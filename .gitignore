@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+startup_last.txt
+*.log
+trading_data.db
