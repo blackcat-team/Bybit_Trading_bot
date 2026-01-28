@@ -811,7 +811,15 @@ async def on_startup_check(context: ContextTypes.DEFAULT_TYPE):
         for p in active_positions:
             sym = p['symbol']
             side = p['side']
-            sl = float(p.get('stopLoss', 0))
+
+            # --- 🔥 FIX: Безопасное получение Stop Loss ---
+            # Bybit может прислать пустую строку "", если стопа нет
+            sl_raw = p.get('stopLoss', '')
+            if sl_raw and sl_raw != "":
+                sl = float(sl_raw)
+            else:
+                sl = 0.0
+            # ----------------------------------------------
 
             tp_orders = []
             if sym in orders_map:
