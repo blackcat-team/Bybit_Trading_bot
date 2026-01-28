@@ -213,6 +213,13 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
             sym = p['symbol']
             side = p['side']
             entry_price = float(p['avgPrice'])
+            # --- FIX: Безопасное получение Stop Loss ---
+            sl_raw = p.get('stopLoss', '')
+            # Если строка пустая или None -> считаем 0.0
+            if sl_raw and sl_raw != "":
+                stop_loss = float(sl_raw)
+            else:
+                stop_loss = 0.0
             stop_loss = float(p.get('stopLoss', 0))
             pnl = float(p['unrealisedPnl'])
 

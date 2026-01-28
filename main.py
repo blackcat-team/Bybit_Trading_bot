@@ -4,6 +4,7 @@ import pytz
 from datetime import time
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 from colorama import init, Fore, Style
+from telegram.request import HTTPXRequest
 
 # Импорты из наших модулей
 from config import TELEGRAM_TOKEN, USER_RISK_USD, IS_DEMO
@@ -97,8 +98,19 @@ if __name__ == '__main__':
     # Загружаем базу
     init_db()
 
-    # Строим бота
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    # --- 🔥 НАСТРОЙКА СЕТИ (FIX NetworkError) ---
+    # Делаем бота более терпимым к лагам телеграма (таймауты по 20 сек)
+    req = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=20.0,
+        write_timeout=20.0,
+        connect_timeout=20.0,
+        pool_timeout=20.0
+    )
+
+    # Строим бота с новыми настройками сети
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).request(req).build()
+    # ---------------------------------------------
 
     # Регистрируем команды
     app.add_handler(CommandHandler("start", start_trading))
@@ -127,14 +139,14 @@ if __name__ == '__main__':
     jq.run_repeating(auto_cleanup_orders_job, interval=3600, first=60)
 
     # 4. Утренний отчет (Каждый день в 09:00 по UTC)
-    # Если pytz не установлен, можно убрать time=... и использовать run_repeating(interval=86400)
-    # Но лучше так:
     jq.run_daily(daily_balance_job, time=time(hour=9, minute=0, tzinfo=pytz.UTC))
 
     # 5. STARTUP RECOVERY (Запустить через 5 секунд после старта)
     jq.run_once(on_startup_check, 5)
 
+    # 6. Тайм-менеджмент позиций (Раз в 4 часа)
     jq.run_repeating(time_management_job, interval=14400, first=300)
+
     print("✅ Background jobs started...")
 
     # ----------------------------------------

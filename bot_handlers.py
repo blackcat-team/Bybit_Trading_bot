@@ -121,8 +121,25 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ <b>ИГНОР {sym}:</b> {reason}", parse_mode='HTML')
             return
 
-        # Определение типа входа (Market vs Limit)
-        ticker = session.get_tickers(category="linear", symbol=sym)['result']['list'][0]
+        # --- 🔥 FIX: ПРОВЕРКА НА СУЩЕСТВОВАНИЕ МОНЕТЫ ---
+        try:
+            # Спрашиваем у биржи: есть такая пара?
+            ticker_data = session.get_tickers(category="linear", symbol=sym)
+            ticker_list = ticker_data.get('result', {}).get('list', [])
+
+            if not ticker_list:
+                # Если список пуст - монеты нет
+                logging.warning(f"⚠️ Symbol {sym} not found on Bybit.")
+                await update.message.reply_text(f"❓ <b>Неизвестная монета:</b> Пара {sym} не найдена на Bybit.",
+                                                parse_mode='HTML')
+                return
+
+            ticker = ticker_list[0]
+        except Exception as ticker_err:
+            logging.error(f"Ticker check error: {ticker_err}")
+            return  # Выходим, чтобы не крашить бота
+        # ------------------------------------------------
+
         market_price = float(ticker['lastPrice'])
         is_market = False
 
@@ -166,18 +183,20 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         pos_usd = current_risk / (diff_pct / 100)
+
+        # Получаем инфо инструмента (тут тоже может быть ошибка, но проверка выше обычно спасает)
         info = session.get_instruments_info(category="linear", symbol=sym)['result']['list'][0]
         qty_step = float(info['lotSizeFilter']['qtyStep'])
         qty = round(round(pos_usd / entry_price / qty_step) * qty_step, 6)
 
-        # ЛОГ МАТЕМАТИКИ (Добавляем это)
+        # ЛОГ МАТЕМАТИКИ
         logging.info(
             f"🧮 Calc {sym}: StopDist={diff_pct:.2f}% | "
             f"Risk=${current_risk} | Lev=x{lev} | "
             f"Qty={qty} (~{pos_usd:.1f}$)"
         )
 
-        # --- 🛡 ПРОВЕРКА НА НУЛЕВОЙ ОБЪЕМ (FIX 10001) ---
+        # --- 🛡 ПРОВЕРКА НА НУЛЕВОЙ ОБЪЕМ ---
         if qty <= 0:
             qty = qty_step
             real_risk = qty * abs(entry_price - stop_val)
@@ -193,7 +212,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"⚠️ <b>Внимание:</b> Объем округлен до min ({qty}). Риск: {real_risk:.2f}$",
                     parse_mode='HTML'
                 )
-        # ------------------------------------------------
+        # ------------------------------------
 
         # --- 🛡 ОТПРАВКА ПЛЕЧА ---
         try:
@@ -231,8 +250,6 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 2. Определение источника (Src)
         source_tag = None
 
-        # Сначала проверяем известные подписи (регистр не важен)
-        # Можешь добавлять сюда другие каналы по аналогии
         if "binance killers" in txt.lower():
             source_tag = "#BinanceKillers"
         elif "fed. russian insiders" in txt.lower():
@@ -240,7 +257,6 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif "cornix" in txt.lower():
             source_tag = "#Cornix"
 
-        # Если известного канала нет, ищем любой хештег (как раньше)
         if not source_tag:
             tags = re.findall(r'#(\w+)', txt)
             if tags:
@@ -282,7 +298,6 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Trade Error: {e}")
         await update.message.reply_text(f"🔥 Ошибка: {e}")
-
 
 # --- 4. Обработчик Кнопок (ОБНОВЛЕННЫЙ) ---
 
