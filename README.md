@@ -1,3 +1,4 @@
+![Visitor Badge](https://visitor-badge.laobi.icu/badge?page_id=blackcat-team.Bybit_Trading_bot)
 # 📈 Bybit Telegram Trading Bot (R-System v1.2 PRO)
 
 ### Описание
