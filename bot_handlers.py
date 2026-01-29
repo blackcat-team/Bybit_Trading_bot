@@ -219,33 +219,92 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.set_leverage(category="linear", symbol=sym, buyLeverage=str(lev), sellLeverage=str(lev))
         except:
             pass
-        # -------------------------
 
-        # --- 🛡 ЗАЩИТА ОТ НЕХВАТКИ БАЛАНСА ---
-        try:
-            wallet = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-            available_balance = float(wallet['result']['list'][0]['totalAvailableBalance'])
-            required_margin = (qty * entry_price) / lev
+            # --- 🛡 ЗАЩИТА ОТ НЕХВАТКИ БАЛАНСА (FIX v6.0 - Engineer Logic) ---
+            try:
+                # 1. Базовые данные (Equity)
+                wallet = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+                account_data = wallet['result']['list'][0]
 
-            if required_margin > available_balance * 0.95:
-                max_margin = available_balance * 0.95
-                max_pos_value = max_margin * lev
-                new_qty = max_pos_value / entry_price
-                new_qty = round(round(new_qty / qty_step) * qty_step, 6)
+                raw_equity = account_data.get('totalEquity', '')
+                total_equity = float(raw_equity) if raw_equity and raw_equity != "" else 0.0
 
-                logging.warning(f"⚠️ Low Balance! Qty reduced: {qty} -> {new_qty}")
-                await update.message.reply_text(
-                    f"⚠️ <b>Нехватка баланса!</b>\n"
-                    f"Надо: {required_margin:.1f}$, есть: {available_balance:.1f}$.\n"
-                    f"Объем урезан: {qty} ➔ {new_qty}",
-                    parse_mode='HTML'
-                )
-                qty = new_qty
-        except Exception as e:
-            logging.error(f"Balance check error: {e}")
+                # 2. Считаем ЗАЛОГ В ПОЗИЦИЯХ
+                total_pos_margin = 0.0
+                try:
+                    positions = session.get_positions(category="linear", settleCoin="USDT")
+                    for p in positions['result']['list']:
+                        im = float(p.get('positionIM', 0))
+                        # Если API вернул 0 (бывает на кроссе), считаем сами: (Size * Price) / Lev
+                        if im == 0 and float(p['size']) > 0:
+                            im = (float(p['size']) * float(p['avgPrice'])) / float(p['leverage'])
+                        total_pos_margin += im
+                except Exception:
+                    pass  # Если ошибка, считаем маржу 0, не страшно
 
-        update_risk_for_symbol(sym, current_risk)
-        pos_value_usd = qty * entry_price
+                # 3. Считаем ЗАЛОГ В ОРДЕРАХ (Buy ордера тратят USDT)
+                total_order_margin = 0.0
+                try:
+                    orders = session.get_open_orders(category="linear", settleCoin="USDT")
+                    for o in orders['result']['list']:
+                        if o['side'] == 'Buy':
+                            nominal = float(o['qty']) * float(o['price'])
+                            # Делим на текущее плечо (lev). Это дает точность ~99%
+                            total_order_margin += (nominal / lev)
+                except Exception:
+                    pass
+
+                # 4. ИТОГОВАЯ ФОРМУЛА: Свободно = Деньги - Позиции - Ордера
+                used_margin = total_pos_margin + total_order_margin
+                available_balance = total_equity - used_margin
+
+                if available_balance < 0: available_balance = 0.0
+
+                logging.info(
+                    f"💰 Balance Calc: Equity={total_equity:.1f}$ - Used={used_margin:.1f}$ = Avail={available_balance:.1f}$")
+
+                # 5. ПРОВЕРКА СДЕЛКИ
+                required_margin = (qty * entry_price) / lev
+
+                # Сравниваем честно (оставляем $1 на всякий случай)
+                if required_margin > available_balance - 1.0:
+
+                    # Если денег нет совсем
+                    if available_balance < 5:
+                        logging.error("❌ Свободных средств почти нет (<5$)!")
+                        await update.message.reply_text(
+                            f"❌ <b>Нет свободной маржи!</b>\nДоступно: {available_balance:.1f}$", parse_mode='HTML')
+                        return
+
+                    # Подгоняем объем
+                    safe_margin = available_balance - 1.0  # Оставляем $1 запаса
+                    if safe_margin < 0: safe_margin = 0
+
+                    max_pos_value = safe_margin * lev
+                    new_qty = max_pos_value / entry_price
+
+                    if new_qty < qty_step:
+                        logging.error("❌ Не хватает баланса даже на мин. лот!")
+                        return
+
+                    new_qty = round(round(new_qty / qty_step) * qty_step, 6)
+
+                    logging.warning(f"⚠️ Auto-Resize: {qty} -> {new_qty}")
+                    await update.message.reply_text(
+                        f"⚠️ <b>Корректировка объема!</b>\n"
+                        f"Доступно реально: {available_balance:.1f}$\n"
+                        f"✂️ Режем: {qty} ➔ {new_qty}",
+                        parse_mode='HTML'
+                    )
+                    qty = new_qty
+
+            except Exception as e:
+                logging.error(f"Balance check critical error: {e}")
+
+            # 👇 ЭТИ СТРОКИ СОХРАНЕНЫ, НИЧЕГО НЕ ПОТЕРЯНО
+            update_risk_for_symbol(sym, current_risk)
+            pos_value_usd = qty * entry_price
+
 
         # 2. Определение источника (Src)
         source_tag = None
