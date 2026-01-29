@@ -224,7 +224,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # --- 🛡 ЗАЩИТА ОТ НЕХВАТКИ БАЛАНСА ---
         try:
             wallet = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-            available_balance = float(wallet['result']['list'][0]['totalWalletBalance'])
+            available_balance = float(wallet['result']['list'][0]['totalAvailableBalance'])
             required_margin = (qty * entry_price) / lev
 
             if required_margin > available_balance * 0.95:

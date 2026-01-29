@@ -213,6 +213,7 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
             sym = p['symbol']
             side = p['side']
             entry_price = float(p['avgPrice'])
+
             # --- FIX: Безопасное получение Stop Loss ---
             sl_raw = p.get('stopLoss', '')
             # Если строка пустая или None -> считаем 0.0
@@ -220,14 +221,14 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
                 stop_loss = float(sl_raw)
             else:
                 stop_loss = 0.0
-            stop_loss = float(p.get('stopLoss', 0))
+            # -------------------------------------------
+
             pnl = float(p['unrealisedPnl'])
 
             # --- 🔥 ГЛАВНАЯ ПРАВКА: Получаем реальное время сделки ---
             start_dt = None
             try:
                 # Запрашиваем последнее исполнение (trade) по этому символу
-                # Это покажет, когда мы реально вошли в сделку
                 exec_info = session.get_executions(category="linear", symbol=sym, limit=1)
                 trades = exec_info.get('result', {}).get('list', [])
 
@@ -235,11 +236,11 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
                     last_trade_ms = int(trades[0]['execTime'])
                     start_dt = datetime.fromtimestamp(last_trade_ms / 1000)
                 else:
-                    # Если истории нет (очень старая сделка?), берем createdTime как запасной вариант
+                    # Если истории нет, берем createdTime
                     start_dt = datetime.fromtimestamp(int(p['createdTime']) / 1000)
             except Exception as exec_err:
                 logging.warning(f"⚠️ Не удалось получить время сделки для {sym}: {exec_err}")
-                continue  # Пропускаем, если не смогли узнать время
+                continue  # Пропускаем
 
             # Возраст сделки
             duration = now - start_dt
@@ -265,7 +266,7 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
                 )
                 continue
 
-                # 🟠 ПРАВИЛО 5 ДНЕЙ
+            # 🟠 ПРАВИЛО 5 ДНЕЙ
             if days_open >= 5:
                 # Проверка: Стоп в БУ?
                 is_be = False
