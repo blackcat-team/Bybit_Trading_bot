@@ -149,3 +149,19 @@ journalctl -u bybitbot -f
 ```bash
 systemctl restart bybitbot
 ```
+Остановка: 
+```bash
+systemctl stop  bybitbot
+```
+Обновление бота: 
+```bash
+sudo systemctl stop bybitbot
+
+cd Bybit_Trading_bot
+git pull
+source .venv/bin/activate
+pip install -r requirements.txt
+
+sudo systemctl start bybitbot
+sudo journalctl -u bybitbot -n 80 --no-pager
+```

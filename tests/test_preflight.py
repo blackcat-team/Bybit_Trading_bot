@@ -35,7 +35,7 @@ sys.modules["database"] = MagicMock()
 
 # Now safe to import
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from bot_handlers import floor_qty, validate_qty, clip_qty
+from bot_handlers import floor_qty, validate_qty, clip_qty, _safe_float, get_available_usd
 
 import pytest
 
@@ -221,3 +221,160 @@ class TestValidateQty:
         # 0.19 with step 0.1 -> floor = 0.1, min = 0.2 -> FAIL
         qty, valid, _ = validate_qty(0.19, 0.1, 0.2)
         assert valid is False
+
+
+# --- _safe_float ---
+
+class TestSafeFloat:
+    def test_normal_number(self):
+        assert _safe_float("123.45") == pytest.approx(123.45)
+
+    def test_empty_string(self):
+        assert _safe_float("") == 0.0
+
+    def test_none(self):
+        assert _safe_float(None) == 0.0
+
+    def test_whitespace(self):
+        assert _safe_float("  ") == 0.0
+
+    def test_zero_string(self):
+        assert _safe_float("0") == 0.0
+
+    def test_custom_default(self):
+        assert _safe_float("", default=-1.0) == -1.0
+
+    def test_invalid_string(self):
+        assert _safe_float("abc") == 0.0
+
+    def test_float_passthrough(self):
+        assert _safe_float(42.5) == pytest.approx(42.5)
+
+
+# --- get_available_usd ---
+
+class TestGetAvailableUsd:
+    def test_primary_totalAvailableBalance(self):
+        """Uses totalAvailableBalance when present."""
+        data = {"totalAvailableBalance": "500.0"}
+        avail, src = get_available_usd(data)
+        assert avail == pytest.approx(500.0)
+        assert src == "totalAvailableBalance"
+
+    def test_coin_fallback_when_primary_empty(self):
+        """Falls back to coin-level USDT when totalAvailableBalance is empty."""
+        data = {
+            "totalAvailableBalance": "",
+            "coin": [{
+                "coin": "USDT",
+                "walletBalance": "1000.0",
+                "totalPositionIM": "200.0",
+                "totalOrderIM": "100.0",
+                "locked": "50.0",
+                "bonus": "10.0",
+            }]
+        }
+        avail, src = get_available_usd(data)
+        # 1000 - 200 - 100 - 50 - 10 = 640
+        assert avail == pytest.approx(640.0)
+        assert src == "coin_fallback"
+
+    def test_coin_fallback_empty_fields_treated_as_zero(self):
+        """Empty strings in coin data are treated as 0."""
+        data = {
+            "totalAvailableBalance": "",
+            "coin": [{
+                "coin": "USDT",
+                "walletBalance": "500.0",
+                "totalPositionIM": "",
+                "totalOrderIM": "",
+                "locked": "",
+                "bonus": "",
+            }]
+        }
+        avail, src = get_available_usd(data)
+        assert avail == pytest.approx(500.0)
+        assert src == "coin_fallback"
+
+    def test_equity_fallback_when_no_coin_data(self):
+        """Falls back to equity - IM when no coin data."""
+        data = {
+            "totalAvailableBalance": "",
+            "totalEquity": "1000.0",
+            "totalInitialMargin": "300.0",
+            "coin": [],
+        }
+        avail, src = get_available_usd(data)
+        assert avail == pytest.approx(700.0)
+        assert src == "equity_fallback"
+
+    def test_fail_closed_all_empty(self):
+        """Returns 0 when everything is empty."""
+        data = {
+            "totalAvailableBalance": "",
+            "totalEquity": "",
+            "totalInitialMargin": "",
+            "coin": [],
+        }
+        avail, src = get_available_usd(data)
+        assert avail == 0.0
+        assert src == "fail_closed"
+
+    def test_coin_negative_clamps_to_zero(self):
+        """If coin calc goes negative, clamp to 0."""
+        data = {
+            "totalAvailableBalance": "",
+            "coin": [{
+                "coin": "USDT",
+                "walletBalance": "100.0",
+                "totalPositionIM": "200.0",
+                "totalOrderIM": "50.0",
+                "locked": "0",
+                "bonus": "0",
+            }]
+        }
+        avail, src = get_available_usd(data)
+        assert avail == 0.0
+        assert src == "coin_fallback"
+
+
+# --- Market re-preflight scenario ---
+
+class TestMarketRePreflight:
+    def test_market_reclip_on_price_increase(self):
+        """If price went up since signal, same qty costs more → might clip."""
+        # Original: qty=10 at price=100 → pos=$1000
+        # Now: price=120, same qty=10 → pos=$1200 (more margin needed)
+        original_qty = 10.0
+        fresh_price = 120.0
+        desired_pos = original_qty * fresh_price  # 1200
+
+        qty, reason, d = clip_qty(
+            desired_pos_usd=desired_pos,
+            entry_price=fresh_price,
+            available_usd=50.0,  # only $50 available
+            lev=5,
+            qty_step=0.1,
+            min_order_qty=0.1,
+        )
+        # max = (50-1)*5*0.97 = 237.65 → max_qty = floor(237.65/120, 0.1) = 1.9
+        assert reason == "CLIPPED"
+        assert qty == pytest.approx(1.9)
+        assert qty < original_qty
+
+    def test_market_no_reclip_when_sufficient(self):
+        """If balance is enough, original qty passes through."""
+        original_qty = 0.5
+        fresh_price = 100.0
+        desired_pos = original_qty * fresh_price  # 50
+
+        qty, reason, d = clip_qty(
+            desired_pos_usd=desired_pos,
+            entry_price=fresh_price,
+            available_usd=1000.0,
+            lev=5,
+            qty_step=0.1,
+            min_order_qty=0.1,
+        )
+        assert reason == "OK"
+        assert qty == pytest.approx(0.5)

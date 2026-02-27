@@ -26,6 +26,76 @@ from database import (
 
 # --- 0. Preflight helpers (чистые функции, без сети) ---
 
+def _safe_float(val, default: float = 0.0) -> float:
+    """Безопасная конвертация значения из API (может быть '', None, число)."""
+    if val is None:
+        return default
+    if isinstance(val, str) and val.strip() == "":
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def get_available_usd(account_data: dict) -> tuple:
+    """
+    Извлекает доступный баланс из ответа get_wallet_balance.
+    account_data = wallet['result']['list'][0]
+
+    Иерархия:
+      1. totalAvailableBalance (account-level) — лучший вариант для cross
+      2. coin-level USDT: walletBalance - totalPositionIM - totalOrderIM - locked - bonus
+      3. account-level: totalEquity - totalInitialMargin
+      4. fail-closed: 0.0
+
+    Returns: (available_usd, source_tag)
+    """
+    # 1. Primary: totalAvailableBalance
+    raw = account_data.get('totalAvailableBalance', '')
+    if raw and str(raw).strip() != '':
+        return _safe_float(raw), "totalAvailableBalance"
+
+    # 2. Coin-level USDT
+    coins = account_data.get('coin', [])
+    usdt_coin = None
+    for c in coins:
+        if c.get('coin') == 'USDT':
+            usdt_coin = c
+            break
+
+    if usdt_coin:
+        wb = _safe_float(usdt_coin.get('walletBalance'))
+        pos_im = _safe_float(usdt_coin.get('totalPositionIM'))
+        ord_im = _safe_float(usdt_coin.get('totalOrderIM'))
+        locked = _safe_float(usdt_coin.get('locked'))
+        bonus = _safe_float(usdt_coin.get('bonus'))
+
+        # Если ключевые поля имеют данные (хотя бы walletBalance)
+        if wb > 0:
+            available = max(0.0, wb - pos_im - ord_im - locked - bonus)
+            logging.warning(
+                f"⚠️ totalAvailableBalance empty → coin fallback: "
+                f"wb={wb:.1f} - posIM={pos_im:.1f} - ordIM={ord_im:.1f} "
+                f"- locked={locked:.1f} - bonus={bonus:.1f} = {available:.1f}"
+            )
+            return available, "coin_fallback"
+
+    # 3. Account-level fallback
+    equity = _safe_float(account_data.get('totalEquity'))
+    im = _safe_float(account_data.get('totalInitialMargin'))
+    if equity > 0:
+        available = max(0.0, equity - im)
+        logging.warning(
+            f"⚠️ No coin data → account fallback: equity={equity:.1f} - IM={im:.1f} = {available:.1f}"
+        )
+        return available, "equity_fallback"
+
+    # 4. Fail-closed
+    logging.error("❌ Cannot determine available balance — all sources empty, using 0")
+    return 0.0, "fail_closed"
+
+
 def floor_qty(raw_qty: float, qty_step: float) -> float:
     """Округляет qty строго ВНИЗ по шагу биржи."""
     if qty_step <= 0:
@@ -296,21 +366,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             wallet = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
             account_data = wallet['result']['list'][0]
-
-            # Основной источник: totalAvailableBalance (Bybit считает сам)
-            raw_avail = account_data.get('totalAvailableBalance', '')
-            if raw_avail and raw_avail != "":
-                available_usd = float(raw_avail)
-                fallback_used = False
-            else:
-                # Fallback: equity - IM (ручной расчёт)
-                raw_equity = account_data.get('totalEquity', '')
-                raw_im = account_data.get('totalInitialMargin', '')
-                equity = float(raw_equity) if raw_equity and raw_equity != "" else 0.0
-                im = float(raw_im) if raw_im and raw_im != "" else 0.0
-                available_usd = max(0.0, equity - im)
-                fallback_used = True
-                logging.warning(f"⚠️ totalAvailableBalance empty, fallback: equity={equity:.1f} - IM={im:.1f}")
+            available_usd, avail_src = get_available_usd(account_data)
 
             qty, reason, details = clip_qty(
                 desired_pos_usd=pos_usd,
@@ -323,7 +379,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             logging.info(
-                f"🧮 Preflight {sym}: desired={pos_usd:.1f}$ | avail={available_usd:.1f}$ | "
+                f"🧮 Preflight {sym}: desired={pos_usd:.1f}$ | avail={available_usd:.1f}$ ({avail_src}) | "
                 f"lev=x{effective_lev} | qty={qty} | reason={reason}"
             )
 
@@ -516,7 +572,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
         elif data.startswith("buy_market|"):
-            _, sym, side, sl, qty, lev = data.split("|")
+            _, sym, side, sl, qty_str, lev_str = data.split("|")
+            lev = int(float(lev_str))
+            qty_from_cb = float(qty_str)
+            order_side = "Buy" if side == "LONG" else "Sell"
 
             # Ставим плечо перед входом
             try:
@@ -525,13 +584,87 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if "110043" not in str(lev_err):
                     logging.warning(f"⚠️ set_leverage({sym}, x{lev}) failed: {lev_err}")
 
-            order_side = "Buy" if side == "LONG" else "Sell"
-            session.place_order(
-                category="linear", symbol=sym, side=order_side,
-                orderType="Market", qty=qty, stopLoss=sl
-            )
-            logging.info(f"⚡ Market order: {sym} | {order_side} | qty={qty} | lev=x{lev}")
-            await query.edit_message_text(f"⚡️ Исполнен Маркет по {sym}")
+            # --- RE-PREFLIGHT: свежая цена + свежий баланс ---
+            final_qty = qty_from_cb
+            qty_step = 0.0
+            min_order_qty = 0.0
+            try:
+                ticker = session.get_tickers(category="linear", symbol=sym)
+                fresh_price = float(ticker['result']['list'][0]['lastPrice'])
+
+                wallet = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+                account_data = wallet['result']['list'][0]
+                available_usd, avail_src = get_available_usd(account_data)
+
+                info = session.get_instruments_info(category="linear", symbol=sym)['result']['list'][0]
+                lot_filter = info['lotSizeFilter']
+                qty_step = float(lot_filter['qtyStep'])
+                min_order_qty = float(lot_filter.get('minOrderQty', qty_step))
+                max_order_qty = float(lot_filter.get('maxOrderQty', 0))
+
+                desired_pos = qty_from_cb * fresh_price
+                final_qty, reason, details = clip_qty(
+                    desired_pos_usd=desired_pos,
+                    entry_price=fresh_price,
+                    available_usd=available_usd,
+                    lev=lev,
+                    qty_step=qty_step,
+                    min_order_qty=min_order_qty,
+                    max_order_qty=max_order_qty,
+                )
+
+                logging.info(
+                    f"🧮 Preflight(MARKET) {sym}: cb_qty={qty_from_cb} | "
+                    f"fresh_price={fresh_price} | avail={available_usd:.1f}$ ({avail_src}) | "
+                    f"lev=x{lev} | qty={final_qty} | reason={reason}"
+                )
+
+                if reason == "REJECT":
+                    await query.edit_message_text(
+                        f"❌ <b>Недостаточно маржи</b> для Market {sym}.\n"
+                        f"Доступно: {available_usd:.1f}$"
+                    )
+                    return
+
+                if final_qty < qty_from_cb:
+                    await context.bot.send_message(
+                        user_id,
+                        f"⚠️ <b>Market корректировка:</b> {qty_from_cb} ➔ {final_qty}",
+                        parse_mode='HTML'
+                    )
+            except Exception as pf_err:
+                logging.warning(f"Market preflight error: {pf_err}, using original qty={qty_from_cb}")
+
+            # --- PLACE ORDER + 110007 micro-retry ---
+            try:
+                session.place_order(
+                    category="linear", symbol=sym, side=order_side,
+                    orderType="Market", qty=str(final_qty), stopLoss=sl
+                )
+                logging.info(f"⚡ Market order: {sym} | {order_side} | qty={final_qty} | lev=x{lev}")
+                await query.edit_message_text(f"⚡️ Исполнен Маркет по {sym}")
+            except Exception as ord_err:
+                if "110007" in str(ord_err) and qty_step > 0:
+                    retry_qty = floor_qty(final_qty - qty_step, qty_step)
+                    if retry_qty >= min_order_qty and retry_qty > 0:
+                        logging.warning(f"⚠️ 110007 retry: {final_qty} -> {retry_qty}")
+                        try:
+                            session.place_order(
+                                category="linear", symbol=sym, side=order_side,
+                                orderType="Market", qty=str(retry_qty), stopLoss=sl
+                            )
+                            logging.info(f"⚡ Market order (retry): {sym} | {order_side} | qty={retry_qty}")
+                            await query.edit_message_text(f"⚡️ Исполнен Маркет по {sym} (retry: {retry_qty})")
+                        except Exception as retry_err:
+                            logging.error(f"Market retry failed: {retry_err}")
+                            await query.edit_message_text(f"❌ Market {sym}: {retry_err}")
+                    else:
+                        await query.edit_message_text(
+                            f"❌ <b>Market {sym}:</b> недостаточно средств даже после retry"
+                        )
+                else:
+                    logging.error(f"Market order error: {ord_err}")
+                    await query.edit_message_text(f"❌ Market {sym}: {ord_err}")
 
         elif data.startswith("emergency_close|"):
             _, sym = data.split("|")
