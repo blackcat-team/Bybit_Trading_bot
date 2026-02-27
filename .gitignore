@@ -30,3 +30,7 @@ Thumbs.db
 
 # runtime artifacts / local state
 *.log
+*.csv
+data/*.json
+data/startup_last.txt
+!data/*.example.json
