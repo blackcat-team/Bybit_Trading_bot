@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
 from colorama import init, Fore, Style
 
@@ -33,7 +34,10 @@ DAILY_LOSS_LIMIT = -50.0  # Макс дневной убыток (останов
 ORDER_TIMEOUT_DAYS = 3    # Через сколько дней удалять висячие лимитки
 
 # --- FILE PATHS ---
-SETTINGS_FILE = "settings.json"
-RISK_FILE = "risk_data.json"
-COMMENTS_FILE = "journal_comments.json"
-SOURCES_FILE = "sources_log.json"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+
+SETTINGS_FILE = DATA_DIR / "settings.json"
+RISK_FILE = DATA_DIR / "risk_data.json"
+COMMENTS_FILE = DATA_DIR / "journal_comments.json"
+SOURCES_FILE = DATA_DIR / "sources_log.json"

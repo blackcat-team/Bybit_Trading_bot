@@ -4,6 +4,7 @@ after the callbacks.py decomposition.
 """
 import sys
 import os
+from pathlib import Path as _Path
 from unittest.mock import MagicMock
 
 # --- Mock heavy deps before importing handlers ---
@@ -19,6 +20,7 @@ _config_mock = MagicMock()
 _config_mock.ALLOWED_ID = "0"
 _config_mock.MARGIN_BUFFER_USD = 1.0
 _config_mock.MARGIN_BUFFER_PCT = 0.03
+_config_mock.DATA_DIR = _Path(__file__).resolve().parent.parent / "data"
 sys.modules["config"] = _config_mock
 
 _tc_mock = MagicMock()
@@ -78,9 +80,10 @@ class TestDirectModuleImport:
         assert callable(send_report)
 
     def test_startup(self):
+        from pathlib import Path
         from handlers.startup import on_startup_check, STARTUP_MARKER_FILE
         assert callable(on_startup_check)
-        assert isinstance(STARTUP_MARKER_FILE, str)
+        assert isinstance(STARTUP_MARKER_FILE, (str, Path))
 
 
 class TestFacadeReexport:

@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from config import (
     SETTINGS_FILE, RISK_FILE, COMMENTS_FILE, SOURCES_FILE,
-    USER_RISK_USD
+    USER_RISK_USD, DATA_DIR
 )
 
 # --- 1. Глобальные переменные (Кэш в памяти) ---
@@ -36,6 +36,7 @@ def save_json(filename, data):
 def init_db():
     """Загружает все данные с диска в память при старте."""
     global RISK_MAPPING, COMMENTS_DB, SOURCES_DB, SETTINGS
+    DATA_DIR.mkdir(exist_ok=True)
     RISK_MAPPING = load_json(RISK_FILE, {})
     COMMENTS_DB = load_json(COMMENTS_FILE, {})
     SOURCES_DB = load_json(SOURCES_FILE, {})

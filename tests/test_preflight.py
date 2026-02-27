@@ -7,6 +7,7 @@ without installing the full bot stack.
 """
 import sys
 import os
+from pathlib import Path as _Path
 from unittest.mock import MagicMock
 
 # --- Mock heavy deps before importing bot_handlers ---
@@ -23,6 +24,7 @@ _config_mock = MagicMock()
 _config_mock.ALLOWED_ID = "0"
 _config_mock.MARGIN_BUFFER_USD = 1.0
 _config_mock.MARGIN_BUFFER_PCT = 0.03
+_config_mock.DATA_DIR = _Path(__file__).resolve().parent.parent / "data"
 sys.modules["config"] = _config_mock
 
 # Stub trading_core
