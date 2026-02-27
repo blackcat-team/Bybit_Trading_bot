@@ -24,6 +24,10 @@ if not TELEGRAM_TOKEN or not BYBIT_API_KEY or not BYBIT_API_SECRET or not ALLOWE
 IS_DEMO = os.getenv('IS_DEMO') == 'True'
 USER_RISK_USD = float(os.getenv('USER_RISK_USD', 50))
 
+# Буферы маржи (защита от 110007)
+MARGIN_BUFFER_USD = float(os.getenv('MARGIN_BUFFER_USD', 1.0))   # Абсолютный запас в $
+MARGIN_BUFFER_PCT = float(os.getenv('MARGIN_BUFFER_PCT', 0.03))  # 3% запас от notional
+
 # Лимиты
 DAILY_LOSS_LIMIT = -50.0  # Макс дневной убыток (остановит торговлю)
 ORDER_TIMEOUT_DAYS = 3    # Через сколько дней удалять висячие лимитки

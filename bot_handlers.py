@@ -2,6 +2,7 @@ import os
 import re
 import csv
 import io
+import math
 from datetime import datetime, timedelta
 import time
 import logging
@@ -10,7 +11,7 @@ import functools
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from config import ALLOWED_ID
+from config import ALLOWED_ID, MARGIN_BUFFER_USD, MARGIN_BUFFER_PCT
 from trading_core import (
     session, check_daily_limit,
     place_tp_ladder,
@@ -21,6 +22,91 @@ from database import (
     get_risk_for_symbol, is_trading_enabled, set_trading_enabled,
     get_global_risk, set_global_risk, get_source_at_time
 )
+
+
+# --- 0. Preflight helpers (чистые функции, без сети) ---
+
+def floor_qty(raw_qty: float, qty_step: float) -> float:
+    """Округляет qty строго ВНИЗ по шагу биржи."""
+    if qty_step <= 0:
+        return raw_qty
+    steps = math.floor(raw_qty / qty_step)
+    return round(steps * qty_step, 10)
+
+
+def validate_qty(
+    qty: float,
+    qty_step: float,
+    min_order_qty: float,
+    max_order_qty: float = 0.0,
+) -> tuple:
+    """
+    Валидирует qty по лот-фильтрам биржи: floor + min + max.
+
+    Returns: (adjusted_qty, is_valid, reject_reason)
+    """
+    qty = floor_qty(qty, qty_step)
+
+    if qty < min_order_qty:
+        return qty, False, f"qty {qty} < minOrderQty {min_order_qty}"
+
+    if max_order_qty > 0 and qty > max_order_qty:
+        qty = floor_qty(max_order_qty, qty_step)
+        return qty, True, f"capped at maxOrderQty {max_order_qty}"
+
+    return qty, True, ""
+
+
+def clip_qty(
+    desired_pos_usd: float,
+    entry_price: float,
+    available_usd: float,
+    lev: int,
+    qty_step: float,
+    min_order_qty: float,
+    max_order_qty: float = 0.0,
+    buffer_usd: float = MARGIN_BUFFER_USD,
+    buffer_pct: float = MARGIN_BUFFER_PCT,
+) -> tuple:
+    """
+    Рассчитывает безопасный qty с учётом маржи, буферов и лот-фильтров.
+
+    Returns: (qty, reason, details_dict)
+        reason: "OK" | "CLIPPED" | "REJECT"
+    """
+    # 1. Desired qty (floor + max cap)
+    raw_desired = desired_pos_usd / entry_price if entry_price > 0 else 0.0
+    desired_qty, _, _ = validate_qty(raw_desired, qty_step, min_order_qty, max_order_qty)
+
+    # 2. Максимальный notional по доступной марже
+    available_safe = max(0.0, available_usd - buffer_usd)
+    max_pos_value = available_safe * lev * (1 - buffer_pct)
+    raw_max = max_pos_value / entry_price if entry_price > 0 else 0.0
+    max_qty = floor_qty(raw_max, qty_step)
+
+    details = {
+        "desired_pos_usd": round(desired_pos_usd, 2),
+        "available_usd": round(available_usd, 2),
+        "available_safe": round(available_safe, 2),
+        "lev": lev,
+        "max_pos_value": round(max_pos_value, 2),
+        "desired_qty": desired_qty,
+        "max_qty": max_qty,
+        "min_order_qty": min_order_qty,
+        "max_order_qty": max_order_qty,
+    }
+
+    # 3. Clip по марже
+    qty = min(desired_qty, max_qty)
+    reason = "OK" if qty >= desired_qty else "CLIPPED"
+
+    # 4. Проверка минимального лота
+    if qty < min_order_qty:
+        details["qty_final"] = 0.0
+        return 0.0, "REJECT", details
+
+    details["qty_final"] = qty
+    return qty, reason, details
 
 
 # --- 1. Управление состоянием (Start/Stop) ---
@@ -74,6 +160,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ALLOWED_ID: return
     if not is_trading_enabled(): return
 
+    pos_value_usd = 0.0
     msg_obj = update.message
     raw = msg_obj.text or msg_obj.caption
     if not raw: return
@@ -184,127 +271,91 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pos_usd = current_risk / (diff_pct / 100)
 
-        # Получаем инфо инструмента (тут тоже может быть ошибка, но проверка выше обычно спасает)
+        # Получаем инфо инструмента
         info = session.get_instruments_info(category="linear", symbol=sym)['result']['list'][0]
-        qty_step = float(info['lotSizeFilter']['qtyStep'])
-        qty = round(round(pos_usd / entry_price / qty_step) * qty_step, 6)
+        lot_filter = info['lotSizeFilter']
+        qty_step = float(lot_filter['qtyStep'])
+        min_order_qty = float(lot_filter.get('minOrderQty', qty_step))
+        max_order_qty = float(lot_filter.get('maxOrderQty', 0))
 
-        # ЛОГ МАТЕМАТИКИ
-        logging.info(
-            f"🧮 Calc {sym}: StopDist={diff_pct:.2f}% | "
-            f"Risk=${current_risk} | Lev=x{lev} | "
-            f"Qty={qty} (~{pos_usd:.1f}$)"
-        )
+        # --- 🛡 ОТПРАВКА ПЛЕЧА ---
+        effective_lev = lev
+        try:
+            session.set_leverage(category="linear", symbol=sym, buyLeverage=str(lev), sellLeverage=str(lev))
+        except Exception as lev_err:
+            err_str = str(lev_err)
+            # 110043 = "leverage not modified" — плечо уже такое, это ОК
+            if "110043" in err_str:
+                pass
+            else:
+                logging.warning(f"⚠️ set_leverage({sym}, x{lev}) failed: {lev_err} — using x1 for preflight")
+                effective_lev = 1
 
-        # --- 🛡 ПРОВЕРКА НА НУЛЕВОЙ ОБЪЕМ ---
-        if qty <= 0:
-            qty = qty_step
-            real_risk = qty * abs(entry_price - stop_val)
-            if real_risk > current_risk * 2:
+        # --- 🛡 PREFLIGHT: баланс + clip qty ---
+        pos_value_usd = 0.0
+        try:
+            wallet = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+            account_data = wallet['result']['list'][0]
+
+            # Основной источник: totalAvailableBalance (Bybit считает сам)
+            raw_avail = account_data.get('totalAvailableBalance', '')
+            if raw_avail and raw_avail != "":
+                available_usd = float(raw_avail)
+                fallback_used = False
+            else:
+                # Fallback: equity - IM (ручной расчёт)
+                raw_equity = account_data.get('totalEquity', '')
+                raw_im = account_data.get('totalInitialMargin', '')
+                equity = float(raw_equity) if raw_equity and raw_equity != "" else 0.0
+                im = float(raw_im) if raw_im and raw_im != "" else 0.0
+                available_usd = max(0.0, equity - im)
+                fallback_used = True
+                logging.warning(f"⚠️ totalAvailableBalance empty, fallback: equity={equity:.1f} - IM={im:.1f}")
+
+            qty, reason, details = clip_qty(
+                desired_pos_usd=pos_usd,
+                entry_price=entry_price,
+                available_usd=available_usd,
+                lev=effective_lev,
+                qty_step=qty_step,
+                min_order_qty=min_order_qty,
+                max_order_qty=max_order_qty,
+            )
+
+            logging.info(
+                f"🧮 Preflight {sym}: desired={pos_usd:.1f}$ | avail={available_usd:.1f}$ | "
+                f"lev=x{effective_lev} | qty={qty} | reason={reason}"
+            )
+
+            if reason == "REJECT":
                 await update.message.reply_text(
-                    f"⚠️ <b>Сделка отменена!</b>\n"
-                    f"Расчетный объем 0. Риск min лота ({real_risk:.2f}$) > лимита {current_risk}$.",
+                    f"❌ <b>Недостаточно маржи</b> даже на мин. лот ({min_order_qty}).\n"
+                    f"Доступно: {available_usd:.1f}$",
                     parse_mode='HTML'
                 )
                 return
-            else:
+
+            if reason == "CLIPPED":
                 await update.message.reply_text(
-                    f"⚠️ <b>Внимание:</b> Объем округлен до min ({qty}). Риск: {real_risk:.2f}$",
+                    f"⚠️ <b>Корректировка объема!</b>\n"
+                    f"Доступно: {available_usd:.1f}$\n"
+                    f"✂️ Режем: {details['desired_qty']} ➔ {qty}",
                     parse_mode='HTML'
                 )
-        # ------------------------------------
 
-        # --- 🛡 ОТПРАВКА ПЛЕЧА ---
-        try:
-            session.set_leverage(category="linear", symbol=sym, buyLeverage=str(lev), sellLeverage=str(lev))
-        except:
-            pass
-
-            # --- 🛡 ЗАЩИТА ОТ НЕХВАТКИ БАЛАНСА (FIX v6.0 - Engineer Logic) ---
-            try:
-                # 1. Базовые данные (Equity)
-                wallet = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-                account_data = wallet['result']['list'][0]
-
-                raw_equity = account_data.get('totalEquity', '')
-                total_equity = float(raw_equity) if raw_equity and raw_equity != "" else 0.0
-
-                # 2. Считаем ЗАЛОГ В ПОЗИЦИЯХ
-                total_pos_margin = 0.0
-                try:
-                    positions = session.get_positions(category="linear", settleCoin="USDT")
-                    for p in positions['result']['list']:
-                        im = float(p.get('positionIM', 0))
-                        # Если API вернул 0 (бывает на кроссе), считаем сами: (Size * Price) / Lev
-                        if im == 0 and float(p['size']) > 0:
-                            im = (float(p['size']) * float(p['avgPrice'])) / float(p['leverage'])
-                        total_pos_margin += im
-                except Exception:
-                    pass  # Если ошибка, считаем маржу 0, не страшно
-
-                # 3. Считаем ЗАЛОГ В ОРДЕРАХ (Buy ордера тратят USDT)
-                total_order_margin = 0.0
-                try:
-                    orders = session.get_open_orders(category="linear", settleCoin="USDT")
-                    for o in orders['result']['list']:
-                        if o['side'] == 'Buy':
-                            nominal = float(o['qty']) * float(o['price'])
-                            # Делим на текущее плечо (lev). Это дает точность ~99%
-                            total_order_margin += (nominal / lev)
-                except Exception:
-                    pass
-
-                # 4. ИТОГОВАЯ ФОРМУЛА: Свободно = Деньги - Позиции - Ордера
-                used_margin = total_pos_margin + total_order_margin
-                available_balance = total_equity - used_margin
-
-                if available_balance < 0: available_balance = 0.0
-
-                logging.info(
-                    f"💰 Balance Calc: Equity={total_equity:.1f}$ - Used={used_margin:.1f}$ = Avail={available_balance:.1f}$")
-
-                # 5. ПРОВЕРКА СДЕЛКИ
-                required_margin = (qty * entry_price) / lev
-
-                # Сравниваем честно (оставляем $1 на всякий случай)
-                if required_margin > available_balance - 1.0:
-
-                    # Если денег нет совсем
-                    if available_balance < 5:
-                        logging.error("❌ Свободных средств почти нет (<5$)!")
-                        await update.message.reply_text(
-                            f"❌ <b>Нет свободной маржи!</b>\nДоступно: {available_balance:.1f}$", parse_mode='HTML')
-                        return
-
-                    # Подгоняем объем
-                    safe_margin = available_balance - 1.0  # Оставляем $1 запаса
-                    if safe_margin < 0: safe_margin = 0
-
-                    max_pos_value = safe_margin * lev
-                    new_qty = max_pos_value / entry_price
-
-                    if new_qty < qty_step:
-                        logging.error("❌ Не хватает баланса даже на мин. лот!")
-                        return
-
-                    new_qty = round(round(new_qty / qty_step) * qty_step, 6)
-
-                    logging.warning(f"⚠️ Auto-Resize: {qty} -> {new_qty}")
-                    await update.message.reply_text(
-                        f"⚠️ <b>Корректировка объема!</b>\n"
-                        f"Доступно реально: {available_balance:.1f}$\n"
-                        f"✂️ Режем: {qty} ➔ {new_qty}",
-                        parse_mode='HTML'
-                    )
-                    qty = new_qty
-
-            except Exception as e:
-                logging.error(f"Balance check critical error: {e}")
-
-            # 👇 ЭТИ СТРОКИ СОХРАНЕНЫ, НИЧЕГО НЕ ПОТЕРЯНО
-            update_risk_for_symbol(sym, current_risk)
             pos_value_usd = qty * entry_price
 
+        except Exception as e:
+            logging.error(f"Preflight critical error: {e}")
+            # Если preflight упал, считаем qty по старой формуле (floor) и пробуем
+            raw_fallback = pos_usd / entry_price if entry_price > 0 else 0.0
+            qty, is_valid, val_reason = validate_qty(raw_fallback, qty_step, min_order_qty, max_order_qty)
+            if not is_valid:
+                qty = min_order_qty
+            pos_value_usd = qty * entry_price
+
+        # 👇 ЭТИ СТРОКИ СОХРАНЕНЫ, НИЧЕГО НЕ ПОТЕРЯНО
+        update_risk_for_symbol(sym, current_risk)
 
         # 2. Определение источника (Src)
         source_tag = None
@@ -334,7 +385,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Src: {source_tag}"
             )
             kb = [
-                [InlineKeyboardButton("⚡️ GO MARKET", callback_data=f"buy_market|{sym}|{side}|{stop_val}|{qty}|{lev}")]]
+                [InlineKeyboardButton("⚡️ GO MARKET", callback_data=f"buy_market|{sym}|{side}|{stop_val}|{qty}|{effective_lev}")]]
             await update.message.reply_html(msg, reply_markup=InlineKeyboardMarkup(kb))
 
         else:
@@ -357,6 +408,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Trade Error: {e}")
         await update.message.reply_text(f"🔥 Ошибка: {e}")
+
 
 # --- 4. Обработчик Кнопок (ОБНОВЛЕННЫЙ) ---
 
@@ -464,25 +516,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
         elif data.startswith("buy_market|"):
-
             _, sym, side, sl, qty, lev = data.split("|")
 
-            # --- [FIX] Страхуемся и тут: ставим плечо перед входом ---
-
+            # Ставим плечо перед входом
             try:
-
                 session.set_leverage(category="linear", symbol=sym, buyLeverage=str(lev), sellLeverage=str(lev))
+            except Exception as lev_err:
+                if "110043" not in str(lev_err):
+                    logging.warning(f"⚠️ set_leverage({sym}, x{lev}) failed: {lev_err}")
 
-            except:
-
-                pass  # Если уже стоит, просто игнорируем
-
-            # ---------------------------------------------------------
-
-            session.place_order(category="linear", symbol=sym, side="Buy" if side == "LONG" else "Sell",
-
-                                orderType="Market", qty=qty, stopLoss=sl)
-
+            order_side = "Buy" if side == "LONG" else "Sell"
+            session.place_order(
+                category="linear", symbol=sym, side=order_side,
+                orderType="Market", qty=qty, stopLoss=sl
+            )
+            logging.info(f"⚡ Market order: {sym} | {order_side} | qty={qty} | lev=x{lev}")
             await query.edit_message_text(f"⚡️ Исполнен Маркет по {sym}")
 
         elif data.startswith("emergency_close|"):
