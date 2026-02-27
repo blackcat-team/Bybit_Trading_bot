@@ -1,25 +1,31 @@
 """
-handlers package — re-exports для main.py и тестов.
+Facade package — keeps existing `from handlers import ...` and
+`from handlers.xxx import ...` working after move to bybit_bot/.
 """
 
-from handlers.signal_parser import parse_and_trade, parse_signal
+import sys
 
-from handlers.commands import (
+from bybit_bot.handlers import (                    # noqa: F401
+    parse_and_trade, parse_signal,
     start_trading, stop_trading,
     set_risk_command, add_note_handler,
-)
-
-from handlers.buttons import button_handler
-
-from handlers.views_orders import view_orders, view_symbol_orders
-
-from handlers.views_positions import check_positions
-
-from handlers.reporting import send_report
-
-from handlers.startup import on_startup_check
-
-from handlers.preflight import (
+    button_handler,
+    view_orders, view_symbol_orders,
+    check_positions,
+    send_report,
+    on_startup_check,
     _safe_float, get_available_usd, floor_qty,
     validate_qty, clip_qty,
 )
+
+# Register submodule aliases so `from handlers.xyz import ...` resolves
+# to the real modules under bybit_bot.handlers.xyz.
+_SUBMODULES = [
+    'buttons', 'callbacks', 'commands', 'orders', 'preflight',
+    'signal_parser', 'ui', 'views_orders', 'views_positions',
+    'reporting', 'startup',
+]
+for _name in _SUBMODULES:
+    _key = f'bybit_bot.handlers.{_name}'
+    if _key in sys.modules:
+        sys.modules[f'handlers.{_name}'] = sys.modules[_key]

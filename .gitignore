@@ -34,3 +34,4 @@ Thumbs.db
 data/*.json
 data/startup_last.txt
 !data/*.example.json
+.claude

@@ -1,9 +1,9 @@
 """
 Facade — keeps main.py and tests working without import changes.
-All implementation lives in handlers/ subpackage.
+All implementation lives in bybit_bot/handlers/ subpackage.
 """
 
-from handlers import (                          # noqa: F401
+from bybit_bot.handlers import (                    # noqa: F401
     # TG command/callback handlers (main.py needs these)
     start_trading, stop_trading, check_positions,
     send_report, add_note_handler, button_handler,
