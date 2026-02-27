@@ -1,6 +1,20 @@
+# python
 __pycache__/
-*.pyc
-.env
-startup_last.txt
-*.log
-trading_data.db
+*.py[cod]
+*.pyd
+*.pyo
+
+# venv
+.venv/
+venv/
+
+# tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
