@@ -14,7 +14,7 @@ from telegram.ext import ContextTypes
 from config import ALLOWED_ID
 from trading_core import session
 from database import get_global_risk, get_source_at_time
-from handlers.orders import bybit_call
+from .orders import bybit_call
 
 
 async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):

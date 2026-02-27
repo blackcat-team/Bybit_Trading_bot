@@ -10,7 +10,7 @@ import logging
 import time
 
 from trading_core import session
-from handlers.preflight import floor_qty
+from .preflight import floor_qty
 
 _SLOW_CALL_THRESHOLD = 0.5  # seconds
 
