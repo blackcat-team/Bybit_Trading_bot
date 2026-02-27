@@ -11,6 +11,7 @@ from telegram.ext import ContextTypes
 
 from config import ALLOWED_ID
 from trading_core import session
+from handlers.orders import bybit_call
 
 STARTUP_MARKER_FILE = "startup_last.txt"
 
@@ -33,14 +34,16 @@ async def on_startup_check(context: ContextTypes.DEFAULT_TYPE):
     logging.info("🚑 Startup Recovery: Scanning...")
 
     try:
-        positions = session.get_positions(category="linear", settleCoin="USDT")['result']['list']
+        pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
+        positions = pos_resp['result']['list']
         active_positions = [p for p in positions if float(p['size']) > 0]
 
         if not active_positions:
             logging.info("✅ No active positions found.")
             return
 
-        orders = session.get_open_orders(category="linear", settleCoin="USDT")['result']['list']
+        orders_resp = await bybit_call(session.get_open_orders, category="linear", settleCoin="USDT")
+        orders = orders_resp['result']['list']
         orders_map = {}
         for o in orders:
             sym = o['symbol']

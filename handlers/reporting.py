@@ -6,7 +6,6 @@ import csv
 import io
 import logging
 import asyncio
-import functools
 from datetime import datetime, timedelta
 
 from telegram import Update
@@ -15,6 +14,7 @@ from telegram.ext import ContextTypes
 from config import ALLOWED_ID
 from trading_core import session
 from database import get_global_risk, get_source_at_time
+from handlers.orders import bybit_call
 
 
 async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -44,19 +44,15 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         all_trades = []
         current_start = start_ts
         chunk_step = 6 * 24 * 60 * 60 * 1000
-        loop = asyncio.get_running_loop()
 
         while current_start < end_ts:
             current_end = min(current_start + chunk_step, end_ts)
-            resp = await loop.run_in_executor(
-                None,
-                functools.partial(
-                    session.get_closed_pnl,
-                    category="linear",
-                    startTime=current_start,
-                    endTime=current_end,
-                    limit=100
-                )
+            resp = await bybit_call(
+                session.get_closed_pnl,
+                category="linear",
+                startTime=current_start,
+                endTime=current_end,
+                limit=100
             )
             chunk_trades = resp.get('result', {}).get('list', [])
             all_trades.extend(chunk_trades)

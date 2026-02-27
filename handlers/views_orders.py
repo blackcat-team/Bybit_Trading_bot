@@ -9,6 +9,7 @@ from telegram.ext import ContextTypes
 
 from config import ALLOWED_ID
 from trading_core import session
+from handlers.orders import bybit_call
 from handlers.views_positions import check_positions
 
 
@@ -19,7 +20,8 @@ async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_obj = update.message if update.message else update.callback_query.message
 
     try:
-        orders = session.get_open_orders(category="linear", settleCoin="USDT")['result']['list']
+        orders_resp = await bybit_call(session.get_open_orders, category="linear", settleCoin="USDT")
+        orders = orders_resp['result']['list']
         active_orders = [o for o in orders if not o.get('reduceOnly')]
 
         if not active_orders:
@@ -67,7 +69,8 @@ async def view_symbol_orders(update: Update, context: ContextTypes.DEFAULT_TYPE,
     msg_obj = update.message if update.message else update.callback_query.message
 
     try:
-        orders = session.get_open_orders(category="linear", symbol=symbol)['result']['list']
+        orders_resp = await bybit_call(session.get_open_orders, category="linear", symbol=symbol)
+        orders = orders_resp['result']['list']
 
         if not orders:
             await check_positions(update, context)

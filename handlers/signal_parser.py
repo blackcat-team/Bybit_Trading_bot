@@ -17,7 +17,7 @@ from database import (
 )
 
 from handlers.preflight import clip_qty, validate_qty, get_available_usd
-from handlers.orders import set_leverage_safe, place_limit_order
+from handlers.orders import set_leverage_safe, place_limit_order, bybit_call
 from handlers.ui import format_market_signal, format_limit_signal
 
 
@@ -125,7 +125,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"📩 Message received: {txt[:50]}...")
 
     try:
-        can_trade, pnl_today = check_daily_limit()
+        can_trade, pnl_today = await bybit_call(check_daily_limit)
         if not can_trade:
             await update.message.reply_text(
                 f"⛔️ <b>ЛИМИТ!</b>\nУбыток: {pnl_today:.2f}$.", parse_mode='HTML'
@@ -147,7 +147,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sym = f"{coin}USDT"
 
         # Защита от дублей
-        is_busy, reason = has_open_trade(sym)
+        is_busy, reason = await bybit_call(has_open_trade, sym)
         if is_busy:
             await update.message.reply_text(
                 f"⚠️ <b>ИГНОР {sym}:</b> {reason}", parse_mode='HTML'
@@ -156,7 +156,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # --- Проверка существования монеты ---
         try:
-            ticker_data = session.get_tickers(category="linear", symbol=sym)
+            ticker_data = await bybit_call(session.get_tickers, category="linear", symbol=sym)
             ticker_list = ticker_data.get('result', {}).get('list', [])
 
             if not ticker_list:
@@ -212,19 +212,20 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pos_usd = current_risk / (diff_pct / 100)
 
         # Получаем инфо инструмента
-        info = session.get_instruments_info(category="linear", symbol=sym)['result']['list'][0]
+        info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=sym)
+        info = info_resp['result']['list'][0]
         lot_filter = info['lotSizeFilter']
         qty_step = float(lot_filter['qtyStep'])
         min_order_qty = float(lot_filter.get('minOrderQty', qty_step))
         max_order_qty = float(lot_filter.get('maxOrderQty', 0))
 
         # Плечо
-        effective_lev = set_leverage_safe(sym, lev)
+        effective_lev = await bybit_call(set_leverage_safe, sym, lev)
 
         # --- PREFLIGHT: баланс + clip qty ---
         pos_value_usd = 0.0
         try:
-            wallet = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+            wallet = await bybit_call(session.get_wallet_balance, accountType="UNIFIED", coin="USDT")
             account_data = wallet['result']['list'][0]
             available_usd, avail_src = get_available_usd(account_data)
 
@@ -290,7 +291,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag
             )
             kb = [[InlineKeyboardButton("🎯 SET AUTO-TPs", callback_data=f"set_tps|{sym}")]]
-            place_limit_order(sym, side, qty, entry_price, stop_val)
+            await bybit_call(place_limit_order, sym, side, qty, entry_price, stop_val)
             await update.message.reply_html(msg, reply_markup=InlineKeyboardMarkup(kb))
 
     except Exception as e:

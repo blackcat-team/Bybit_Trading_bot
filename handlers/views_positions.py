@@ -11,15 +11,17 @@ from config import ALLOWED_ID
 from trading_core import session
 from database import get_risk_for_symbol
 from handlers.ui import format_position_card
+from handlers.orders import bybit_call
 
 
 async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ALLOWED_ID: return
     try:
-        positions = session.get_positions(category="linear", settleCoin="USDT")['result']['list']
+        pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
+        positions = pos_resp['result']['list']
         active = [p for p in positions if float(p.get('size', 0)) > 0]
 
-        raw_orders = session.get_open_orders(category="linear", settleCoin="USDT")
+        raw_orders = await bybit_call(session.get_open_orders, category="linear", settleCoin="USDT")
         all_orders = raw_orders.get('result', {}).get('list', [])
 
         orders_count = {}

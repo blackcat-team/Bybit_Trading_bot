@@ -10,7 +10,7 @@ from telegram.ext import ContextTypes
 from config import ALLOWED_ID
 from trading_core import session, place_tp_ladder
 from handlers.preflight import clip_qty, get_available_usd, floor_qty
-from handlers.orders import place_market_with_retry, close_position_market
+from handlers.orders import place_market_with_retry, close_position_market, bybit_call
 from handlers.views_orders import view_orders, view_symbol_orders
 from handlers.views_positions import check_positions
 
@@ -36,18 +36,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data.startswith("to_be|"):
             _, sym, side = data.split("|")
-            pos = session.get_positions(category="linear", symbol=sym)['result']['list'][0]
+            pos_resp = await bybit_call(session.get_positions, category="linear", symbol=sym)
+            pos = pos_resp['result']['list'][0]
             entry = float(pos['avgPrice'])
-            session.set_trading_stop(category="linear", symbol=sym, stopLoss=str(entry), slTriggerBy="LastPrice")
+            await bybit_call(session.set_trading_stop, category="linear", symbol=sym, stopLoss=str(entry), slTriggerBy="LastPrice")
             await context.bot.send_message(user_id, f"🛡 {sym} переведен в БУ!")
 
         elif data.startswith("exit_be|"):
             _, sym, side = data.split("|")
             try:
-                pos = session.get_positions(category="linear", symbol=sym)['result']['list'][0]
+                pos_resp = await bybit_call(session.get_positions, category="linear", symbol=sym)
+                pos = pos_resp['result']['list'][0]
                 entry_price = float(pos['avgPrice'])
 
-                info = session.get_instruments_info(category="linear", symbol=sym)['result']['list'][0]
+                info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=sym)
+                info = info_resp['result']['list'][0]
                 tick_size = float(info['priceFilter']['tickSize'])
 
                 fee_buffer = 0.001  # 0.1%
@@ -61,7 +64,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 target_str = str(target_price)
 
-                session.set_trading_stop(
+                await bybit_call(
+                    session.set_trading_stop,
                     category="linear",
                     symbol=sym,
                     takeProfit=target_str,
@@ -89,7 +93,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mode = parts[3] if len(parts) > 3 else "list"
 
             try:
-                session.cancel_order(category="linear", symbol=sym, orderId=oid)
+                await bybit_call(session.cancel_order, category="linear", symbol=sym, orderId=oid)
             except Exception as e:
                 pass  # Если уже отменен
 
@@ -99,7 +103,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await view_orders(update, context)
 
         elif data == "cancel_all_orders":
-            session.cancel_all_orders(category="linear", settleCoin="USDT")
+            await bybit_call(session.cancel_all_orders, category="linear", settleCoin="USDT")
             await query.edit_message_text("🗑 Все лимитные ордера отменены.")
 
         elif data == "refresh_orders":
@@ -113,7 +117,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Ставим плечо перед входом
             try:
-                session.set_leverage(category="linear", symbol=sym, buyLeverage=str(lev), sellLeverage=str(lev))
+                await bybit_call(session.set_leverage, category="linear", symbol=sym, buyLeverage=str(lev), sellLeverage=str(lev))
             except Exception as lev_err:
                 if "110043" not in str(lev_err):
                     logging.warning(f"⚠️ set_leverage({sym}, x{lev}) failed: {lev_err}")
@@ -123,14 +127,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             qty_step = 0.0
             min_order_qty = 0.0
             try:
-                ticker = session.get_tickers(category="linear", symbol=sym)
+                ticker = await bybit_call(session.get_tickers, category="linear", symbol=sym)
                 fresh_price = float(ticker['result']['list'][0]['lastPrice'])
 
-                wallet = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+                wallet = await bybit_call(session.get_wallet_balance, accountType="UNIFIED", coin="USDT")
                 account_data = wallet['result']['list'][0]
                 available_usd, avail_src = get_available_usd(account_data)
 
-                info = session.get_instruments_info(category="linear", symbol=sym)['result']['list'][0]
+                info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=sym)
+                info = info_resp['result']['list'][0]
                 lot_filter = info['lotSizeFilter']
                 qty_step = float(lot_filter['qtyStep'])
                 min_order_qty = float(lot_filter.get('minOrderQty', qty_step))
@@ -170,7 +175,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.warning(f"Market preflight error: {pf_err}, using original qty={qty_from_cb}")
 
             # --- PLACE ORDER + 110007 micro-retry ---
-            success, msg_text, _ = place_market_with_retry(
+            success, msg_text, _ = await bybit_call(
+                place_market_with_retry,
                 sym, order_side, final_qty, sl, qty_step, min_order_qty
             )
             if success:
@@ -181,7 +187,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("emergency_close|"):
             _, sym = data.split("|")
             try:
-                success, msg_text, _ = close_position_market(sym)
+                success, msg_text, _ = await bybit_call(close_position_market, sym)
                 if success:
                     await query.answer(f"✅ {sym} закрыт аварийно!", show_alert=True)
                     await query.edit_message_text(msg_text)
