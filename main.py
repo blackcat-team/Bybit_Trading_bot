@@ -7,15 +7,15 @@ from colorama import init, Fore, Style
 from telegram.request import HTTPXRequest
 
 # Импорты из наших модулей
-from config import TELEGRAM_TOKEN, USER_RISK_USD, IS_DEMO
-from database import init_db
-from trading_core import session
-from bot_handlers import (
+from core.config import TELEGRAM_TOKEN, USER_RISK_USD, IS_DEMO
+from core.database import init_db
+from core.trading_core import session
+from handlers import (
     start_trading, stop_trading, check_positions,
     send_report, add_note_handler, button_handler,
     parse_and_trade, set_risk_command, view_orders, on_startup_check
 )
-from jobs import daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job, heartbeat_job, time_management_job
+from app.jobs import daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job, heartbeat_job, time_management_job
 
 # Инициализация цветов
 init(autoreset=True)

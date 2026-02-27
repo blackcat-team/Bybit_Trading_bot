@@ -2,7 +2,7 @@ import logging
 import time
 from datetime import datetime
 from pybit.unified_trading import HTTP
-from config import (
+from core.config import (
     BYBIT_API_KEY, BYBIT_API_SECRET, IS_DEMO,
     DAILY_LOSS_LIMIT, USER_RISK_USD
 )

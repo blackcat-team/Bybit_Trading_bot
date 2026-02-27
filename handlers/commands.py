@@ -7,8 +7,8 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config import ALLOWED_ID
-from database import (
+from core.config import ALLOWED_ID
+from core.database import (
     add_comment,
     is_trading_enabled, set_trading_enabled,
     get_global_risk, set_global_risk,

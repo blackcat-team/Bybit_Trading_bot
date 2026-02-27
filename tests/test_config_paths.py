@@ -25,15 +25,15 @@ os.environ.setdefault("ALLOWED_TELEGRAM_ID", "0")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Clear any mock config installed by other test files so we get the real one
-sys.modules.pop("config", None)
-import config
+sys.modules.pop("core.config", None)
+from core import config
 
 
 class TestConfigPaths:
     def test_base_dir_is_project_root(self):
-        """BASE_DIR points to the project root (where config.py lives)."""
+        """BASE_DIR points to the project root (where main.py lives)."""
         assert config.BASE_DIR.is_dir()
-        assert (config.BASE_DIR / "config.py").is_file()
+        assert (config.BASE_DIR / "main.py").is_file()
 
     def test_data_dir_inside_project(self):
         """DATA_DIR is BASE_DIR/data."""

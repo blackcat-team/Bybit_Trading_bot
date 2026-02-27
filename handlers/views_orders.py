@@ -7,10 +7,10 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from config import ALLOWED_ID
-from trading_core import session
-from .orders import bybit_call
-from .views_positions import check_positions
+from core.config import ALLOWED_ID
+from core.trading_core import session
+from handlers.orders import bybit_call
+from handlers.views_positions import check_positions
 
 
 async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):

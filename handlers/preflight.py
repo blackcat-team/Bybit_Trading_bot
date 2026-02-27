@@ -6,7 +6,7 @@ Preflight helpers — чистые функции без сетевых вызо
 import math
 import logging
 
-from config import MARGIN_BUFFER_USD, MARGIN_BUFFER_PCT
+from core.config import MARGIN_BUFFER_USD, MARGIN_BUFFER_PCT
 
 
 def _safe_float(val, default: float = 0.0) -> float:

@@ -9,9 +9,9 @@ import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from config import ALLOWED_ID, DATA_DIR
-from trading_core import session
-from .orders import bybit_call
+from core.config import ALLOWED_ID, DATA_DIR
+from core.trading_core import session
+from handlers.orders import bybit_call
 
 STARTUP_MARKER_FILE = DATA_DIR / "startup_last.txt"
 
