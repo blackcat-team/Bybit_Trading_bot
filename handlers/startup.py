@@ -2,6 +2,7 @@
 Startup recovery — on_startup_check.
 """
 
+import asyncio
 import os
 import time
 import logging
@@ -19,17 +20,16 @@ STARTUP_MARKER_FILE = DATA_DIR / "startup_last.txt"
 async def on_startup_check(context: ContextTypes.DEFAULT_TYPE):
     now = time.time()
     if os.path.exists(STARTUP_MARKER_FILE):
-        with open(STARTUP_MARKER_FILE, "r") as f:
-            try:
-                last_run = float(f.read())
-                if now - last_run < 300:
-                    logging.info("🚑 Startup Scan skipped (Cooldown).")
-                    return
-            except:
-                pass
+        try:
+            text = await asyncio.to_thread(STARTUP_MARKER_FILE.read_text)
+            last_run = float(text)
+            if now - last_run < 300:
+                logging.info("🚑 Startup Scan skipped (Cooldown).")
+                return
+        except Exception:
+            pass
 
-    with open(STARTUP_MARKER_FILE, "w") as f:
-        f.write(str(now))
+    await asyncio.to_thread(STARTUP_MARKER_FILE.write_text, str(now))
 
     logging.info("🚑 Startup Recovery: Scanning...")
 

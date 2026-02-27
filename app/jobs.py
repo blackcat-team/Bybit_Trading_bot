@@ -7,6 +7,7 @@ from telegram.ext import ContextTypes
 from core.config import ALLOWED_ID, ORDER_TIMEOUT_DAYS
 from core.database import is_trading_enabled, get_risk_for_symbol
 from core.trading_core import session
+from core.bybit_call import bybit_call
 
 # Засекаем время старта
 START_TIME = time.time()
@@ -19,7 +20,8 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
 
     # Пытаемся получить PnL (тихо, без лишнего шума)
     try:
-        positions = session.get_positions(category="linear", settleCoin="USDT")['result']['list']
+        _pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
+        positions = _pos_resp['result']['list']
         total_pnl = sum(float(p['unrealisedPnl']) for p in positions if float(p['size']) > 0)
         active_count = len([p for p in positions if float(p['size']) > 0])
         pnl_str = f" | 💰 Open PnL: {total_pnl:+.2f}$ ({active_count} deals)"
@@ -43,7 +45,8 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
     if not is_trading_enabled(): return
 
     try:
-        positions = session.get_positions(category="linear", settleCoin="USDT")['result']['list']
+        _pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
+        positions = _pos_resp['result']['list']
         active = [p for p in positions if float(p['size']) > 0]
 
         for p in active:
@@ -82,7 +85,8 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
             current_r = price_move / dist_1r_price
 
             # 3. Получаем шаг цены (tickSize) для округления
-            info = session.get_instruments_info(category="linear", symbol=sym)['result']['list'][0]
+            _info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=sym)
+            info = _info_resp['result']['list'][0]
             tick = float(info['priceFilter']['tickSize'])
 
             new_sl = None
@@ -124,11 +128,12 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
                 new_sl = round(round(new_sl / tick) * tick, 6)
 
                 try:
-                    session.set_trading_stop(
+                    await bybit_call(
+                        session.set_trading_stop,
                         category="linear",
                         symbol=sym,
                         stopLoss=str(new_sl),
-                        slTriggerBy="LastPrice"
+                        slTriggerBy="LastPrice",
                     )
                     logging.info(f"♻️ {action_tag}: {sym} SL moved to {new_sl}")
                     await context.bot.send_message(
@@ -149,7 +154,8 @@ async def auto_cleanup_orders_job(context: ContextTypes.DEFAULT_TYPE):
     if not is_trading_enabled(): return
 
     try:
-        orders = session.get_open_orders(category="linear", settleCoin="USDT")['result']['list']
+        _orders_resp = await bybit_call(session.get_open_orders, category="linear", settleCoin="USDT")
+        orders = _orders_resp['result']['list']
         if not orders: return
 
         now_ms = time.time() * 1000
@@ -165,7 +171,7 @@ async def auto_cleanup_orders_job(context: ContextTypes.DEFAULT_TYPE):
             # Если просрочен
             if (now_ms - created_time) > timeout_ms:
                 try:
-                    session.cancel_order(category="linear", symbol=o['symbol'], orderId=o['orderId'])
+                    await bybit_call(session.cancel_order, category="linear", symbol=o['symbol'], orderId=o['orderId'])
                     logging.info(f"🗑 Cleanup: {o['symbol']}")
                     await context.bot.send_message(
                         chat_id=ALLOWED_ID,
@@ -182,7 +188,7 @@ async def auto_cleanup_orders_job(context: ContextTypes.DEFAULT_TYPE):
 async def daily_balance_job(context: ContextTypes.DEFAULT_TYPE):
     """Каждое утро (в 9:00 UTC) присылает баланс."""
     try:
-        wallet = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        wallet = await bybit_call(session.get_wallet_balance, accountType="UNIFIED", coin="USDT")
         equity = float(wallet['result']['list'][0]['totalEquity'])
         pnl = float(wallet['result']['list'][0]['totalPerpUPL'])
 
@@ -200,7 +206,8 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
     """
     try:
         # 1. Получаем все позиции
-        positions = session.get_positions(category="linear", settleCoin="USDT")['result']['list']
+        _pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
+        positions = _pos_resp['result']['list']
         active_positions = [p for p in positions if float(p['size']) > 0]
 
         if not active_positions:
@@ -229,7 +236,7 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
             start_dt = None
             try:
                 # Запрашиваем последнее исполнение (trade) по этому символу
-                exec_info = session.get_executions(category="linear", symbol=sym, limit=1)
+                exec_info = await bybit_call(session.get_executions, category="linear", symbol=sym, limit=1)
                 trades = exec_info.get('result', {}).get('list', [])
 
                 if trades:

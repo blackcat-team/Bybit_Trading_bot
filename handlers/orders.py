@@ -3,27 +3,15 @@ Bybit order wrappers — тонкие обёртки вокруг session.place_
 Синхронные функции, возвращают результат или бросают исключение.
 
 bybit_call() — async helper для non-blocking вызова любой sync-функции Bybit SDK.
+Canonical implementation lives in core.bybit_call; re-exported here for
+backward compatibility (existing imports from handlers.orders stay valid).
 """
 
-import asyncio
 import logging
-import time
 
+from core.bybit_call import bybit_call, _SLOW_CALL_THRESHOLD  # noqa: F401 — re-export
 from core.trading_core import session
 from handlers.preflight import floor_qty
-
-_SLOW_CALL_THRESHOLD = 0.5  # seconds
-
-
-async def bybit_call(fn, *args, **kwargs):
-    """Run a sync Bybit SDK call in a thread, logging slow calls."""
-    t0 = time.monotonic()
-    result = await asyncio.to_thread(fn, *args, **kwargs)
-    elapsed = time.monotonic() - t0
-    if elapsed > _SLOW_CALL_THRESHOLD:
-        name = getattr(fn, '__name__', None) or getattr(fn, '__qualname__', str(fn))
-        logging.warning(f"🐌 Slow Bybit call: {name} took {elapsed:.2f}s")
-    return result
 
 
 def set_leverage_safe(sym: str, lev: int) -> int:

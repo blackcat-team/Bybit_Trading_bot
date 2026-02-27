@@ -1,0 +1,8 @@
+$ E:\PythonProject\Scripts\Bybit_bot\.venv\Scripts\python.exe -m compileall core/ handlers/ app/ main.py -q
+rc=0
+
+--- STDOUT ---
+
+
+--- STDERR ---
+

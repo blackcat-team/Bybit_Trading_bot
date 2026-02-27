@@ -6,6 +6,7 @@ from core.config import (
     BYBIT_API_KEY, BYBIT_API_SECRET, IS_DEMO,
     DAILY_LOSS_LIMIT, USER_RISK_USD
 )
+from core.bybit_call import bybit_call
 
 # --- 1. Инициализация Сессии Bybit ---
 # Этот объект session мы будем импортировать в другие файлы
@@ -116,7 +117,8 @@ async def place_tp_ladder(symbol):
     """
     try:
         # 1. Получаем живую позицию
-        positions = session.get_positions(category="linear", symbol=symbol)['result']['list']
+        _pos_resp = await bybit_call(session.get_positions, category="linear", symbol=symbol)
+        positions = _pos_resp['result']['list']
         my_pos = next((p for p in positions if float(p['size']) > 0), None)
 
         if not my_pos:
@@ -151,7 +153,8 @@ async def place_tp_ladder(symbol):
             targets['tp3'] = entry_price - (3.0 * r_price_dist)
 
         # 5. Считаем объемы (30% / 30% / Остаток)
-        info = session.get_instruments_info(category="linear", symbol=symbol)['result']['list'][0]
+        _info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=symbol)
+        info = _info_resp['result']['list'][0]
         qty_step = float(info['lotSizeFilter']['qtyStep'])
         price_tick = float(info['priceFilter']['tickSize'])
 
@@ -165,13 +168,14 @@ async def place_tp_ladder(symbol):
         close_side = "Sell" if is_long else "Buy"
         logs = [f"📉 <b>Risk Check:</b> Стоп на {stop_loss}. Риск позиции: <b>{total_risk_usd:.2f}$</b> (1R)"]
 
-        def send_limit(q, p, r_name):
+        async def send_limit(q, p, r_name):
             if q <= 0: return False
             try:
-                session.place_order(
+                await bybit_call(
+                    session.place_order,
                     category="linear", symbol=symbol, side=close_side,
                     orderType="Limit", qty=str(q), price=str(p),
-                    reduceOnly=True, timeInForce="GTC"
+                    reduceOnly=True, timeInForce="GTC",
                 )
                 # Считаем профит этого конкретного ордера
                 est_profit = q * abs(entry_price - p)
@@ -181,9 +185,9 @@ async def place_tp_ladder(symbol):
                 logs.append(f"❌ Err {r_name}: {ex}")
                 return False
 
-        send_limit(qty_30, targets['tp1'], "TP1 (1R)")
-        send_limit(qty_30, targets['tp2'], "TP2 (2R)")
-        send_limit(qty_rem, targets['tp3'], "TP3 (3R)")
+        await send_limit(qty_30, targets['tp1'], "TP1 (1R)")
+        await send_limit(qty_30, targets['tp2'], "TP2 (2R)")
+        await send_limit(qty_rem, targets['tp3'], "TP3 (3R)")
 
         logging.info(f"Real-R TPs placed for {symbol}. Risk: {total_risk_usd}$")
         return "\n".join(logs)
