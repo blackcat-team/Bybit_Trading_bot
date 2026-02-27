@@ -23,13 +23,13 @@ _config_mock.ALLOWED_ID = "0"
 _config_mock.MARGIN_BUFFER_USD = 1.0
 _config_mock.MARGIN_BUFFER_PCT = 0.03
 _config_mock.DATA_DIR = _Path(__file__).resolve().parent.parent / "data"
-sys.modules["config"] = _config_mock
+sys.modules["core.config"] = _config_mock
 
 _tc_mock = MagicMock()
 _tc_mock.session = MagicMock()
-sys.modules["trading_core"] = _tc_mock
+sys.modules["core.trading_core"] = _tc_mock
 
-sys.modules["database"] = MagicMock()
+sys.modules["core.database"] = MagicMock()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

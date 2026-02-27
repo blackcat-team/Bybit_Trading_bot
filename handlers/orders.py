@@ -9,8 +9,8 @@ import asyncio
 import logging
 import time
 
-from trading_core import session
-from .preflight import floor_qty
+from core.trading_core import session
+from handlers.preflight import floor_qty
 
 _SLOW_CALL_THRESHOLD = 0.5  # seconds
 

@@ -8,17 +8,17 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from config import ALLOWED_ID
-from trading_core import session, check_daily_limit, has_open_trade
-from database import (
+from core.config import ALLOWED_ID
+from core.trading_core import session, check_daily_limit, has_open_trade
+from core.database import (
     log_source, update_risk_for_symbol,
     get_risk_for_symbol, is_trading_enabled,
     get_global_risk,
 )
 
-from .preflight import clip_qty, validate_qty, get_available_usd
-from .orders import set_leverage_safe, place_limit_order, bybit_call
-from .ui import format_market_signal, format_limit_signal
+from handlers.preflight import clip_qty, validate_qty, get_available_usd
+from handlers.orders import set_leverage_safe, place_limit_order, bybit_call
+from handlers.ui import format_market_signal, format_limit_signal
 
 
 # ---------------------------------------------------------------------------

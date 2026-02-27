@@ -1,5 +1,5 @@
 """
-Smoke tests — verify that the handlers re-export facade works
+Smoke tests — verify that the handlers package exports work
 after the callbacks.py decomposition.
 """
 import sys
@@ -21,13 +21,13 @@ _config_mock.ALLOWED_ID = "0"
 _config_mock.MARGIN_BUFFER_USD = 1.0
 _config_mock.MARGIN_BUFFER_PCT = 0.03
 _config_mock.DATA_DIR = _Path(__file__).resolve().parent.parent / "data"
-sys.modules["config"] = _config_mock
+sys.modules["core.config"] = _config_mock
 
 _tc_mock = MagicMock()
 _tc_mock.session = MagicMock()
-sys.modules["trading_core"] = _tc_mock
+sys.modules["core.trading_core"] = _tc_mock
 
-sys.modules["database"] = MagicMock()
+sys.modules["core.database"] = MagicMock()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -53,7 +53,7 @@ class TestHandlersImport:
 
 
 class TestDirectModuleImport:
-    """Functions importable from their new home modules."""
+    """Functions importable from their home modules."""
 
     def test_commands(self):
         from handlers.commands import start_trading, stop_trading, set_risk_command, add_note_handler
@@ -98,8 +98,8 @@ class TestFacadeReexport:
         assert callable(button_handler)
         assert callable(send_report)
 
-    def test_bot_handlers_facade(self):
-        from bot_handlers import (
+    def test_package_reexports_all(self):
+        from handlers import (
             start_trading, stop_trading, check_positions,
             send_report, add_note_handler, button_handler,
             parse_and_trade, set_risk_command, view_orders,

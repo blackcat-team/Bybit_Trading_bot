@@ -7,11 +7,11 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from config import ALLOWED_ID
-from trading_core import session
-from database import get_risk_for_symbol
-from .ui import format_position_card
-from .orders import bybit_call
+from core.config import ALLOWED_ID
+from core.trading_core import session
+from core.database import get_risk_for_symbol
+from handlers.ui import format_position_card
+from handlers.orders import bybit_call
 
 
 async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):

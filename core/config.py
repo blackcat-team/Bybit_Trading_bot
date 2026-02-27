@@ -34,7 +34,7 @@ DAILY_LOSS_LIMIT = -50.0  # Макс дневной убыток (останов
 ORDER_TIMEOUT_DAYS = 3    # Через сколько дней удалять висячие лимитки
 
 # --- FILE PATHS ---
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
 SETTINGS_FILE = DATA_DIR / "settings.json"

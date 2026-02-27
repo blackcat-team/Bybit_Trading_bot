@@ -10,7 +10,7 @@ import os
 from pathlib import Path as _Path
 from unittest.mock import MagicMock
 
-# --- Mock heavy deps before importing bot_handlers ---
+# --- Mock heavy deps before importing handlers ---
 _MOCKED_MODULES = [
     "telegram", "telegram.ext", "telegram.request",
     "pybit", "pybit.unified_trading",
@@ -19,25 +19,25 @@ _MOCKED_MODULES = [
 for mod in _MOCKED_MODULES:
     sys.modules.setdefault(mod, MagicMock())
 
-# Stub config constants that bot_handlers imports at module level
+# Stub config constants that handlers imports at module level
 _config_mock = MagicMock()
 _config_mock.ALLOWED_ID = "0"
 _config_mock.MARGIN_BUFFER_USD = 1.0
 _config_mock.MARGIN_BUFFER_PCT = 0.03
 _config_mock.DATA_DIR = _Path(__file__).resolve().parent.parent / "data"
-sys.modules["config"] = _config_mock
+sys.modules["core.config"] = _config_mock
 
 # Stub trading_core
 _tc_mock = MagicMock()
 _tc_mock.session = MagicMock()
-sys.modules["trading_core"] = _tc_mock
+sys.modules["core.trading_core"] = _tc_mock
 
 # Stub database
-sys.modules["database"] = MagicMock()
+sys.modules["core.database"] = MagicMock()
 
 # Now safe to import
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from bot_handlers import floor_qty, validate_qty, clip_qty, _safe_float, get_available_usd
+from handlers.preflight import floor_qty, validate_qty, clip_qty, _safe_float, get_available_usd
 
 import pytest
 

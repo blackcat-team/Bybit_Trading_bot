@@ -3,7 +3,7 @@ import os
 import time
 import logging
 from datetime import datetime
-from config import (
+from core.config import (
     SETTINGS_FILE, RISK_FILE, COMMENTS_FILE, SOURCES_FILE,
     USER_RISK_USD, DATA_DIR
 )

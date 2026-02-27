@@ -4,9 +4,9 @@ from datetime import datetime, timedelta
 from telegram.ext import ContextTypes
 
 
-from config import ALLOWED_ID, ORDER_TIMEOUT_DAYS
-from database import is_trading_enabled, get_risk_for_symbol
-from trading_core import session
+from core.config import ALLOWED_ID, ORDER_TIMEOUT_DAYS
+from core.database import is_trading_enabled, get_risk_for_symbol
+from core.trading_core import session
 
 # Засекаем время старта
 START_TIME = time.time()
