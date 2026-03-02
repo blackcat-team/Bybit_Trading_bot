@@ -4,13 +4,17 @@ import time
 import logging
 from datetime import datetime
 from core.config import (
-    SETTINGS_FILE, RISK_FILE, COMMENTS_FILE, SOURCES_FILE,
+    SETTINGS_FILE, RISK_FILE, COMMENTS_FILE, SOURCES_FILE, HEAT_QUEUE_FILE,
     USER_RISK_USD, DATA_DIR
 )
 
 # In-memory store for pending market signals: sym → (risk_usd, source_tag).
 # Written to disk only after the GO MARKET button order succeeds.
 _MARKET_PENDING: dict = {}
+
+# In-memory + persisted heat queue: list of trade dicts waiting for heat to drop.
+# Each item: {sym, side, entry_val, stop_val, risk_usd, source_tag, queued_at, ttl_min}
+HEAT_QUEUE: list = []
 
 # --- 1. Глобальные переменные (Кэш в памяти) ---
 # Они заполнятся данными при вызове init_db()
@@ -81,12 +85,13 @@ def _load_settings_fail_closed() -> dict:
 # --- 3. Инициализация ---
 def init_db():
     """Загружает все данные с диска в память при старте."""
-    global RISK_MAPPING, COMMENTS_DB, SOURCES_DB, SETTINGS
+    global RISK_MAPPING, COMMENTS_DB, SOURCES_DB, SETTINGS, HEAT_QUEUE
     DATA_DIR.mkdir(exist_ok=True)
     RISK_MAPPING = load_json(RISK_FILE, {})
     COMMENTS_DB = load_json(COMMENTS_FILE, {})
     SOURCES_DB = load_json(SOURCES_FILE, {})
     SETTINGS = _load_settings_fail_closed()
+    HEAT_QUEUE = load_json(HEAT_QUEUE_FILE, [])
     print("✅ Database loaded successfully.")
 
 
@@ -205,3 +210,53 @@ def pop_market_pending(symbol: str):
     Returns: (risk_usd, source_tag) или None если запись отсутствует.
     """
     return _MARKET_PENDING.pop(symbol, None)
+
+
+# --- 9. Heat Queue (trades waiting for heat to drop) ---
+
+def add_to_heat_queue(item: dict) -> None:
+    """
+    Add a trade to the heat queue and persist to disk.
+    item must include: sym, side, entry_val, stop_val, risk_usd, source_tag,
+                       queued_at (epoch seconds), ttl_min.
+    """
+    HEAT_QUEUE.append(item)
+    save_json(HEAT_QUEUE_FILE, HEAT_QUEUE)
+
+
+def get_heat_queue() -> list:
+    """Return a shallow copy of the current heat queue (all items, expired or not)."""
+    return list(HEAT_QUEUE)
+
+
+def prune_heat_queue() -> list:
+    """
+    Remove expired items (queued_at + ttl_min * 60 < now) from the queue.
+    Returns list of removed items.
+    Persists updated queue to disk.
+    """
+    global HEAT_QUEUE
+    now = time.time()
+    active = []
+    expired = []
+    for item in HEAT_QUEUE:
+        ttl_sec = item.get("ttl_min", 30) * 60
+        if now - item.get("queued_at", 0) < ttl_sec:
+            active.append(item)
+        else:
+            expired.append(item)
+    if expired:
+        HEAT_QUEUE = active
+        save_json(HEAT_QUEUE_FILE, HEAT_QUEUE)
+    return expired
+
+
+def remove_from_heat_queue(sym: str) -> bool:
+    """Remove the first queue item matching sym. Returns True if removed."""
+    global HEAT_QUEUE
+    for i, item in enumerate(HEAT_QUEUE):
+        if item.get("sym") == sym:
+            HEAT_QUEUE.pop(i)
+            save_json(HEAT_QUEUE_FILE, HEAT_QUEUE)
+            return True
+    return False

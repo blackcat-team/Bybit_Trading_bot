@@ -12,6 +12,7 @@ from telegram.ext import ContextTypes
 from core.config import ALLOWED_ID
 from core.trading_core import session, check_daily_limit, has_open_trade
 from core.notifier import send_alert, FAIL_CLOSED
+from core.heat import enforce_heat
 from core.database import (
     log_source, update_risk_for_symbol,
     get_risk_for_symbol, is_trading_enabled,
@@ -280,6 +281,25 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "❌ <b>Ошибка проверки баланса.</b> Повторите сигнал.",
                 parse_mode='HTML',
+            )
+            return
+
+        # ── Heat enforcement (disabled when MAX_TOTAL_HEAT_USDT=0) ──────────
+        heat_allowed, heat_reason = await enforce_heat(
+            new_risk_usd=current_risk,
+            trade_info={
+                "sym": sym, "side": side,
+                "entry_val": entry_price, "stop_val": stop_val,
+                "risk_usd": current_risk, "source_tag": source_tag,
+            },
+            bot=context.bot,
+            owner_id=ALLOWED_ID,
+        )
+        if not heat_allowed:
+            action_word = "В очереди" if heat_reason.startswith("queued") else "Отклонено"
+            await update.message.reply_html(
+                f"⛔ <b>{action_word} (Heat limit):</b> {sym}\n"
+                f"<i>Увеличьте MAX_TOTAL_HEAT_USDT или дождитесь закрытия позиций.</i>"
             )
             return
 

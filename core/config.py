@@ -33,6 +33,17 @@ MARGIN_BUFFER_PCT = float(os.getenv('MARGIN_BUFFER_PCT', 0.03))  # 3% запас
 DAILY_LOSS_LIMIT = -50.0  # Макс дневной убыток (остановит торговлю)
 ORDER_TIMEOUT_DAYS = 3    # Через сколько дней удалять висячие лимитки
 
+# --- RISK BUDGET / HEAT ---
+# MAX_TOTAL_HEAT_USDT: sum of risk-at-stop across all open+pending trades.
+#   0 = disabled (default).  Set >0 to enforce.
+MAX_TOTAL_HEAT_USDT = float(os.getenv('MAX_TOTAL_HEAT_USDT', 0))
+# HEAT_ACTION: what to do when heat limit is exceeded.
+#   "reject"  — fail-closed, block the trade (default)
+#   "queue"   — park the trade with TTL, retry when heat drops
+HEAT_ACTION = os.getenv('HEAT_ACTION', 'reject').lower()
+# HEAT_QUEUE_TTL_MIN: how long queued trades remain valid (minutes).
+HEAT_QUEUE_TTL_MIN = int(os.getenv('HEAT_QUEUE_TTL_MIN', 30))
+
 # --- FILE PATHS ---
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -41,3 +52,4 @@ SETTINGS_FILE = DATA_DIR / "settings.json"
 RISK_FILE = DATA_DIR / "risk_data.json"
 COMMENTS_FILE = DATA_DIR / "journal_comments.json"
 SOURCES_FILE = DATA_DIR / "sources_log.json"
+HEAT_QUEUE_FILE = DATA_DIR / "heat_queue.json"

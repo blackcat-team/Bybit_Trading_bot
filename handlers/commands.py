@@ -131,8 +131,17 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         last_alert_str = "none"
 
-    # ── 6. Heat (placeholder until Commit 3) ─────────────────────────────
-    heat_str = "disabled (set MAX_TOTAL_HEAT_USDT to enable)"
+    # ── 6. Heat ───────────────────────────────────────────────────────────
+    from core.config import MAX_TOTAL_HEAT_USDT
+    if MAX_TOTAL_HEAT_USDT <= 0:
+        heat_str = "disabled"
+    else:
+        try:
+            from core.heat import compute_current_heat
+            heat_usd, heat_src = await compute_current_heat()
+            heat_str = f"{heat_usd:.1f}$ / {MAX_TOTAL_HEAT_USDT:.1f}$ ({heat_src})"
+        except Exception:
+            heat_str = "N/A"
 
     lines = [
         "📊 <b>BOT STATUS</b>",
