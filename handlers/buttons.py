@@ -22,8 +22,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await query.answer()
-    except:
-        pass
+    except Exception:
+        pass  # Telegram rejects duplicate answer() calls; safe to ignore
 
     data = query.data
 
@@ -95,7 +95,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await bybit_call(session.cancel_order, category="linear", symbol=sym, orderId=oid)
             except Exception as e:
-                pass  # Если уже отменен
+                logging.debug(f"cancel_order {sym}/{oid}: {e}")  # likely already cancelled
 
             if mode == "sym":
                 await view_symbol_orders(update, context, sym)

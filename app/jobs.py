@@ -25,7 +25,7 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
         total_pnl = sum(float(p['unrealisedPnl']) for p in positions if float(p['size']) > 0)
         active_count = len([p for p in positions if float(p['size']) > 0])
         pnl_str = f" | 💰 Open PnL: {total_pnl:+.2f}$ ({active_count} deals)"
-    except:
+    except Exception:
         pnl_str = ""
 
     logging.info(f"💓 System active. Uptime: {uptime}{pnl_str}")
@@ -142,7 +142,7 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
                         parse_mode='HTML'
                     )
                 except Exception as e:
-                    pass
+                    logging.warning(f"Auto-BE: failed to move SL for {sym}: {e}")
 
     except Exception as e:
         logging.debug(f"Auto-BE Job Error: {e}")
@@ -178,8 +178,8 @@ async def auto_cleanup_orders_job(context: ContextTypes.DEFAULT_TYPE):
                         text=f"🗑 <b>CLEANUP:</b> Ордер {o['symbol']} удален (таймаут).",
                         parse_mode='HTML'
                     )
-                except:
-                    pass
+                except Exception as e:
+                    logging.debug(f"Cleanup cancel {o['symbol']}/{o['orderId']}: {e}")
     except Exception as e:
         logging.error(f"Cleanup Job Error: {e}")
 
@@ -257,9 +257,10 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
             if days_open == 0:
                 continue
 
-            # Получаем риск для расчета 1R
+            # Получаем риск для расчета 1R; без сохранённого риска — пропускаем символ.
             risk_usd = get_risk_for_symbol(sym)
-            if risk_usd == 0: risk_usd = 10
+            if risk_usd <= 0:
+                continue
 
             # --- ПРАВИЛА ---
 

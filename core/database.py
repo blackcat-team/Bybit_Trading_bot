@@ -23,7 +23,7 @@ def load_json(filename, default_data):
     try:
         with open(filename, "r") as f:
             return json.load(f)
-    except:
+    except Exception:
         return default_data
 
 

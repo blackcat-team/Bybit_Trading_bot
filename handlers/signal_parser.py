@@ -263,14 +263,12 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pos_value_usd = qty * entry_price
 
         except Exception as e:
-            logging.error(f"Preflight critical error: {e}")
-            raw_fallback = pos_usd / entry_price if entry_price > 0 else 0.0
-            qty, is_valid, val_reason = validate_qty(
-                raw_fallback, qty_step, min_order_qty, max_order_qty
+            logging.error(f"Preflight critical error for {sym}: {e}")
+            await update.message.reply_text(
+                "❌ <b>Ошибка проверки баланса.</b> Повторите сигнал.",
+                parse_mode='HTML',
             )
-            if not is_valid:
-                qty = min_order_qty
-            pos_value_usd = qty * entry_price
+            return
 
         update_risk_for_symbol(sym, current_risk)
         log_source(sym, source_tag)

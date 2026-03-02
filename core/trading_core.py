@@ -222,6 +222,6 @@ def has_open_trade(symbol):
         return False, None
 
     except Exception as e:
-        logging.error(f"Check duplicates error: {e}")
-        # Если API отвалилось, лучше пропустить сигнал, чем наделать дублей
-        return False, None
+        # Fail-closed: treat API errors as "trade exists" to prevent duplicate positions.
+        logging.error(f"has_open_trade({symbol}) API error — blocking to prevent duplicate: {e}")
+        return True, "API error (fail-closed)"
