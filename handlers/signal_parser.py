@@ -10,9 +10,10 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID
-from core.trading_core import session, check_daily_limit, has_open_trade
+from core.trading_core import session, check_daily_limit
 from core.notifier import send_alert, FAIL_CLOSED
 from core.heat import enforce_heat
+from core.conflict import resolve_signal_conflict
 from core.database import (
     log_source, update_risk_for_symbol,
     get_risk_for_symbol, is_trading_enabled,
@@ -160,14 +161,6 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         sym = f"{coin}USDT"
 
-        # Защита от дублей
-        is_busy, reason = await bybit_call(has_open_trade, sym)
-        if is_busy:
-            await update.message.reply_text(
-                f"⚠️ <b>ИГНОР {sym}:</b> {reason}", parse_mode='HTML'
-            )
-            return
-
         # --- Проверка существования монеты ---
         try:
             ticker_data = await bybit_call(session.get_tickers, category="linear", symbol=sym)
@@ -213,6 +206,30 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         else:
             side = "LONG" if entry_price > stop_val else "SHORT"
+
+        # ── Conflict resolver ──────────────────────────────────────────────
+        # Default (CONFLICT_POLICY_SAME_DIR=ignore): same behavior as before.
+        # Opposite direction: fail-closed + owner alert.
+        conflict_action, conflict_reason = await resolve_signal_conflict(sym, side)
+        if conflict_action == "block":
+            await update.message.reply_text(
+                f"⛔ <b>КОНФЛИКТ {sym}:</b> {conflict_reason}", parse_mode='HTML'
+            )
+            try:
+                await send_alert(
+                    context.bot, ALLOWED_ID, "WARNING", FAIL_CLOSED,
+                    f"Signal conflict for {sym}: {conflict_reason}",
+                    dedup_key=f"conflict_block_{sym}",
+                )
+            except Exception:
+                pass
+            return
+        elif conflict_action == "ignore":
+            await update.message.reply_text(
+                f"⚠️ <b>ИГНОР {sym}:</b> {conflict_reason}", parse_mode='HTML'
+            )
+            return
+        # "allow" or "add" → continue with normal flow
 
         # Расчет риска и плеча
         current_risk = get_global_risk()

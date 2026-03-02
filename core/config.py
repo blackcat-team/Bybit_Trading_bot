@@ -33,6 +33,16 @@ MARGIN_BUFFER_PCT = float(os.getenv('MARGIN_BUFFER_PCT', 0.03))  # 3% запас
 DAILY_LOSS_LIMIT = -50.0  # Макс дневной убыток (остановит торговлю)
 ORDER_TIMEOUT_DAYS = 3    # Через сколько дней удалять висячие лимитки
 
+# --- SIGNAL CONFLICT POLICY ---
+# CONFLICT_POLICY_SAME_DIR: what to do when a signal arrives for a symbol+direction
+#   that already has an open position or pending entry.
+#   "ignore"         — silently drop the signal (default, backward-compatible)
+#   "add_if_allowed" — allow adding if SOURCE_ALLOW_ADD=1 and heat budget permits
+CONFLICT_POLICY_SAME_DIR = os.getenv('CONFLICT_POLICY_SAME_DIR', 'ignore').lower()
+# SOURCE_ALLOW_ADD: 1 = adding to an existing same-direction position is permitted.
+#   Only relevant when CONFLICT_POLICY_SAME_DIR=add_if_allowed.
+SOURCE_ALLOW_ADD = os.getenv('SOURCE_ALLOW_ADD', '0') == '1'
+
 # --- RISK BUDGET / HEAT ---
 # MAX_TOTAL_HEAT_USDT: sum of risk-at-stop across all open+pending trades.
 #   0 = disabled (default).  Set >0 to enforce.
