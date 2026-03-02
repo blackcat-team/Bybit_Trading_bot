@@ -7,6 +7,7 @@ from .signal_parser import parse_and_trade, parse_signal
 from .commands import (
     start_trading, stop_trading,
     set_risk_command, add_note_handler,
+    status_command,
 )
 
 from .buttons import button_handler

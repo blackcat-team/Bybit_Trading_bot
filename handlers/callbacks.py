@@ -6,6 +6,7 @@ Keeps handlers.__init__ and bot_handlers working without import changes.
 from handlers.commands import (                    # noqa: F401
     start_trading, stop_trading,
     set_risk_command, add_note_handler,
+    status_command,
 )
 from handlers.buttons import button_handler        # noqa: F401
 from handlers.views_orders import (                # noqa: F401

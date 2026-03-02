@@ -13,7 +13,8 @@ from core.trading_core import session
 from handlers import (
     start_trading, stop_trading, check_positions,
     send_report, add_note_handler, button_handler,
-    parse_and_trade, set_risk_command, view_orders, on_startup_check
+    parse_and_trade, set_risk_command, view_orders, on_startup_check,
+    status_command,
 )
 from app.jobs import daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job, heartbeat_job, time_management_job
 
@@ -120,6 +121,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("report", send_report))
     app.add_handler(CommandHandler("note", add_note_handler))
     app.add_handler(CommandHandler("risk", set_risk_command))
+    app.add_handler(CommandHandler("status", status_command))
 
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), parse_and_trade))

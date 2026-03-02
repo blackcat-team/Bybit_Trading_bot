@@ -1,9 +1,10 @@
 """
-TG command handlers — /start, /stop, /risk, /note.
+TG command handlers — /start, /stop, /risk, /note, /status.
 """
 
 import asyncio
 import logging
+from datetime import datetime
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -13,7 +14,9 @@ from core.database import (
     add_comment,
     is_trading_enabled, set_trading_enabled,
     get_global_risk, set_global_risk,
+    _MARKET_PENDING, SOURCES_DB,
 )
+from core.bybit_call import bybit_call
 
 
 async def start_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -70,3 +73,76 @@ async def add_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Заметка для {sym} сохранена.")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка заметки: {e}")
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /status — быстрый снимок состояния бота.
+    Выводит: торговля вкл/выкл, дневной PnL, позиции, ожидающие маркет-входы,
+    последний алерт, сводку источников.
+    Все Bybit-вызовы — graceful fallback при ошибке API.
+    """
+    if str(update.effective_user.id) != ALLOWED_ID:
+        return
+
+    # ── 1. Trading enabled ────────────────────────────────────────────────
+    trading_str = "✅ ON" if is_trading_enabled() else "🛑 OFF"
+
+    # ── 2. Daily PnL + open positions (Bybit, graceful) ──────────────────
+    daily_pnl_str = "N/A"
+    pos_count_str = "N/A"
+    pending_orders_str = "N/A"
+    try:
+        from core.trading_core import session, check_daily_limit
+        _, pnl = await bybit_call(check_daily_limit)
+        daily_pnl_str = f"{pnl:+.2f}$"
+
+        pos_resp = await bybit_call(
+            session.get_positions, category="linear", settleCoin="USDT"
+        )
+        positions = [p for p in pos_resp["result"]["list"] if float(p["size"]) > 0]
+        pos_count_str = str(len(positions))
+
+        orders_resp = await bybit_call(
+            session.get_open_orders, category="linear", settleCoin="USDT"
+        )
+        entry_orders = [
+            o for o in orders_resp["result"]["list"]
+            if not o.get("reduceOnly", False)
+        ]
+        pending_orders_str = str(len(entry_orders))
+    except Exception:
+        pass
+
+    # ── 3. Pending market entries (in-memory) ────────────────────────────
+    mkt_pending_str = str(len(_MARKET_PENDING))
+
+    # ── 4. Sources (unique tags seen, count) ─────────────────────────────
+    src_count = len(SOURCES_DB)
+    src_list = ", ".join(list(SOURCES_DB.keys())[:6]) if SOURCES_DB else "—"
+    sources_str = f"{src_count} ({src_list})"
+
+    # ── 5. Last alert ─────────────────────────────────────────────────────
+    from core.notifier import get_last_alert
+    last = get_last_alert()
+    if last:
+        ts_str = datetime.fromtimestamp(last["ts"]).strftime("%H:%M:%S")
+        last_alert_str = f"[{last['level']}/{last['class']}] {ts_str} — {last['msg'][:60]}"
+    else:
+        last_alert_str = "none"
+
+    # ── 6. Heat (placeholder until Commit 3) ─────────────────────────────
+    heat_str = "disabled (set MAX_TOTAL_HEAT_USDT to enable)"
+
+    lines = [
+        "📊 <b>BOT STATUS</b>",
+        f"Trading:         {trading_str}",
+        f"Daily PnL:       {daily_pnl_str}",
+        f"Open positions:  {pos_count_str}",
+        f"Entry orders:    {pending_orders_str}",
+        f"Mkt pending:     {mkt_pending_str}",
+        f"Sources seen:    {sources_str}",
+        f"Heat:            {heat_str}",
+        f"Last alert:      {last_alert_str}",
+    ]
+    await update.message.reply_html("\n".join(lines))
