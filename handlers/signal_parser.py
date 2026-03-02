@@ -9,7 +9,7 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from core.config import ALLOWED_ID
+from core.config import ALLOWED_ID, REQUIRE_MARKET_CONFIRM
 from core.trading_core import session, check_daily_limit
 from core.notifier import send_alert, FAIL_CLOSED
 from core.heat import enforce_heat
@@ -24,6 +24,25 @@ from core.database import (
 from handlers.preflight import clip_qty, validate_qty, get_available_usd
 from handlers.orders import set_leverage_safe, place_limit_order, bybit_call
 from handlers.ui import format_market_signal, format_limit_signal
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _market_callback(sym: str, side: str, stop_val, qty, lev,
+                     require_confirm: int) -> tuple:
+    """Return (button_label, callback_data) for the market-entry inline button.
+
+    Pure function — testable without mocking config.
+    When require_confirm=1: first tap shows a preview; confirm tap executes.
+    When require_confirm=0: tap immediately executes (backward-compatible).
+    """
+    if require_confirm:
+        return ("👁 PREVIEW TRADE",
+                f"mkt_preview|{sym}|{side}|{stop_val}|{qty}|{lev}")
+    return ("⚡️ GO MARKET",
+            f"buy_market|{sym}|{side}|{stop_val}|{qty}|{lev}")
 
 
 # ---------------------------------------------------------------------------
@@ -335,12 +354,10 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = format_market_signal(
                 sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag
             )
-            kb = [[
-                InlineKeyboardButton(
-                    "⚡️ GO MARKET",
-                    callback_data=f"buy_market|{sym}|{side}|{stop_val}|{qty}|{effective_lev}",
-                )
-            ]]
+            btn_label, cb_data = _market_callback(
+                sym, side, stop_val, qty, effective_lev, REQUIRE_MARKET_CONFIRM
+            )
+            kb = [[InlineKeyboardButton(btn_label, callback_data=cb_data)]]
             await update.message.reply_html(msg, reply_markup=InlineKeyboardMarkup(kb))
         else:
             msg = format_limit_signal(

@@ -4,19 +4,30 @@ Inline-keyboard callback router — button_handler.
 
 import asyncio
 import logging
+import time
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram import error as tg_error
 from telegram.ext import ContextTypes
 
-from core.config import ALLOWED_ID
-from core.database import update_risk_for_symbol, log_source, pop_market_pending
+from core.config import ALLOWED_ID, REQUIRE_MARKET_CONFIRM, MARKET_PREVIEW_TTL_SEC
+from core.database import update_risk_for_symbol, log_source, pop_market_pending, _MARKET_PENDING
 from core.journal import append_event, ENTRY_PLACED
 from core.trading_core import session, place_tp_ladder
 from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_qty
 from handlers.orders import place_market_with_retry, close_position_market, bybit_call
 from handlers.views_orders import view_orders, view_symbol_orders
 from handlers.views_positions import check_positions
+
+
+# Preview timestamp store: sym → epoch when user tapped "PREVIEW TRADE".
+# Consumed (popped) once the user taps "CONFIRM" to prevent double-execution.
+_PREVIEW_TS: dict = {}
+
+
+def _preview_is_fresh(sym: str, ttl_sec: int) -> bool:
+    """Return True if a valid, unexpired preview exists for sym."""
+    return time.time() - _PREVIEW_TS.get(sym, 0.0) <= ttl_sec
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -115,9 +126,83 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "refresh_orders":
             await view_orders(update, context)
 
+        elif data.startswith("mkt_preview|"):
+            _, sym, side, sl, qty_str, lev_str = data.split("|")
+            lev = int(float(lev_str))
+            qty = float(qty_str)
+            sl_float = float(sl)
+
+            # Fetch fresh price (graceful fallback to 0)
+            entry_price = 0.0
+            try:
+                ticker = await bybit_call(session.get_tickers, category="linear", symbol=sym)
+                entry_price = float(ticker['result']['list'][0]['lastPrice'])
+            except Exception:
+                pass
+
+            # Compute projected heat (graceful fallback)
+            heat_after = 0.0
+            max_heat = 0.0
+            try:
+                from core.config import MAX_TOTAL_HEAT_USDT
+                from core.heat import compute_current_heat
+                max_heat = MAX_TOTAL_HEAT_USDT
+                if max_heat > 0:
+                    cur_heat, _ = await compute_current_heat()
+                    pending = _MARKET_PENDING.get(sym)
+                    risk_for_heat = pending[0] if pending else 0.0
+                    heat_after = cur_heat + risk_for_heat
+            except Exception:
+                pass
+
+            # Get risk + source from pending store
+            risk_usd = 0.0
+            source_tag = "#Manual"
+            try:
+                pending = _MARKET_PENDING.get(sym)
+                if pending:
+                    risk_usd, source_tag = pending
+            except Exception:
+                pass
+
+            pos_value_usd = qty * entry_price if entry_price > 0 else 0.0
+
+            from handlers.ui import format_market_preview
+            preview_msg = format_market_preview(
+                sym, side, lev, entry_price, sl_float, qty, pos_value_usd,
+                risk_usd, source_tag, heat_after, max_heat,
+            )
+
+            confirm_cb = f"buy_market|{sym}|{side}|{sl}|{qty_str}|{lev_str}"
+            kb = [[
+                InlineKeyboardButton("✅ CONFIRM", callback_data=confirm_cb),
+                InlineKeyboardButton("❌ CANCEL", callback_data=f"mkt_cancel|{sym}"),
+            ]]
+            _PREVIEW_TS[sym] = time.time()
+            await query.edit_message_text(
+                preview_msg, parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+
+        elif data.startswith("mkt_cancel|"):
+            _, sym = data.split("|")
+            _PREVIEW_TS.pop(sym, None)
+            await query.edit_message_text(
+                f"❌ <b>Отменено.</b> {sym} не торгуется.", parse_mode='HTML'
+            )
+
         elif data.startswith("buy_market|"):
             _, sym, side, sl, qty_str, lev_str = data.split("|")
             lev = int(float(lev_str))
+
+            # TTL gate: only active when preview-confirm mode is on.
+            if REQUIRE_MARKET_CONFIRM and not _preview_is_fresh(sym, MARKET_PREVIEW_TTL_SEC):
+                await query.edit_message_text(
+                    f"⏰ <b>Preview expired.</b> Отправьте сигнал заново для {sym}.",
+                    parse_mode='HTML',
+                )
+                return
+            _PREVIEW_TS.pop(sym, None)  # consume the preview token
             qty_from_cb = float(qty_str)
             order_side = "Buy" if side == "LONG" else "Sell"
 

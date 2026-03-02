@@ -30,6 +30,8 @@ _cfg.ALLOWED_ID = "0"
 _cfg.MARGIN_BUFFER_USD = 1.0
 _cfg.MARGIN_BUFFER_PCT = 0.03
 _cfg.DATA_DIR = _Path(__file__).resolve().parent.parent / "data"
+_cfg.REQUIRE_MARKET_CONFIRM = 0   # preview mode OFF for all p12 tests
+_cfg.MARKET_PREVIEW_TTL_SEC = 300
 sys.modules["core.config"] = _cfg
 
 # The ALLOWED_ID name is bound at module-import time in handlers.buttons (may be "0"
@@ -129,6 +131,7 @@ class TestMarketFallbackSafety:
         ]
 
         with patch("handlers.buttons.ALLOWED_ID", _UID), \
+             patch("handlers.buttons.REQUIRE_MARKET_CONFIRM", 0), \
              patch("handlers.buttons.bybit_call", _seq_bybit(responses)):
             await button_handler(update, ctx)
 
@@ -156,6 +159,7 @@ class TestMarketFallbackSafety:
 
         # clip_qty raises after lot filter is already set, triggering the fallback
         with patch("handlers.buttons.ALLOWED_ID", _UID), \
+             patch("handlers.buttons.REQUIRE_MARKET_CONFIRM", 0), \
              patch("handlers.buttons.bybit_call", _seq_bybit(responses)), \
              patch("handlers.buttons.clip_qty", side_effect=RuntimeError("clip failed")):
             await button_handler(update, ctx)
@@ -183,6 +187,7 @@ class TestMarketFallbackSafety:
         ]
 
         with patch("handlers.buttons.ALLOWED_ID", _UID), \
+             patch("handlers.buttons.REQUIRE_MARKET_CONFIRM", 0), \
              patch("handlers.buttons.bybit_call", _seq_bybit(responses)), \
              patch("handlers.buttons.clip_qty", side_effect=RuntimeError("clip failed")):
             await button_handler(update, ctx)
@@ -209,6 +214,7 @@ class TestMarketFallbackSafety:
         ]
 
         with patch("handlers.buttons.ALLOWED_ID", _UID), \
+             patch("handlers.buttons.REQUIRE_MARKET_CONFIRM", 0), \
              patch("handlers.buttons.bybit_call", _seq_bybit(responses)), \
              patch("handlers.buttons.clip_qty", side_effect=RuntimeError("clip failed")), \
              patch("handlers.buttons.validate_qty", side_effect=ValueError("bad qty data")):

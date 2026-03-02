@@ -75,3 +75,10 @@ SOURCES_FILE = DATA_DIR / "sources_log.json"
 HEAT_QUEUE_FILE = DATA_DIR / "heat_queue.json"
 JOURNAL_FILE = DATA_DIR / "trade_journal.jsonl"
 DISABLED_SOURCES_FILE = DATA_DIR / "disabled_sources.json"
+
+# --- MARKET TRADE PREVIEW / CONFIRM ---
+# REQUIRE_MARKET_CONFIRM: 0 (default) = existing GO MARKET behavior unchanged.
+#   1 = first tap shows a detailed trade preview; user must tap CONFIRM to place.
+REQUIRE_MARKET_CONFIRM = int(os.getenv('REQUIRE_MARKET_CONFIRM', 0))
+# MARKET_PREVIEW_TTL_SEC: seconds the confirm button stays valid after preview.
+MARKET_PREVIEW_TTL_SEC = int(os.getenv('MARKET_PREVIEW_TTL_SEC', 300))
