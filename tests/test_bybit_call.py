@@ -59,17 +59,47 @@ async def test_bybit_call_propagates_exception():
 
 
 @pytest.mark.asyncio
-async def test_bybit_call_slow_warning(caplog):
-    """Calls exceeding threshold emit a WARNING log."""
+async def test_bybit_call_slow_debug_by_default(caplog):
+    """Calls exceeding threshold log at DEBUG by default — no WARNING emitted."""
     import time
+    import core.bybit_call as _bbc
     from handlers.orders import _SLOW_CALL_THRESHOLD
 
     def slow_fn():
         time.sleep(_SLOW_CALL_THRESHOLD + 0.1)
         return "done"
 
-    with caplog.at_level(logging.WARNING):
-        result = await bybit_call(slow_fn)
+    orig = _bbc._SLOW_CALL_WARN
+    try:
+        _bbc._SLOW_CALL_WARN = False  # enforce default
+        with caplog.at_level(logging.DEBUG):
+            result = await bybit_call(slow_fn)
+    finally:
+        _bbc._SLOW_CALL_WARN = orig
 
     assert result == "done"
-    assert any("Slow Bybit call" in msg for msg in caplog.messages)
+    assert not any(r.levelno == logging.WARNING and "Slow" in r.message for r in caplog.records)
+    assert any("bybit_call slow" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_bybit_call_slow_warning_when_opted_in(caplog):
+    """BYBIT_SLOW_CALL_WARN=1 promotes slow-call log to WARNING."""
+    import time
+    import core.bybit_call as _bbc
+    from handlers.orders import _SLOW_CALL_THRESHOLD
+
+    def slow_fn():
+        time.sleep(_SLOW_CALL_THRESHOLD + 0.1)
+        return "done"
+
+    orig = _bbc._SLOW_CALL_WARN
+    try:
+        _bbc._SLOW_CALL_WARN = True
+        with caplog.at_level(logging.WARNING):
+            result = await bybit_call(slow_fn)
+    finally:
+        _bbc._SLOW_CALL_WARN = orig
+
+    assert result == "done"
+    assert any("Slow Bybit call" in r.message for r in caplog.records)

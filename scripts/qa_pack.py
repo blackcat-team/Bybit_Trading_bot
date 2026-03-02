@@ -7,6 +7,7 @@ import argparse
 import dataclasses
 import hashlib
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -235,6 +236,38 @@ def which_rg() -> Optional[str]:
     return shutil.which("rg")
 
 
+def _scan_file(compiled: re.Pattern, path: Path, cwd: Path) -> List[str]:
+    """Scan a single file for regex matches; return lines in 'rel/path:lineno:text' format."""
+    results: List[str] = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        rel = path.relative_to(cwd).as_posix()
+        for i, line in enumerate(text.splitlines(), 1):
+            if compiled.search(line):
+                results.append(f"{rel}:{i}:{line}")
+    except Exception:
+        pass
+    return results
+
+
+def python_grep_gate(pattern: str, paths: List[str], cwd: Path) -> str:
+    """Pure-Python fallback for 'rg -n pattern path...' producing identical output format.
+
+    Paths ending with '/' (or that are directories) are walked recursively for *.py files.
+    Single .py file paths are scanned directly.
+    """
+    compiled = re.compile(pattern)
+    lines: List[str] = []
+    for raw_path in paths:
+        target = cwd / raw_path
+        if raw_path.endswith("/") or (target.exists() and target.is_dir()):
+            for py_file in sorted(target.rglob("*.py")):
+                lines.extend(_scan_file(compiled, py_file, cwd))
+        elif target.is_file():
+            lines.extend(_scan_file(compiled, target, cwd))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build QA pack zip (src+evidence) for an exact git commit.")
     ap.add_argument("--stage", required=True, help="Stage name (e.g. p10_asyncwrap)")
@@ -351,16 +384,24 @@ def main() -> None:
                     )
                     write_text(logs_dir / f"{prefix}_compileall_rc.txt", f"{rc}\n")
 
-                # rg gates (best-effort)
+                # grep gates: always produce outputs (Python fallback when rg is missing)
                 if not args.skip_grep:
                     rg_path = which_rg()
                     write_text(logs_dir / f"{prefix}_rg_present.txt", (rg_path or "NOT_FOUND") + "\n")
-                    if not rg_path:
-                        write_text(logs_dir / f"{prefix}_rg_skipped.txt", "SKIP: rg not found in PATH. Install ripgrep or skip.\n")
-                    else:
+                    if rg_path:
+                        write_text(logs_dir / f"{prefix}_grep_method.txt", "rg\n")
                         for name, gate_args in RG_GATES:
                             out = logs_dir / f"{prefix}_{name}.txt"
                             rc = run_capture_to_file(["rg", "-n", *gate_args], worktree_dir, out)
+                            write_text(logs_dir / f"{prefix}_{name}_rc.txt", f"{rc}\n")
+                    else:
+                        write_text(logs_dir / f"{prefix}_grep_method.txt", "python_fallback\n")
+                        for name, gate_args in RG_GATES:
+                            pattern = gate_args[0]
+                            paths = gate_args[1:]
+                            content = python_grep_gate(pattern, paths, worktree_dir)
+                            write_text(logs_dir / f"{prefix}_{name}.txt", content if content.strip() else "(no matches)\n")
+                            rc = 0 if content.strip() else 1
                             write_text(logs_dir / f"{prefix}_{name}_rc.txt", f"{rc}\n")
 
             finally:

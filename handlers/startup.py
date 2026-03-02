@@ -12,7 +12,7 @@ from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID, DATA_DIR
 from core.trading_core import session
-from handlers.orders import bybit_call
+from core.bybit_call import bybit_call
 
 STARTUP_MARKER_FILE = DATA_DIR / "startup_last.txt"
 
