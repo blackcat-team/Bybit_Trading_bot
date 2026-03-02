@@ -1,3 +1,4 @@
+import asyncio
 import time
 import logging
 from datetime import datetime, timedelta
@@ -369,8 +370,9 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Get journal to avoid duplicate CLOSED events
+        _closed_evs = await asyncio.to_thread(read_events, event_type=CLOSED)
         already_closed = {
-            ev["symbol"] for ev in read_events(event_type=CLOSED)
+            ev["symbol"] for ev in _closed_evs
             if ev.get("ts", 0) > time.time() - 7 * 86400  # last 7 days
         }
 
@@ -398,7 +400,7 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
                 close_ts = int(t.get("updatedTime", time.time() * 1000))
                 src = get_source_at_time(sym, close_ts)
 
-                append_event({
+                await asyncio.to_thread(append_event, {
                     "event": CLOSED,
                     "symbol": sym,
                     "side": t.get("side", ""),
@@ -418,7 +420,7 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
 
         # Auto-quarantine check
         try:
-            quarantined = check_and_quarantine_sources()
+            quarantined = await asyncio.to_thread(check_and_quarantine_sources)
             for tag, reason in quarantined:
                 await send_alert(
                     context.bot, ALLOWED_ID, "WARNING", FAIL_CLOSED,
@@ -444,7 +446,7 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
 async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
     """Send weekly source statistics report to owner."""
     try:
-        stats = compute_source_stats(since_ts=time.time() - 7 * 86400)
+        stats = await asyncio.to_thread(compute_source_stats, since_ts=time.time() - 7 * 86400)
         disabled = get_disabled_sources()
 
         if not stats:

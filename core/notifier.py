@@ -18,6 +18,7 @@ Startup wiring (called once from main.py so bybit_call can send alerts):
     configure_alerts(app.bot, ALLOWED_ID)
 """
 
+import html
 import logging
 import time
 
@@ -117,13 +118,14 @@ async def alert_bybit_error(exc: Exception, fn_name: str) -> None:
         return
     cls = classify_error(exc)
     dedup_key = f"bybit_err_{cls}_{fn_name}"
-    safe_msg = str(exc)[:120]
+    safe_msg = html.escape(str(exc)[:120])
+    safe_fn = html.escape(fn_name)
     await send_alert(
         _alert_bot,
         _alert_owner_id,
         level="ERROR",
         alert_class=cls,
-        msg=f"Bybit error in <code>{fn_name}</code>:\n<code>{safe_msg}</code>",
+        msg=f"Bybit error in <code>{safe_fn}</code>:\n<code>{safe_msg}</code>",
         dedup_key=dedup_key,
     )
 
