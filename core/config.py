@@ -33,6 +33,16 @@ MARGIN_BUFFER_PCT = float(os.getenv('MARGIN_BUFFER_PCT', 0.03))  # 3% запас
 DAILY_LOSS_LIMIT = -50.0  # Макс дневной убыток (остановит торговлю)
 ORDER_TIMEOUT_DAYS = 3    # Через сколько дней удалять висячие лимитки
 
+# --- TRADE JOURNAL & SOURCE QUARANTINE ---
+# QUARANTINE_LOSS_STREAK: disable a source after N consecutive losses.
+#   0 = disabled (default)
+QUARANTINE_LOSS_STREAK = int(os.getenv('QUARANTINE_LOSS_STREAK', 0))
+# QUARANTINE_DAILY_PNL_USDT: disable source if daily PnL falls below this.
+#   0 = disabled (default). Negative value = allow some loss.
+QUARANTINE_DAILY_PNL_USDT = float(os.getenv('QUARANTINE_DAILY_PNL_USDT', 0))
+# QUARANTINE_WEEKLY_PNL_USDT: same, weekly window.
+QUARANTINE_WEEKLY_PNL_USDT = float(os.getenv('QUARANTINE_WEEKLY_PNL_USDT', 0))
+
 # --- SIGNAL CONFLICT POLICY ---
 # CONFLICT_POLICY_SAME_DIR: what to do when a signal arrives for a symbol+direction
 #   that already has an open position or pending entry.
@@ -63,3 +73,5 @@ RISK_FILE = DATA_DIR / "risk_data.json"
 COMMENTS_FILE = DATA_DIR / "journal_comments.json"
 SOURCES_FILE = DATA_DIR / "sources_log.json"
 HEAT_QUEUE_FILE = DATA_DIR / "heat_queue.json"
+JOURNAL_FILE = DATA_DIR / "trade_journal.jsonl"
+DISABLED_SOURCES_FILE = DATA_DIR / "disabled_sources.json"

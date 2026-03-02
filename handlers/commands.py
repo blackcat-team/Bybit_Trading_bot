@@ -117,10 +117,16 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── 3. Pending market entries (in-memory) ────────────────────────────
     mkt_pending_str = str(len(_MARKET_PENDING))
 
-    # ── 4. Sources (unique tags seen, count) ─────────────────────────────
+    # ── 4. Sources (seen + quarantined) ──────────────────────────────────
     src_count = len(SOURCES_DB)
     src_list = ", ".join(list(SOURCES_DB.keys())[:6]) if SOURCES_DB else "—"
-    sources_str = f"{src_count} ({src_list})"
+    try:
+        from core.journal import get_disabled_sources
+        disabled = get_disabled_sources()
+        dis_str = ", ".join(disabled.keys()) if disabled else "none"
+    except Exception:
+        dis_str = "N/A"
+    sources_str = f"{src_count} seen | quarantined: {dis_str}"
 
     # ── 5. Last alert ─────────────────────────────────────────────────────
     from core.notifier import get_last_alert

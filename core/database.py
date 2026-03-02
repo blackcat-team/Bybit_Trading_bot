@@ -92,6 +92,11 @@ def init_db():
     SOURCES_DB = load_json(SOURCES_FILE, {})
     SETTINGS = _load_settings_fail_closed()
     HEAT_QUEUE = load_json(HEAT_QUEUE_FILE, [])
+    try:
+        from core.journal import load_disabled_sources
+        load_disabled_sources()
+    except Exception as e:
+        logging.warning("init_db: load_disabled_sources failed: %s", e)
     print("✅ Database loaded successfully.")
 
 

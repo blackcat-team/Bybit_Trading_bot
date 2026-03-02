@@ -16,7 +16,11 @@ from handlers import (
     parse_and_trade, set_risk_command, view_orders, on_startup_check,
     status_command,
 )
-from app.jobs import daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job, heartbeat_job, time_management_job
+from app.jobs import (
+    daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job,
+    heartbeat_job, time_management_job,
+    reconcile_journal_job, weekly_source_report_job,
+)
 from core.notifier import configure_alerts
 
 # Инициализация цветов
@@ -151,6 +155,12 @@ if __name__ == '__main__':
 
     # 6. Тайм-менеджмент позиций (Раз в 4 часа)
     jq.run_repeating(time_management_job, interval=14400, first=300)
+
+    # 7. Reconcile journal (Раз в час — после cleanup)
+    jq.run_repeating(reconcile_journal_job, interval=3600, first=120)
+
+    # 8. Weekly source stats report (Каждый понедельник в 09:00 UTC)
+    jq.run_daily(weekly_source_report_job, time=time(hour=9, minute=0, tzinfo=pytz.UTC), days=(0,))
 
     print("✅ Background jobs started...")
 

@@ -5,10 +5,15 @@ from telegram.ext import ContextTypes
 
 
 from core.config import ALLOWED_ID, ORDER_TIMEOUT_DAYS
-from core.database import is_trading_enabled, get_risk_for_symbol
+from core.database import is_trading_enabled, get_risk_for_symbol, RISK_MAPPING
 from core.trading_core import session
 from core.bybit_call import bybit_call
-from core.notifier import send_alert, WARNING
+from core.notifier import send_alert, WARNING, FAIL_CLOSED
+from core.journal import (
+    append_event, read_events, CLOSED,
+    compute_source_stats, check_and_quarantine_sources,
+    get_disabled_sources,
+)
 
 # Засекаем время старта
 START_TIME = time.time()
@@ -334,3 +339,134 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+
+
+# --- 6. Reconcile journal (detect closed trades) ---
+async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Detect positions that closed since the last check.
+
+    Strategy:
+    - List symbols in RISK_MAPPING (had entries placed)
+    - Get current open positions from Bybit
+    - For each symbol that was tracked but has no open position:
+        Fetch last closed PnL via get_closed_pnl and write CLOSED event.
+    - Run auto-quarantine check on updated stats.
+    """
+    try:
+        _pos_resp = await bybit_call(
+            session.get_positions, category="linear", settleCoin="USDT"
+        )
+        open_syms = {
+            p["symbol"] for p in _pos_resp["result"]["list"] if float(p.get("size", 0)) > 0
+        }
+
+        # Symbols we track but no longer open
+        tracked_syms = set(RISK_MAPPING.keys())
+        closed_candidates = tracked_syms - open_syms
+
+        if not closed_candidates:
+            return
+
+        # Get journal to avoid duplicate CLOSED events
+        already_closed = {
+            ev["symbol"] for ev in read_events(event_type=CLOSED)
+            if ev.get("ts", 0) > time.time() - 7 * 86400  # last 7 days
+        }
+
+        for sym in closed_candidates:
+            if sym in already_closed:
+                continue
+            try:
+                now_ms = int(time.time() * 1000)
+                start_ms = now_ms - 7 * 24 * 60 * 60 * 1000  # last 7 days
+                pnl_resp = await bybit_call(
+                    session.get_closed_pnl,
+                    category="linear", symbol=sym,
+                    startTime=start_ms, limit=1,
+                )
+                trades = pnl_resp.get("result", {}).get("list", [])
+                if not trades:
+                    continue
+
+                t = trades[0]
+                pnl_usdt = float(t.get("closedPnl", 0))
+                risk_usd = get_risk_for_symbol(sym) or 1.0
+                r_val = pnl_usdt / risk_usd if risk_usd > 0 else 0.0
+
+                from core.database import get_source_at_time
+                close_ts = int(t.get("updatedTime", time.time() * 1000))
+                src = get_source_at_time(sym, close_ts)
+
+                append_event({
+                    "event": CLOSED,
+                    "symbol": sym,
+                    "side": t.get("side", ""),
+                    "source_tag": src,
+                    "planned_risk_usdt": risk_usd,
+                    "qty": float(t.get("qty", 0)),
+                    "entry": float(t.get("avgEntryPrice", 0)),
+                    "stop": 0.0,
+                    "exit": float(t.get("avgExitPrice", 0)),
+                    "pnl_usdt": pnl_usdt,
+                    "R": round(r_val, 2),
+                    "hold_time_sec": 0,
+                })
+                logging.info("Reconcile: CLOSED event written for %s (PnL %.2f$)", sym, pnl_usdt)
+            except Exception as sym_err:
+                logging.debug("reconcile: %s: %s", sym, sym_err)
+
+        # Auto-quarantine check
+        try:
+            quarantined = check_and_quarantine_sources()
+            for tag, reason in quarantined:
+                await send_alert(
+                    context.bot, ALLOWED_ID, "WARNING", FAIL_CLOSED,
+                    f"Source quarantined: <b>{tag}</b>\nReason: {reason}",
+                    dedup_key=f"quarantine_{tag}",
+                )
+        except Exception as qe:
+            logging.debug("quarantine check error: %s", qe)
+
+    except Exception as e:
+        logging.error("Reconcile job error: %s", e)
+        try:
+            await send_alert(
+                context.bot, ALLOWED_ID, "WARNING", WARNING,
+                f"Reconcile job error: {str(e)[:100]}",
+                dedup_key="job_reconcile_error",
+            )
+        except Exception:
+            pass
+
+
+# --- 7. Weekly source stats report ---
+async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
+    """Send weekly source statistics report to owner."""
+    try:
+        stats = compute_source_stats(since_ts=time.time() - 7 * 86400)
+        disabled = get_disabled_sources()
+
+        if not stats:
+            await context.bot.send_message(
+                chat_id=ALLOWED_ID,
+                text="📊 <b>Weekly Source Report:</b>\nNo closed trades this week.",
+                parse_mode='HTML',
+            )
+            return
+
+        lines = ["📊 <b>Weekly Source Report</b>"]
+        for tag, s in sorted(stats.items(), key=lambda x: x[1]["total_pnl"], reverse=True):
+            status = "⛔ QUARANTINED" if tag in disabled else "✅"
+            lines.append(
+                f"\n{status} <b>{tag}</b>\n"
+                f"  PnL: {s['total_pnl']:+.2f}$ | "
+                f"WR: {s['winrate']:.0f}% ({s['wins']}W/{s['losses']}L) | "
+                f"AvgR: {s['avg_r']:+.2f} | Streak: {s['loss_streak']}L"
+            )
+
+        await context.bot.send_message(
+            chat_id=ALLOWED_ID, text="\n".join(lines), parse_mode='HTML'
+        )
+    except Exception as e:
+        logging.error("Weekly report job error: %s", e)

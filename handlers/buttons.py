@@ -11,6 +11,7 @@ from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID
 from core.database import update_risk_for_symbol, log_source, pop_market_pending
+from core.journal import append_event, ENTRY_PLACED
 from core.trading_core import session, place_tp_ladder
 from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_qty
 from handlers.orders import place_market_with_retry, close_position_market, bybit_call
@@ -217,6 +218,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if success:
                 # Write risk+source to disk only after the order is confirmed.
+                risk_val, src_val = None, None
                 try:
                     pending = pop_market_pending(sym)
                     if pending:
@@ -225,6 +227,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await asyncio.to_thread(log_source, sym, src_val)
                 except Exception as pend_err:
                     logging.warning("post-market pending write failed for %s: %s", sym, pend_err)
+                # Journal ENTRY_PLACED for market order
+                try:
+                    await asyncio.to_thread(
+                        append_event,
+                        {
+                            "event": ENTRY_PLACED, "symbol": sym,
+                            "side": side, "source_tag": src_val or "unknown",
+                            "planned_risk_usdt": risk_val or 0.0,
+                            "qty": final_qty, "entry": 0.0, "stop": float(sl),
+                            "order_type": "market",
+                        },
+                    )
+                except Exception as je:
+                    logging.debug("journal ENTRY_PLACED failed: %s", je)
                 await query.edit_message_text(msg_text)
             else:
                 await query.edit_message_text(msg_text)

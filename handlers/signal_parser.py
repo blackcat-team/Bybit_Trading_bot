@@ -14,6 +14,7 @@ from core.trading_core import session, check_daily_limit
 from core.notifier import send_alert, FAIL_CLOSED
 from core.heat import enforce_heat
 from core.conflict import resolve_signal_conflict
+from core.journal import is_source_enabled, append_event, ENTRY_PLACED
 from core.database import (
     log_source, update_risk_for_symbol,
     get_risk_for_symbol, is_trading_enabled,
@@ -160,6 +161,14 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source_tag = sig["source_tag"]
 
         sym = f"{coin}USDT"
+
+        # ── Source quarantine check ────────────────────────────────────────
+        if not is_source_enabled(source_tag):
+            await update.message.reply_text(
+                f"⛔ <b>Source quarantined:</b> {source_tag}. New signals from this source are blocked.",
+                parse_mode='HTML',
+            )
+            return
 
         # --- Проверка существования монеты ---
         try:
@@ -342,6 +351,15 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Write risk+source only after successful limit order placement.
             await asyncio.to_thread(update_risk_for_symbol, sym, current_risk)
             await asyncio.to_thread(log_source, sym, source_tag)
+            await asyncio.to_thread(
+                append_event,
+                {
+                    "event": ENTRY_PLACED, "symbol": sym, "side": side,
+                    "source_tag": source_tag, "planned_risk_usdt": current_risk,
+                    "qty": qty, "entry": entry_price, "stop": stop_val,
+                    "order_type": "limit",
+                },
+            )
             await update.message.reply_html(msg, reply_markup=InlineKeyboardMarkup(kb))
 
     except Exception as e:
