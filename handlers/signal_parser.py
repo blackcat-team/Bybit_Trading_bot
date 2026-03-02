@@ -11,6 +11,7 @@ from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID
 from core.trading_core import session, check_daily_limit, has_open_trade
+from core.notifier import send_alert, FAIL_CLOSED
 from core.database import (
     log_source, update_risk_for_symbol,
     get_risk_for_symbol, is_trading_enabled,
@@ -134,6 +135,14 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"⛔️ <b>ЛИМИТ!</b>\nУбыток: {pnl_today:.2f}$.", parse_mode='HTML'
             )
+            try:
+                await send_alert(
+                    context.bot, ALLOWED_ID, "WARNING", FAIL_CLOSED,
+                    f"Daily loss limit hit: PnL={pnl_today:.2f}$. Trading blocked.",
+                    dedup_key="fail_closed_daily_limit",
+                )
+            except Exception:
+                pass
             return
 
         # --- Парсинг сигнала ---

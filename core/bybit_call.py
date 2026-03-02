@@ -26,13 +26,24 @@ async def bybit_call(fn, *args, **kwargs):
 
     Calls slower than _SLOW_CALL_THRESHOLD seconds log at DEBUG by default.
     Set BYBIT_SLOW_CALL_WARN=1 to promote slow-call logs to WARNING.
-    All exceptions propagate unchanged.
+
+    On exception: classifies the error and sends a deduped owner alert
+    (if configure_alerts() was called at startup), then re-raises unchanged.
     """
+    name = getattr(fn, "__name__", None) or getattr(fn, "__qualname__", str(fn))
     t0 = time.monotonic()
-    result = await asyncio.to_thread(fn, *args, **kwargs)
+    try:
+        result = await asyncio.to_thread(fn, *args, **kwargs)
+    except Exception as exc:
+        try:
+            from core.notifier import alert_bybit_error
+            await alert_bybit_error(exc, name)
+        except Exception:
+            pass  # never let alerting suppress the real exception
+        raise
+
     elapsed = time.monotonic() - t0
     if elapsed > _SLOW_CALL_THRESHOLD:
-        name = getattr(fn, "__name__", None) or getattr(fn, "__qualname__", str(fn))
         msg = f"bybit_call slow: {name} took {elapsed:.2f}s"
         if _SLOW_CALL_WARN:
             logging.warning("🐌 Slow Bybit call: %s took %.2fs", name, elapsed)

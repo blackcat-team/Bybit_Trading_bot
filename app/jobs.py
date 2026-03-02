@@ -8,6 +8,7 @@ from core.config import ALLOWED_ID, ORDER_TIMEOUT_DAYS
 from core.database import is_trading_enabled, get_risk_for_symbol
 from core.trading_core import session
 from core.bybit_call import bybit_call
+from core.notifier import send_alert, WARNING
 
 # Засекаем время старта
 START_TIME = time.time()
@@ -146,6 +147,14 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.warning(f"Auto-BE Job Error: {e}")
+        try:
+            await send_alert(
+                context.bot, ALLOWED_ID, "WARNING", WARNING,
+                f"Auto-BE job error: {str(e)[:100]}",
+                dedup_key="job_auto_be_error",
+            )
+        except Exception:
+            pass
 
 
 # --- 3. Очистка старых ордеров ---
@@ -182,6 +191,14 @@ async def auto_cleanup_orders_job(context: ContextTypes.DEFAULT_TYPE):
                     logging.debug(f"Cleanup cancel {o['symbol']}/{o['orderId']}: {e}")
     except Exception as e:
         logging.error(f"Cleanup Job Error: {e}")
+        try:
+            await send_alert(
+                context.bot, ALLOWED_ID, "WARNING", WARNING,
+                f"Cleanup job error: {str(e)[:100]}",
+                dedup_key="job_cleanup_error",
+            )
+        except Exception:
+            pass
 
 
 # --- 4. Утренний отчет ---
@@ -197,6 +214,14 @@ async def daily_balance_job(context: ContextTypes.DEFAULT_TYPE):
         logging.info("Morning report sent")
     except Exception as e:
         logging.error(f"Daily Balance Job Error: {e}")
+        try:
+            await send_alert(
+                context.bot, ALLOWED_ID, "WARNING", WARNING,
+                f"Daily balance job error: {str(e)[:100]}",
+                dedup_key="job_daily_balance_error",
+            )
+        except Exception:
+            pass
 
 # --- 5. TIME MANAGEMENT ---
 async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
@@ -301,3 +326,11 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Time Management Job Error: {e}")
+        try:
+            await send_alert(
+                context.bot, ALLOWED_ID, "WARNING", WARNING,
+                f"Time-management job error: {str(e)[:100]}",
+                dedup_key="job_time_mgmt_error",
+            )
+        except Exception:
+            pass

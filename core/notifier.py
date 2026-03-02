@@ -1,5 +1,5 @@
 """
-Notifier — owner alert with per-key dedup / cooldown.
+Notifier — owner alert with per-key dedup / cooldown + error classifier.
 
 Usage:
     from core.notifier import send_alert, RATE_LIMIT, AUTH, FAIL_CLOSED
@@ -8,6 +8,14 @@ Usage:
 
 Alert classes (also importable as string constants):
     RATE_LIMIT, AUTH, INSUFFICIENT_MARGIN, INVALID_QTY, FAIL_CLOSED, WARNING, INFO
+
+Error classifier:
+    from core.notifier import classify_error
+    cls = classify_error(exc)  # → one of the alert class constants
+
+Startup wiring (called once from main.py so bybit_call can send alerts):
+    from core.notifier import configure_alerts
+    configure_alerts(app.bot, ALLOWED_ID)
 """
 
 import logging
@@ -35,6 +43,10 @@ DEFAULT_COOLDOWN = 300  # 5 minutes
 _dedup: dict[str, float] = {}   # dedup_key → last_sent timestamp
 _last_alert: dict = {}           # info about the most recent alert that was sent
 
+# Optional bot/owner wired at startup by configure_alerts(); used by alert_bybit_error.
+_alert_bot = None
+_alert_owner_id: str = ""
+
 _ICONS = {
     RATE_LIMIT:          "🚦",
     AUTH:                "🔑",
@@ -44,6 +56,76 @@ _ICONS = {
     WARNING:             "⚠️",
     INFO:                "ℹ️",
 }
+
+
+# ---------------------------------------------------------------------------
+# Error classifier
+# ---------------------------------------------------------------------------
+
+# Bybit retCode strings that indicate specific error classes
+_RATE_LIMIT_HINTS  = ("429", "rate limit", "10006", "too many request")
+_AUTH_HINTS        = ("10003", "10004", "api key", "api-key", "invalid signature",
+                      "signature", "authentication", "unauthorized")
+_MARGIN_HINTS      = ("110007", "110012", "110045", "insufficient", "not enough margin",
+                      "available balance")
+_QTY_HINTS         = ("110017", "110006", "110043", "invalid qty", "invalid price",
+                      "qty precision", "qty step", "min order qty")
+
+
+def classify_error(exc: Exception) -> str:
+    """
+    Map an exception to one of the alert class constants.
+
+    Checks exception message and, when available, HTTP status code.
+    Returns one of: RATE_LIMIT, AUTH, INSUFFICIENT_MARGIN, INVALID_QTY, WARNING.
+    """
+    msg = str(exc).lower()
+    if any(h in msg for h in _RATE_LIMIT_HINTS):
+        return RATE_LIMIT
+    if any(h in msg for h in _AUTH_HINTS):
+        return AUTH
+    if any(h in msg for h in _MARGIN_HINTS):
+        return INSUFFICIENT_MARGIN
+    if any(h in msg for h in _QTY_HINTS):
+        return INVALID_QTY
+    return WARNING
+
+
+# ---------------------------------------------------------------------------
+# Startup wiring
+# ---------------------------------------------------------------------------
+
+def configure_alerts(bot, owner_id: str) -> None:
+    """
+    Wire the Telegram bot and owner chat-id so that alert_bybit_error()
+    can send alerts without a request context.
+    Call once from main.py after ApplicationBuilder().build().
+    """
+    global _alert_bot, _alert_owner_id
+    _alert_bot = bot
+    _alert_owner_id = str(owner_id)
+
+
+async def alert_bybit_error(exc: Exception, fn_name: str) -> None:
+    """
+    Send a classified alert for a Bybit API error.
+
+    Best-effort: if no bot is configured, or on send failure, logs only.
+    Always deduped per (class, fn_name) with DEFAULT_COOLDOWN.
+    """
+    if not _alert_bot or not _alert_owner_id:
+        return
+    cls = classify_error(exc)
+    dedup_key = f"bybit_err_{cls}_{fn_name}"
+    safe_msg = str(exc)[:120]
+    await send_alert(
+        _alert_bot,
+        _alert_owner_id,
+        level="ERROR",
+        alert_class=cls,
+        msg=f"Bybit error in <code>{fn_name}</code>:\n<code>{safe_msg}</code>",
+        dedup_key=dedup_key,
+    )
 
 
 # ---------------------------------------------------------------------------

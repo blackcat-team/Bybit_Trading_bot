@@ -17,6 +17,7 @@ from handlers import (
     status_command,
 )
 from app.jobs import daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job, heartbeat_job, time_management_job
+from core.notifier import configure_alerts
 
 # Инициализация цветов
 init(autoreset=True)
@@ -111,6 +112,8 @@ if __name__ == '__main__':
 
     # Строим бота с новыми настройками сети
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).request(req).build()
+    # Wire alert notifier so bybit_call can send owner alerts without a context
+    configure_alerts(app.bot, ALLOWED_ID)
     # ---------------------------------------------
 
     # Регистрируем команды
