@@ -2,6 +2,7 @@
 Signal parser — разбор текстовых сигналов + основной хендлер parse_and_trade.
 """
 
+import asyncio
 import re
 import logging
 
@@ -13,7 +14,7 @@ from core.trading_core import session, check_daily_limit, has_open_trade
 from core.database import (
     log_source, update_risk_for_symbol,
     get_risk_for_symbol, is_trading_enabled,
-    get_global_risk,
+    get_global_risk, set_market_pending,
 )
 
 from handlers.preflight import clip_qty, validate_qty, get_available_usd
@@ -273,10 +274,9 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        update_risk_for_symbol(sym, current_risk)
-        log_source(sym, source_tag)
-
         if is_market:
+            # Park risk+source in memory; written to disk only after GO MARKET succeeds.
+            set_market_pending(sym, current_risk, source_tag)
             msg = format_market_signal(
                 sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag
             )
@@ -293,6 +293,9 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             kb = [[InlineKeyboardButton("🎯 SET AUTO-TPs", callback_data=f"set_tps|{sym}")]]
             await bybit_call(place_limit_order, sym, side, qty, entry_price, stop_val)
+            # Write risk+source only after successful limit order placement.
+            await asyncio.to_thread(update_risk_for_symbol, sym, current_risk)
+            await asyncio.to_thread(log_source, sym, source_tag)
             await update.message.reply_html(msg, reply_markup=InlineKeyboardMarkup(kb))
 
     except Exception as e:

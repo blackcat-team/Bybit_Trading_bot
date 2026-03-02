@@ -2,6 +2,7 @@
 Inline-keyboard callback router — button_handler.
 """
 
+import asyncio
 import logging
 
 from telegram import Update
@@ -9,6 +10,7 @@ from telegram import error as tg_error
 from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID
+from core.database import update_risk_for_symbol, log_source, pop_market_pending
 from core.trading_core import session, place_tp_ladder
 from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_qty
 from handlers.orders import place_market_with_retry, close_position_market, bybit_call
@@ -214,6 +216,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sym, order_side, final_qty, sl, qty_step, min_order_qty
             )
             if success:
+                # Write risk+source to disk only after the order is confirmed.
+                try:
+                    pending = pop_market_pending(sym)
+                    if pending:
+                        risk_val, src_val = pending
+                        await asyncio.to_thread(update_risk_for_symbol, sym, risk_val)
+                        await asyncio.to_thread(log_source, sym, src_val)
+                except Exception as pend_err:
+                    logging.warning("post-market pending write failed for %s: %s", sym, pend_err)
                 await query.edit_message_text(msg_text)
             else:
                 await query.edit_message_text(msg_text)

@@ -2,6 +2,7 @@
 TG command handlers — /start, /stop, /risk, /note.
 """
 
+import asyncio
 import logging
 
 from telegram import Update
@@ -17,13 +18,13 @@ from core.database import (
 
 async def start_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ALLOWED_ID: return
-    set_trading_enabled(True)
+    await asyncio.to_thread(set_trading_enabled, True)
     await update.message.reply_text("✅ <b>STARTED</b>. Бот принимает сигналы.", parse_mode='HTML')
 
 
 async def stop_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ALLOWED_ID: return
-    set_trading_enabled(False)
+    await asyncio.to_thread(set_trading_enabled, False)
     await update.message.reply_text("🛑 <b>STOPPED</b>. Бот игнорирует сигналы.", parse_mode='HTML')
 
 
@@ -46,7 +47,7 @@ async def set_risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("❌ Риск должен быть положительным числом!")
             return
 
-        set_global_risk(new_risk)
+        await asyncio.to_thread(set_global_risk, new_risk)
         await msg.reply_text(f"✅ Риск изменен на <b>{new_risk}$</b>", parse_mode='HTML')
         logging.info(f"Risk changed to {new_risk}$ by user")
 
@@ -65,7 +66,7 @@ async def add_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         sym = context.args[0].upper()
         text = " ".join(context.args[1:])
-        add_comment(sym, text)
+        await asyncio.to_thread(add_comment, sym, text)
         await update.message.reply_text(f"✅ Заметка для {sym} сохранена.")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка заметки: {e}")

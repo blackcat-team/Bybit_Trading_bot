@@ -8,6 +8,10 @@ from core.config import (
     USER_RISK_USD, DATA_DIR
 )
 
+# In-memory store for pending market signals: sym → (risk_usd, source_tag).
+# Written to disk only after the GO MARKET button order succeeds.
+_MARKET_PENDING: dict = {}
+
 # --- 1. Глобальные переменные (Кэш в памяти) ---
 # Они заполнятся данными при вызове init_db()
 RISK_MAPPING = {}
@@ -18,18 +22,60 @@ SETTINGS = {"trading_enabled": True}
 
 # --- 2. Базовые функции чтения/записи ---
 def load_json(filename, default_data):
-    """Читает JSON файл, если он существует. Иначе возвращает default_data."""
-    if not os.path.exists(filename): return default_data
+    """Читает JSON файл. Возвращает default_data если файл отсутствует или повреждён."""
+    if not os.path.exists(filename):
+        return default_data
     try:
-        with open(filename, "r") as f:
+        with open(filename, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except json.JSONDecodeError as e:
+        logging.error("load_json(%s): corrupted JSON — %s; using default", filename, e)
+        return default_data
+    except Exception as e:
+        logging.error("load_json(%s): read error — %s; using default", filename, e)
         return default_data
 
 
 def save_json(filename, data):
-    """Сохраняет данные в JSON файл с отступами."""
-    with open(filename, "w") as f: json.dump(data, f, ensure_ascii=False, indent=4)
+    """Атомарная запись JSON (temp-file + os.replace) во избежание частичной записи."""
+    tmp = str(filename) + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, filename)
+    except Exception as e:
+        logging.error("save_json(%s): write failed — %s", filename, e)
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
+
+
+def _load_settings_fail_closed() -> dict:
+    """
+    Загружает settings.json с fail-closed логикой:
+    - Файл отсутствует (первый запуск) → trading_enabled=True (штатное поведение)
+    - Файл повреждён/пуст               → trading_enabled=False (fail-closed)
+    """
+    if not os.path.exists(SETTINGS_FILE):
+        return {"trading_enabled": True}
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError) as e:
+        logging.error(
+            "settings.json corrupted — trading DISABLED (fail-closed): %s", e
+        )
+        return {"trading_enabled": False}
+    except Exception as e:
+        logging.error(
+            "settings.json read error — trading DISABLED (fail-closed): %s", e
+        )
+        return {"trading_enabled": False}
 
 
 # --- 3. Инициализация ---
@@ -40,7 +86,7 @@ def init_db():
     RISK_MAPPING = load_json(RISK_FILE, {})
     COMMENTS_DB = load_json(COMMENTS_FILE, {})
     SOURCES_DB = load_json(SOURCES_FILE, {})
-    SETTINGS = load_json(SETTINGS_FILE, {"trading_enabled": True})
+    SETTINGS = _load_settings_fail_closed()
     print("✅ Database loaded successfully.")
 
 
@@ -140,3 +186,22 @@ def get_source_at_time(symbol, trade_close_ts):
         # Если запись была сделана ДО закрытия сделки - это наш источник
         if record['ts'] < trade_close_ts: return record['src']
     return "Unknown"
+
+
+# --- 8. Ожидающие маркет-сигналы (временное хранилище до исполнения ордера) ---
+
+def set_market_pending(symbol: str, risk_usd: float, source_tag: str) -> None:
+    """
+    Временно сохраняет риск и источник для маркет-сигнала.
+    Вызывается при показе карточки сигнала; запись в БД — только после
+    успешного исполнения ордера (pop_market_pending).
+    """
+    _MARKET_PENDING[symbol] = (float(risk_usd), str(source_tag))
+
+
+def pop_market_pending(symbol: str):
+    """
+    Извлекает и удаляет ожидающую запись для символа.
+    Returns: (risk_usd, source_tag) или None если запись отсутствует.
+    """
+    return _MARKET_PENDING.pop(symbol, None)
