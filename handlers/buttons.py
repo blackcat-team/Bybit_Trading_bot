@@ -5,11 +5,12 @@ Inline-keyboard callback router — button_handler.
 import logging
 
 from telegram import Update
+from telegram import error as tg_error
 from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID
 from core.trading_core import session, place_tp_ladder
-from handlers.preflight import clip_qty, get_available_usd, floor_qty
+from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_qty
 from handlers.orders import place_market_with_retry, close_position_market, bybit_call
 from handlers.views_orders import view_orders, view_symbol_orders
 from handlers.views_positions import check_positions
@@ -22,8 +23,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await query.answer()
+    except tg_error.BadRequest as e:
+        logging.debug("query.answer ignored: %s", e)  # too old / already answered
     except Exception:
-        pass  # Telegram rejects duplicate answer() calls; safe to ignore
+        logging.exception("query.answer failed")
 
     data = query.data
 
@@ -126,6 +129,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             final_qty = qty_from_cb
             qty_step = 0.0
             min_order_qty = 0.0
+            max_order_qty = 0.0
             try:
                 ticker = await bybit_call(session.get_tickers, category="linear", symbol=sym)
                 fresh_price = float(ticker['result']['list'][0]['lastPrice'])
@@ -172,7 +176,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode='HTML'
                     )
             except Exception as pf_err:
-                logging.warning(f"Market preflight error: {pf_err}, using original qty={qty_from_cb}")
+                logging.warning(f"Market preflight error for {sym}: {pf_err}")
+                if qty_step <= 0:
+                    # No lot-filter data — cannot safely validate qty; block order.
+                    logging.warning(f"Market order for {sym} blocked: no lot-filter data after preflight error")
+                    await query.edit_message_text(
+                        f"❌ <b>Недостаточно маржи</b> для Market {sym}.\n"
+                        f"Повторите попытку."
+                    )
+                    return
+                try:
+                    fallback_qty, is_valid, val_reason = validate_qty(
+                        qty_from_cb, qty_step, min_order_qty, max_order_qty
+                    )
+                except Exception as val_err:
+                    logging.warning(f"validate_qty error for {sym}: {val_err} — blocking market order")
+                    await query.edit_message_text(
+                        f"❌ <b>Недостаточно маржи</b> для Market {sym}.\n"
+                        f"Повторите попытку."
+                    )
+                    return
+                if not is_valid:
+                    logging.warning(
+                        f"Market fallback qty {qty_from_cb} invalid ({val_reason}) — blocking {sym}"
+                    )
+                    await query.edit_message_text(
+                        f"❌ <b>Недостаточно маржи</b> для Market {sym}.\n"
+                        f"Повторите попытку."
+                    )
+                    return
+                final_qty = fallback_qty
+                logging.info(f"Market preflight fallback: cb_qty={qty_from_cb} → validated={final_qty} for {sym}")
 
             # --- PLACE ORDER + 110007 micro-retry ---
             success, msg_text, _ = await bybit_call(
