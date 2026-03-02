@@ -105,9 +105,9 @@ def check_daily_limit():
         return True, total_daily_pnl
 
     except Exception as e:
-        logging.error(f"Daily Limit Check Error: {e}")
-        # В случае ошибки API лучше разрешить (или запретить - по вкусу), пока оставим True
-        return True, 0.0
+        # Fail-closed: cannot verify daily PnL, block new trades to prevent overexposure.
+        logging.error(f"check_daily_limit() API error — blocking trading: {e}")
+        return False, 0.0
 
 
 async def place_tp_ladder(symbol):

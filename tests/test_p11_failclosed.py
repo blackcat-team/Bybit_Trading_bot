@@ -1,10 +1,13 @@
 """
-P11 fail-closed patches — unit tests.
+P11 + C1 fail-closed patches — unit tests.
 
 Covers:
 - has_open_trade() fail-closed on API exception (M3 audit finding)
 - has_open_trade() fail-closed on malformed API response
 - has_open_trade() normal happy-paths still work correctly
+- check_daily_limit() fail-closed on API exception (C1 audit finding)
+- check_daily_limit() fail-closed on malformed API response
+- check_daily_limit() happy-paths (within limit, over limit)
 No network calls — session is fully mocked.
 """
 import sys
@@ -129,3 +132,53 @@ class TestHasOpenTradeHappyPaths:
             busy, reason = _tc.has_open_trade("BTCUSDT")
         assert busy is True
         assert "42000" in (reason or "")
+
+
+class TestCheckDailyLimitFailClosed:
+    """check_daily_limit() must return (False, 0.0) on any API failure (fail-closed)."""
+
+    def test_api_exception_fails_closed(self):
+        """session.get_closed_pnl raises RuntimeError → (False, 0.0)."""
+        mock_session = MagicMock()
+        mock_session.get_closed_pnl.side_effect = RuntimeError("network timeout")
+        with patch.object(_tc, "session", mock_session):
+            can_trade, pnl = _tc.check_daily_limit()
+        assert can_trade is False, "API exception must fail-closed (can_trade=False)"
+        assert pnl == 0.0
+
+    def test_malformed_response_fails_closed(self):
+        """Response missing 'result' key (KeyError) → (False, 0.0)."""
+        mock_session = MagicMock()
+        mock_session.get_closed_pnl.return_value = {"retCode": -1}  # no 'result'
+        with patch.object(_tc, "session", mock_session):
+            can_trade, pnl = _tc.check_daily_limit()
+        assert can_trade is False, "Malformed response must fail-closed (can_trade=False)"
+        assert pnl == 0.0
+
+    def test_within_limit_allows_trading(self):
+        """Normal response, PnL above limit → (True, pnl)."""
+        mock_session = MagicMock()
+        mock_session.get_closed_pnl.return_value = {
+            "result": {"list": [{"closedPnl": "10.0"}]}
+        }
+        mock_session.get_wallet_balance.return_value = {
+            "result": {"list": [{"totalPerpUPL": "5.0"}]}
+        }
+        with patch.object(_tc, "session", mock_session):
+            can_trade, pnl = _tc.check_daily_limit()
+        assert can_trade is True
+        assert abs(pnl - 15.0) < 0.001
+
+    def test_over_limit_blocks_trading(self):
+        """Daily PnL below DAILY_LOSS_LIMIT (-50) → (False, pnl)."""
+        mock_session = MagicMock()
+        mock_session.get_closed_pnl.return_value = {
+            "result": {"list": [{"closedPnl": "-60.0"}]}
+        }
+        mock_session.get_wallet_balance.return_value = {
+            "result": {"list": [{"totalPerpUPL": "0.0"}]}
+        }
+        with patch.object(_tc, "session", mock_session):
+            can_trade, pnl = _tc.check_daily_limit()
+        assert can_trade is False
+        assert pnl < -50.0

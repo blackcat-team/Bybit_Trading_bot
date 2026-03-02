@@ -35,6 +35,9 @@ def parse_signal(txt: str) -> dict | None:
         is_market (bool), source_tag (str)
     Или None, если текст не распознан как сигнал.
     """
+    # Normalise spaced decimals so "0. 0745" → "0.0745" before any regex parsing.
+    txt = re.sub(r'(?<=\d)\.\s+(?=\d)', '.', txt)
+
     coin = None
     entry_val = None
     stop_val = None
