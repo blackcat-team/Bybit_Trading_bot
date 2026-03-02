@@ -145,7 +145,7 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
                     logging.warning(f"Auto-BE: failed to move SL for {sym}: {e}")
 
     except Exception as e:
-        logging.debug(f"Auto-BE Job Error: {e}")
+        logging.warning(f"Auto-BE Job Error: {e}")
 
 
 # --- 3. Очистка старых ордеров ---

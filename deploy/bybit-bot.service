@@ -1,0 +1,59 @@
+# deploy/bybit-bot.service — systemd unit for Bybit Trading Bot
+#
+# Installation (Linux VPS):
+#   1. Copy this file to /etc/systemd/system/bybit-bot.service
+#      (adjust WorkingDirectory and User to match your setup)
+#   2. sudo systemctl daemon-reload
+#   3. sudo systemctl enable bybit-bot
+#   4. sudo systemctl start bybit-bot
+#
+# The bot runs as a dedicated non-root user. Create it with:
+#   sudo useradd -r -s /sbin/nologin botuser
+#   sudo chown -R botuser:botuser /opt/bybit-bot
+#
+# Logs:
+#   journalctl -u bybit-bot -f
+
+[Unit]
+Description=Bybit Telegram Trading Bot
+Documentation=https://github.com/blackcat-team/Bybit_Trading_bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- Run as non-root ---
+User=botuser
+Group=botuser
+
+# --- Paths (adjust to match your deployment) ---
+WorkingDirectory=/opt/bybit-bot
+ExecStart=/opt/bybit-bot/.venv/bin/python main.py
+
+# --- Environment ---
+# Put TELEGRAM_TOKEN, BYBIT_API_KEY, etc. in /opt/bybit-bot/.env
+EnvironmentFile=/opt/bybit-bot/.env
+
+# --- Restart policy ---
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# --- Security hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/bybit-bot/data
+ProtectHome=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# --- Logging ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bybit-bot
+
+[Install]
+WantedBy=multi-user.target

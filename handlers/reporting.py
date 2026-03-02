@@ -27,7 +27,7 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             month_str, year_str = context.args[0].split('.')
             target_date = datetime(int(year_str), int(month_str), 1)
-        except:
+        except (ValueError, TypeError):
             await update.message.reply_text("⚠️ Формат: <code>/report 01.2026</code>", parse_mode='HTML')
             return
 
