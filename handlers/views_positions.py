@@ -35,7 +35,7 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if update.callback_query:
                 try:
                     await update.callback_query.message.edit_text(msg)
-                except:
+                except Exception:
                     await update.callback_query.message.reply_text(msg)
             else:
                 await update.message.reply_text(msg)
@@ -44,7 +44,7 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.callback_query and update.callback_query.data == "back_to_pos":
             try:
                 await update.callback_query.message.delete()
-            except:
+            except Exception:
                 pass
 
         for p in active:

@@ -123,36 +123,29 @@ cp sources_log.example.json sources_log.json
 
 ## 🖥 Запуск 24/7 (Systemd)
 
-Чтобы бот работал в фоне и перезапускался при ошибках:
+Чтобы бот работал в фоне и перезапускался при ошибках.
+Готовый файл службы находится в `deploy/bybit-bot.service` — скопируйте и отредактируйте пути.
 
-**1. Создайте файл службы:**
+**1. Создайте пользователя и директорию (не root):**
 ```bash
-sudo nano /etc/systemd/system/bybitbot.service
+sudo useradd -r -s /sbin/nologin botuser
+sudo mkdir -p /opt/bybit-bot
+sudo chown -R botuser:botuser /opt/bybit-bot
+# Скопируйте файлы проекта в /opt/bybit-bot и создайте .venv
 ```
 
-**2. Вставьте этот код (проверьте пути!):**
-```ini
-[Unit]
-Description=Bybit Trading Bot
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root/Bybit_bot
-ExecStart=/root/Bybit_bot/.venv/bin/python main.py
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+**2. Скопируйте файл службы:**
+```bash
+sudo cp deploy/bybit-bot.service /etc/systemd/system/bybit-bot.service
+# Отредактируйте WorkingDirectory и пути если нужно:
+# sudo nano /etc/systemd/system/bybit-bot.service
 ```
 
 **3. Запустите:**
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable bybitbot
-sudo systemctl start bybitbot
+sudo systemctl enable bybit-bot
+sudo systemctl start bybit-bot
 ```
 **Управление:**
 

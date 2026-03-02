@@ -87,7 +87,12 @@ def close_position_market(sym: str) -> tuple:
 
     Returns: (success: bool, message: str, size: float)
     """
-    pos = session.get_positions(category="linear", symbol=sym)['result']['list'][0]
+    resp = session.get_positions(category="linear", symbol=sym)
+    positions = resp.get('result', {}).get('list', [])
+    if not positions:
+        logging.warning("close_position_market(%s): empty position list from API", sym)
+        return False, f"❌ Нет данных о позиции {sym}", 0.0
+    pos = positions[0]
     size = float(pos['size'])
     side = pos['side']
 
