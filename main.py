@@ -7,7 +7,7 @@ from colorama import init, Fore, Style
 from telegram.request import HTTPXRequest
 
 # Импорты из наших модулей
-from core.config import TELEGRAM_TOKEN, USER_RISK_USD, IS_DEMO
+from core.config import TELEGRAM_TOKEN, USER_RISK_USD, IS_DEMO, ALLOWED_ID
 from core.database import init_db
 from core.trading_core import session
 from handlers import (
