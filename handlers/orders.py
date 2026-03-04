@@ -2,9 +2,9 @@
 Bybit order wrappers — тонкие обёртки вокруг session.place_order / set_leverage.
 Синхронные функции, возвращают результат или бросают исключение.
 
-bybit_call() — async helper для non-blocking вызова любой sync-функции Bybit SDK.
-Canonical implementation lives in core.bybit_call; re-exported here for
-backward compatibility (existing imports from handlers.orders stay valid).
+bybit_call() — async-хелпер для неблокирующего вызова любой sync-функции Bybit SDK.
+Каноническая реализация находится в core.bybit_call; здесь — ре-экспорт для
+обратной совместимости (существующие импорты из handlers.orders остаются рабочими).
 """
 
 import logging

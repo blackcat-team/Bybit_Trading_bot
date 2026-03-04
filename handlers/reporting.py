@@ -1,5 +1,5 @@
 """
-Reporting — /report (send_report).
+Отчётность — команда /report (send_report).
 """
 
 import csv

@@ -1,5 +1,5 @@
 """
-Position views — /pos (check_positions).
+Представления позиций — /pos (check_positions).
 """
 
 import logging

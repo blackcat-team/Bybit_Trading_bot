@@ -1,5 +1,5 @@
 """
-TG command handlers — /start, /stop, /risk, /note, /status.
+Обработчики команд Telegram — /start, /stop, /risk, /note, /status.
 """
 
 import asyncio

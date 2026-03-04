@@ -1,5 +1,5 @@
 """
-handlers package — re-exports для main.py и тестов.
+Пакет handlers — ре-экспорты для main.py и тестов.
 """
 
 from .signal_parser import parse_and_trade, parse_signal

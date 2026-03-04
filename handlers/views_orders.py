@@ -1,5 +1,5 @@
 """
-Order views — /orders (view_orders), symbol detail (view_symbol_orders).
+Представления ордеров — /orders (view_orders), детали по символу (view_symbol_orders).
 """
 
 import logging
@@ -65,9 +65,9 @@ async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _has_open_position(positions: list, symbol: str) -> bool:
-    """Return True if *positions* contains an active (size > 0) entry for *symbol*.
+    """Возвращает True, если *positions* содержит активную (size > 0) запись для *symbol*.
 
-    Pure helper — no I/O, safe to unit-test with fake data.
+    Чистый хелпер — без I/O, безопасен для unit-тестов с фиктивными данными.
     """
     return any(
         p.get('symbol') == symbol and float(p.get('size', 0) or 0) > 0

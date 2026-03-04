@@ -1,5 +1,5 @@
 """
-Startup recovery — on_startup_check.
+Восстановление при старте — on_startup_check.
 """
 
 import asyncio

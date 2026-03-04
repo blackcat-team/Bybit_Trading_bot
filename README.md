@@ -197,31 +197,31 @@ sudo systemctl start bybit-bot
 
 Статус:
 ```bash
-systemctl status bybitbot
+systemctl status bybit-bot
 ```
 Логи: 
 ```bash
-journalctl -u bybitbot -f
+journalctl -u bybit-bot -f
 ```
 Рестарт: 
 ```bash
-systemctl restart bybitbot
+systemctl restart bybit-bot
 ```
 Остановка: 
 ```bash
-systemctl stop  bybitbot
+systemctl stop  bybit-bot
 ```
 Обновление бота: 
 ```bash
-sudo systemctl stop bybitbot
+sudo systemctl stop bybit-bot
 
 cd Bybit_Trading_bot
 git pull
 source .venv/bin/activate
 pip install -r requirements.txt
 
-sudo systemctl start bybitbot
-sudo journalctl -u bybitbot -n 80 --no-pager
+sudo systemctl start bybit-bot
+sudo journalctl -u bybit-bot -n 80 --no-pager
 ```
 
 ---

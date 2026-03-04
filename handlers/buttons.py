@@ -1,5 +1,5 @@
 """
-Inline-keyboard callback router — button_handler.
+Обработчик inline-кнопок — роутер callback-запросов (button_handler).
 """
 
 import asyncio
@@ -21,13 +21,13 @@ from handlers.views_positions import check_positions
 from handlers.ui import h
 
 
-# Preview timestamp store: sym → epoch when user tapped "PREVIEW TRADE".
-# Consumed (popped) once the user taps "CONFIRM" to prevent double-execution.
+# Хранилище меток времени превью: sym → эпоха нажатия "PREVIEW TRADE".
+# Удаляется (pop) при нажатии "ПОДТВЕРДИТЬ", чтобы предотвратить двойное исполнение.
 _PREVIEW_TS: dict = {}
 
 
 def _preview_is_fresh(sym: str, ttl_sec: int) -> bool:
-    """Return True if a valid, unexpired preview exists for sym."""
+    """Возвращает True, если существует актуальное (не устаревшее) превью для sym."""
     return time.time() - _PREVIEW_TS.get(sym, 0.0) <= ttl_sec
 
 
@@ -39,7 +39,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.answer()
     except tg_error.BadRequest as e:
-        logging.debug("query.answer ignored: %s", e)  # too old / already answered
+        logging.debug("query.answer ignored: %s", e)  # устарел / уже отвечен
     except Exception:
         logging.exception("query.answer failed")
 
@@ -133,7 +133,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             qty = float(qty_str)
             sl_float = float(sl)
 
-            # Fetch fresh price (graceful fallback to 0)
+            # Получаем свежую цену (мягкий fallback до 0)
             entry_price = 0.0
             try:
                 ticker = await bybit_call(session.get_tickers, category="linear", symbol=sym)
@@ -141,7 +141,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            # Compute projected heat (graceful fallback)
+            # Рассчитываем прогнозируемый heat (мягкий fallback)
             heat_after = 0.0
             max_heat = 0.0
             try:
@@ -156,7 +156,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            # Get risk + source from pending store
+            # Читаем риск + источник из pending-хранилища
             risk_usd = 0.0
             source_tag = "#Manual"
             try:
@@ -176,8 +176,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             confirm_cb = f"buy_market|{sym}|{side}|{sl}|{qty_str}|{lev_str}"
             kb = [[
-                InlineKeyboardButton("✅ CONFIRM", callback_data=confirm_cb),
-                InlineKeyboardButton("❌ CANCEL", callback_data=f"mkt_cancel|{sym}"),
+                InlineKeyboardButton("✅ ПОДТВЕРДИТЬ", callback_data=confirm_cb),
+                InlineKeyboardButton("❌ ОТМЕНИТЬ", callback_data=f"mkt_cancel|{sym}"),
             ]]
             _PREVIEW_TS[sym] = time.time()
             await query.edit_message_text(
@@ -197,10 +197,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, sym, side, sl, qty_str, lev_str = data.split("|")
             lev = int(float(lev_str))
 
-            # TTL gate: only active when preview-confirm mode is on.
+            # TTL-защита: активна только в режиме preview-confirm.
             if REQUIRE_MARKET_CONFIRM and not _preview_is_fresh(sym, MARKET_PREVIEW_TTL_SEC):
                 await query.edit_message_text(
-                    f"⏰ <b>Preview expired.</b> Отправьте сигнал заново для {sym}.",
+                    f"⏰ <b>Превью устарело.</b> Отправьте сигнал заново для {sym}.",
                     parse_mode='HTML',
                 )
                 return
@@ -351,12 +351,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("close_confirm|"):
             _, sym = data.split("|")
             kb = [[
-                InlineKeyboardButton("✅ CONFIRM CLOSE", callback_data=f"close_mkt_confirm|{sym}"),
-                InlineKeyboardButton("↩ Back to Orders", callback_data=f"show_orders|{sym}"),
+                InlineKeyboardButton("✅ ПОДТВЕРДИТЬ ЗАКРЫТИЕ", callback_data=f"close_mkt_confirm|{sym}"),
+                InlineKeyboardButton("↩ К ордерам", callback_data=f"show_orders|{sym}"),
             ]]
             await query.edit_message_text(
-                f"⚠️ Close <b>{h(sym)}</b> at MARKET price?\n"
-                f"This will close the FULL position immediately.",
+                f"⚠️ Закрыть <b>{h(sym)}</b> по РЫНКУ?\n"
+                f"Вся позиция будет закрыта немедленно.",
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(kb),
             )
@@ -366,13 +366,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 success, msg_text, _ = await bybit_call(close_position_market, sym)
                 if success:
-                    await query.answer(f"✅ {sym} closed!", show_alert=True)
+                    await query.answer(f"✅ {sym} закрыт!", show_alert=True)
                     await query.edit_message_text(msg_text)
                 else:
                     await query.answer(msg_text, show_alert=True)
                     await check_positions(update, context)
             except Exception as e:
-                await query.answer(f"❌ Close error: {e}", show_alert=True)
+                await query.answer(f"❌ Ошибка закрытия: {e}", show_alert=True)
 
         elif data.startswith("emergency_close|"):
             _, sym = data.split("|")

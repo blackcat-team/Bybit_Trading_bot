@@ -1,6 +1,6 @@
 """
-Facade — re-exports from thematic sub-modules.
-Keeps handlers.__init__ and bot_handlers working without import changes.
+Фасад — ре-экспорт из тематических субмодулей.
+Позволяет handlers.__init__ и bot_handlers работать без изменения импортов.
 """
 
 from handlers.commands import (                    # noqa: F401

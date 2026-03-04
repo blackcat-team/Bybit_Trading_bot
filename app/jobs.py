@@ -17,7 +17,7 @@ from core.config import ALLOWED_ID, ORDER_TIMEOUT_DAYS
 from core.database import is_trading_enabled, get_risk_for_symbol, RISK_MAPPING
 from core.trading_core import session
 from core.bybit_call import bybit_call
-from core.notifier import send_alert, WARNING, FAIL_CLOSED
+from core.notifier import send_alert, classify_error, WARNING, FAIL_CLOSED, TIMEOUT
 from core.journal import (
     append_event, read_events, CLOSED,
     compute_source_stats, check_and_quarantine_sources,
@@ -159,11 +159,12 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.warning(f"Auto-BE Job Error: {e}")
         try:
-            await send_alert(
-                context.bot, ALLOWED_ID, "WARNING", WARNING,
-                f"Auto-BE job error: {str(e)[:100]}",
-                dedup_key="job_auto_be_error",
-            )
+            if classify_error(e) != TIMEOUT:  # bybit_call уже отправил алерт для таймаутов
+                await send_alert(
+                    context.bot, ALLOWED_ID, "WARNING", WARNING,
+                    f"Auto-BE job error: {str(e)[:100]}",
+                    dedup_key="job_auto_be_error",
+                )
         except Exception:
             pass
 
@@ -203,11 +204,12 @@ async def auto_cleanup_orders_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Cleanup Job Error: {e}")
         try:
-            await send_alert(
-                context.bot, ALLOWED_ID, "WARNING", WARNING,
-                f"Cleanup job error: {str(e)[:100]}",
-                dedup_key="job_cleanup_error",
-            )
+            if classify_error(e) != TIMEOUT:
+                await send_alert(
+                    context.bot, ALLOWED_ID, "WARNING", WARNING,
+                    f"Cleanup job error: {str(e)[:100]}",
+                    dedup_key="job_cleanup_error",
+                )
         except Exception:
             pass
 
@@ -226,11 +228,12 @@ async def daily_balance_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Daily Balance Job Error: {e}")
         try:
-            await send_alert(
-                context.bot, ALLOWED_ID, "WARNING", WARNING,
-                f"Daily balance job error: {str(e)[:100]}",
-                dedup_key="job_daily_balance_error",
-            )
+            if classify_error(e) != TIMEOUT:
+                await send_alert(
+                    context.bot, ALLOWED_ID, "WARNING", WARNING,
+                    f"Daily balance job error: {str(e)[:100]}",
+                    dedup_key="job_daily_balance_error",
+                )
         except Exception:
             pass
 
@@ -340,11 +343,12 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Time Management Job Error: {e}")
         try:
-            await send_alert(
-                context.bot, ALLOWED_ID, "WARNING", WARNING,
-                f"Time-management job error: {str(e)[:100]}",
-                dedup_key="job_time_mgmt_error",
-            )
+            if classify_error(e) != TIMEOUT:
+                await send_alert(
+                    context.bot, ALLOWED_ID, "WARNING", WARNING,
+                    f"Time-management job error: {str(e)[:100]}",
+                    dedup_key="job_time_mgmt_error",
+                )
         except Exception:
             pass
 
@@ -438,11 +442,12 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error("Reconcile job error: %s", e)
         try:
-            await send_alert(
-                context.bot, ALLOWED_ID, "WARNING", WARNING,
-                f"Reconcile job error: {str(e)[:100]}",
-                dedup_key="job_reconcile_error",
-            )
+            if classify_error(e) != TIMEOUT:
+                await send_alert(
+                    context.bot, ALLOWED_ID, "WARNING", WARNING,
+                    f"Reconcile job error: {str(e)[:100]}",
+                    dedup_key="job_reconcile_error",
+                )
         except Exception:
             pass
 
