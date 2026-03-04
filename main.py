@@ -77,7 +77,7 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 # --- 2. Функция стартовой проверки (Баннер) ---
 def print_startup_banner():
-    """Выводит красивую статистику при запуске, как на старом скрине."""
+    """Выводит красивую статистику при запуске"""
     try:
         if not session:
             print(f"{Fore.RED}❌ Connection failed (No Session){Style.RESET_ALL}")
@@ -111,7 +111,7 @@ if __name__ == '__main__':
     # Загружаем базу
     init_db()
 
-    # --- 🔥 НАСТРОЙКА СЕТИ (FIX NetworkError) ---
+    # --- 🔥 НАСТРОЙКА СЕТИ ---
     # Делаем бота более терпимым к лагам телеграма (таймауты по 20 сек)
     req = HTTPXRequest(
         connection_pool_size=8,
@@ -150,7 +150,7 @@ if __name__ == '__main__':
     jq = app.job_queue
 
     # 1. Пульс (раз в час) - пишет в консоль, что бот жив
-    jq.run_repeating(heartbeat_job, interval=3600, first=10)
+    jq.run_repeating(heartbeat_job, interval=1800, first=10)
 
     # 2. Авто-БУ (раз в минуту) - следит за позициями
     jq.run_repeating(auto_breakeven_job, interval=60, first=15)

@@ -74,7 +74,7 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
 
             is_long = side == "Buy"
 
-            # --- [FIX №2] ПОЛУЧЕНИЕ РИСКА (БЕЗ МАГИЧЕСКИХ ЧИСЕЛ) ---
+            # --- ПОЛУЧЕНИЕ РИСКА (БЕЗ МАГИЧЕСКИХ ЧИСЕЛ) ---
             risk_usd = get_risk_for_symbol(sym)
 
             if risk_usd <= 0:
@@ -83,7 +83,7 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
                 # logging.warning(f"⚠️ Skip Auto-BE for {sym}: No risk data stored.")
                 continue
 
-                # --- [FIX №1] РАСЧЕТ 1R (ЦЕНОВАЯ ДИСТАНЦИЯ) ---
+                # --- РАСЧЕТ 1R (ЦЕНОВАЯ ДИСТАНЦИЯ) ---
             # Пока считаем через qty, так как initial_sl не храним в БД.
             # Но благодаря проверке выше, это безопасно.
             dist_1r_price = risk_usd / qty
@@ -108,7 +108,7 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
 
             # СТУПЕНЬ 2: Прибыль > 2R -> Безубыток + 0.05R
             if current_r >= 2:
-                # --- [FIX №3] ДИНАМИЧЕСКИЙ OFFSET (5% от 1R) ---
+                # --- ДИНАМИЧЕСКИЙ OFFSET (5% от 1R) ---
                 # Это гораздо лучше, чем 0.1%, так как адаптируется под волатильность монеты
                 offset = dist_1r_price * 0.05
 
@@ -259,7 +259,7 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
             side = p['side']
             entry_price = float(p['avgPrice'])
 
-            # --- FIX: Безопасное получение Stop Loss ---
+            # --- Безопасное получение Stop Loss ---
             sl_raw = p.get('stopLoss', '')
             # Если строка пустая или None -> считаем 0.0
             if sl_raw and sl_raw != "":
@@ -270,7 +270,7 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
 
             pnl = float(p['unrealisedPnl'])
 
-            # --- 🔥 ГЛАВНАЯ ПРАВКА: Получаем реальное время сделки ---
+            # --- Получаем реальное время сделки ---
             start_dt = None
             try:
                 # Запрашиваем последнее исполнение (trade) по этому символу
@@ -348,8 +348,6 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-
-# --- 6. Reconcile journal (detect closed trades) ---
 async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Обнаруживает позиции, закрытые с момента последней проверки.
@@ -449,7 +447,6 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-# --- 7. Weekly source stats report ---
 async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
     """Еженедельный отчёт по статистике источников сигналов."""
     try:
