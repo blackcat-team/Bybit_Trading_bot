@@ -16,6 +16,7 @@ from core.database import (
     get_global_risk, set_global_risk,
     _MARKET_PENDING, SOURCES_DB,
 )
+
 from core.bybit_call import bybit_call
 
 
@@ -119,7 +120,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 4. Sources (seen + quarantined) ──────────────────────────────────
     src_count = len(SOURCES_DB)
-    src_list = ", ".join(list(SOURCES_DB.keys())[:6]) if SOURCES_DB else "—"
     try:
         from core.journal import get_disabled_sources
         disabled = get_disabled_sources()
@@ -149,9 +149,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             heat_str = "N/A"
 
+    risk_str = f"{get_global_risk():.1f}$"
+
     lines = [
-        "📊 <b>BOT STATUS</b>",
+        "📊 BOT STATUS",
         f"Trading:         {trading_str}",
+        f"Risk:            {risk_str}",
         f"Daily PnL:       {daily_pnl_str}",
         f"Open positions:  {pos_count_str}",
         f"Entry orders:    {pending_orders_str}",
@@ -160,4 +163,4 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Heat:            {heat_str}",
         f"Last alert:      {last_alert_str}",
     ]
-    await update.message.reply_html("\n".join(lines))
+    await update.message.reply_text("\n".join(lines))

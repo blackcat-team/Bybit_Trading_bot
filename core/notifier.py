@@ -69,7 +69,7 @@ _AUTH_HINTS        = ("10003", "10004", "api key", "api-key", "invalid signature
                       "signature", "authentication", "unauthorized")
 _MARGIN_HINTS      = ("110007", "110012", "110045", "insufficient", "not enough margin",
                       "available balance")
-_QTY_HINTS         = ("110017", "110006", "110043", "invalid qty", "invalid price",
+_QTY_HINTS         = ("110017", "110006", "invalid qty", "invalid price",
                       "qty precision", "qty step", "min order qty")
 
 

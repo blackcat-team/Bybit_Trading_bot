@@ -1,4 +1,5 @@
 import logging
+import math
 import time
 from datetime import datetime
 from pybit.unified_trading import HTTP
@@ -114,6 +115,7 @@ async def place_tp_ladder(symbol):
     """
     Ставит тейки (TP1, TP2, TP3) на основе РЕАЛЬНОГО положения Стоп-лосса в позиции.
     Теперь R считается от живого StopLoss, а не от теоретического.
+    Деградирует до 2 или 1 TP-ордера если позиция слишком маленькая для сплита.
     """
     try:
         # 1. Получаем живую позицию
@@ -134,8 +136,6 @@ async def place_tp_ladder(symbol):
             return "⚠️ В позиции НЕТ Стоп-лосса! Я не могу посчитать 1R."
 
         # 3. Считаем РЕАЛЬНЫЙ риск (R)
-        # R_price - дистанция цены до стопа
-        # Total_Risk_USD - сколько долларов мы потеряем, если выбьет стоп
         r_price_dist = abs(entry_price - stop_loss)
         total_risk_usd = total_qty * r_price_dist
 
@@ -152,24 +152,24 @@ async def place_tp_ladder(symbol):
             targets['tp2'] = entry_price - (2.0 * r_price_dist)
             targets['tp3'] = entry_price - (3.0 * r_price_dist)
 
-        # 5. Считаем объемы (30% / 30% / Остаток)
+        # 5. Инфо по инструменту
         _info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=symbol)
         info = _info_resp['result']['list'][0]
         qty_step = float(info['lotSizeFilter']['qtyStep'])
+        min_order_qty = float(info['lotSizeFilter'].get('minOrderQty', qty_step))
         price_tick = float(info['priceFilter']['tickSize'])
 
         # Округляем цены целей
-        for k in targets: targets[k] = round(round(targets[k] / price_tick) * price_tick, 6)
-
-        qty_30 = round(round((total_qty * 0.30) / qty_step) * qty_step, 6)
-        qty_rem = round(total_qty - qty_30 - qty_30, 6)  # Остаток, чтобы не было хвостов
+        for k in targets:
+            targets[k] = round(round(targets[k] / price_tick) * price_tick, 6)
 
         # 6. Расставляем ордера
         close_side = "Sell" if is_long else "Buy"
         logs = [f"📉 <b>Risk Check:</b> Стоп на {stop_loss}. Риск позиции: <b>{total_risk_usd:.2f}$</b> (1R)"]
 
         async def send_limit(q, p, r_name):
-            if q <= 0: return False
+            if q <= 0:
+                return False
             try:
                 await bybit_call(
                     session.place_order,
@@ -177,7 +177,6 @@ async def place_tp_ladder(symbol):
                     orderType="Limit", qty=str(q), price=str(p),
                     reduceOnly=True, timeInForce="GTC",
                 )
-                # Считаем профит этого конкретного ордера
                 est_profit = q * abs(entry_price - p)
                 logs.append(f"✅ {r_name}: {p} (Vol: {q}) → <b>+{est_profit:.2f}$</b>")
                 return True
@@ -185,11 +184,31 @@ async def place_tp_ladder(symbol):
                 logs.append(f"❌ Err {r_name}: {ex}")
                 return False
 
-        await send_limit(qty_30, targets['tp1'], "TP1 (1R)")
-        await send_limit(qty_30, targets['tp2'], "TP2 (2R)")
-        await send_limit(qty_rem, targets['tp3'], "TP3 (3R)")
+        # 7. Выбираем схему сплита с учётом minOrderQty
+        qty_30 = round(math.floor((total_qty * 0.30) / qty_step) * qty_step, 6)
+        if qty_30 >= min_order_qty:
+            # Normal 3-leg: 30% / 30% / remainder
+            qty_rem = round(total_qty - qty_30 - qty_30, 6)
+            await send_limit(qty_30, targets['tp1'], "TP1 (1R)")
+            await send_limit(qty_30, targets['tp2'], "TP2 (2R)")
+            await send_limit(qty_rem, targets['tp3'], "TP3 (3R)")
+            legs_note = ""
+        else:
+            # Try 2-leg: 50% / remainder
+            qty_half = round(math.floor((total_qty * 0.50) / qty_step) * qty_step, 6)
+            if qty_half >= min_order_qty:
+                qty_rem2 = round(total_qty - qty_half, 6)
+                await send_limit(qty_half, targets['tp1'], "TP1 (1R)")
+                await send_limit(qty_rem2, targets['tp2'], "TP2 (2R)")
+                legs_note = " (degraded: qty too small for 3 legs → placed 2)"
+                logs.append("⚠️ Позиция слишком маленькая для 3 TP: поставлено 2 ордера.")
+            else:
+                # 1-leg: full position at TP1
+                await send_limit(total_qty, targets['tp1'], "TP1 (1R)")
+                legs_note = " (degraded: qty too small to split → placed 1)"
+                logs.append("⚠️ Позиция слишком маленькая для сплита: поставлен 1 TP-ордер.")
 
-        logging.info(f"Real-R TPs placed for {symbol}. Risk: {total_risk_usd}$")
+        logging.info(f"Real-R TPs placed for {symbol}. Risk: {total_risk_usd}$" + legs_note)
         return "\n".join(logs)
 
     except Exception as e:

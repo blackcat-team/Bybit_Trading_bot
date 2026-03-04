@@ -15,7 +15,7 @@ from core.database import update_risk_for_symbol, log_source, pop_market_pending
 from core.journal import append_event, ENTRY_PLACED
 from core.trading_core import session, place_tp_ladder
 from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_qty
-from handlers.orders import place_market_with_retry, close_position_market, bybit_call
+from handlers.orders import place_market_with_retry, close_position_market, bybit_call, set_leverage_safe
 from handlers.views_orders import view_orders, view_symbol_orders
 from handlers.views_positions import check_positions
 
@@ -206,18 +206,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             qty_from_cb = float(qty_str)
             order_side = "Buy" if side == "LONG" else "Sell"
 
-            # Ставим плечо перед входом
+            # Ставим плечо перед входом — set_leverage_safe silently swallows 110043 ("not modified")
             try:
-                await bybit_call(session.set_leverage, category="linear", symbol=sym, buyLeverage=str(lev), sellLeverage=str(lev))
+                await bybit_call(set_leverage_safe, sym, lev)
             except Exception as lev_err:
-                if "110043" not in str(lev_err):
-                    logging.warning(f"⚠️ set_leverage({sym}, x{lev}) failed: {lev_err}")
+                logging.warning("set_leverage(%s, x%s) unexpected error: %s", sym, lev, lev_err)
 
             # --- RE-PREFLIGHT: свежая цена + свежий баланс ---
             final_qty = qty_from_cb
             qty_step = 0.0
             min_order_qty = 0.0
             max_order_qty = 0.0
+            fresh_price = 0.0  # fallback for journal entry price
             try:
                 ticker = await bybit_call(session.get_tickers, category="linear", symbol=sym)
                 fresh_price = float(ticker['result']['list'][0]['lastPrice'])
@@ -312,6 +312,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await asyncio.to_thread(log_source, sym, src_val)
                 except Exception as pend_err:
                     logging.warning("post-market pending write failed for %s: %s", sym, pend_err)
+                # Poll for real fill price; fallback to fresh_price from preflight
+                entry_price = fresh_price
+                try:
+                    for _ in range(3):
+                        await asyncio.sleep(0.4)
+                        pos_r = await bybit_call(
+                            session.get_positions, category="linear", symbol=sym
+                        )
+                        plist = [p for p in pos_r['result']['list'] if float(p['size']) > 0]
+                        if plist:
+                            ep = float(plist[0].get('avgPrice', 0) or 0)
+                            if ep > 0:
+                                entry_price = ep
+                                break
+                except Exception:
+                    pass  # keep fresh_price as fallback
                 # Journal ENTRY_PLACED for market order
                 try:
                     await asyncio.to_thread(
@@ -320,7 +336,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "event": ENTRY_PLACED, "symbol": sym,
                             "side": side, "source_tag": src_val or "unknown",
                             "planned_risk_usdt": risk_val or 0.0,
-                            "qty": final_qty, "entry": 0.0, "stop": float(sl),
+                            "qty": final_qty, "entry": entry_price, "stop": float(sl),
                             "order_type": "market",
                         },
                     )

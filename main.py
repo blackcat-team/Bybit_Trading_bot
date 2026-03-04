@@ -133,6 +133,10 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), parse_and_trade))
 
+    async def _ptb_error_handler(update, context):
+        logging.error("Unhandled PTB exception: %s", context.error, exc_info=context.error)
+    app.add_error_handler(_ptb_error_handler)
+
     print(f"{Fore.GREEN}{Style.BRIGHT}🤖 Bot Modular v2.0 Running...{Style.RESET_ALL}")
 
     # --- ЗАПУСК ФОНОВЫХ ЗАДАЧ (AUTOPILOT) ---
