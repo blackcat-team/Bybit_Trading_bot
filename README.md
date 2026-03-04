@@ -1,4 +1,4 @@
-# 📈 Bybit Telegram Trading Bot (R-System v1.2 PRO)
+# 📈 Bybit Telegram Trading Bot
 ![Visitor Badge](https://visitor-badge.laobi.icu/badge?page_id=blackcat-team.Bybit_Trading_bot)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
 ![Bybit](https://img.shields.io/badge/Bybit-API-orange)
@@ -18,7 +18,7 @@
 * **Защита:** Блокирует сделки с нулевым объемом, защищает от "перепутанных" кнопок Long/Short и контролирует доступную маржу.
 
 ### 2. Умное управление позицией (Smart Logic)
-* **📉 Ступенчатый Безубыток (Smart Breakeven v2.1):**
+* **📉 Ступенчатый Безубыток:**
     * Прибыль ≥ **1R**: Сокращает риск на 70% (подтягивает SL в зону -0.3R).
     * Прибыль ≥ **2R**: Переводит в полный БУ (Вход + 0.05R для покрытия комиссий).
 * **💰 Smart Take Profits:** Автоматическая расстановка лесенки тейков по стратегии "30/30/40":
@@ -206,3 +206,35 @@ pip install -r requirements.txt
 sudo systemctl start bybitbot
 sudo journalctl -u bybitbot -n 80 --no-pager
 ```
+
+---
+
+## ✅ Production Checklist
+
+Before going live, verify the following:
+
+**API & auth**
+- [ ] `BYBIT_API_KEY` / `BYBIT_API_SECRET` — created with Trade-only permission, IP whitelist set
+- [ ] `ALLOWED_TELEGRAM_ID` — only your personal ID (never a group/channel)
+- [ ] `IS_DEMO=False` in `.env`
+
+**Risk controls**
+- [ ] `USER_RISK_USD` — set to a value you are comfortable losing per trade
+- [ ] `DAILY_LOSS_LIMIT` in `core/config.py` — set to your prop-firm or personal limit (default −50 USD)
+- [ ] `MAX_TOTAL_HEAT_USDT` — set to your total open-risk ceiling (0 = disabled)
+- [ ] `REQUIRE_MARKET_CONFIRM=1` — recommended for live trading (shows preview before execution)
+
+**Signal safety**
+- [ ] `CONFLICT_POLICY_SAME_DIR=ignore` — prevents duplicate entries by default
+- [ ] `QUARANTINE_LOSS_STREAK` — consider 3–5 to auto-disable poorly-performing sources
+- [ ] Review sources in `/status` before first signal
+
+**Infrastructure**
+- [ ] Bot runs as non-root user with `systemd` service (`deploy/bybit-bot.service`)
+- [ ] `data/` directory exists and is writable by the bot user
+- [ ] Test on Bybit testnet (`IS_DEMO=True`) before switching to live
+
+**Post-launch**
+- [ ] Send `/start` to enable signal processing
+- [ ] Confirm `/status` shows correct balance and no errors
+- [ ] Place one small test trade end-to-end and verify TP/SL placement
