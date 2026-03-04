@@ -9,8 +9,61 @@ format_market_preview
   → HTML (sent with parse_mode='HTML' by buttons.py; kept separate).
 """
 
+# ── Number-formatting helpers ─────────────────────────────────────────────────
+
+def _trim_num(s: str) -> str:
+    """Strip trailing zeros then trailing dot from a decimal string.
+
+    "27.500000" → "27.5"
+    "0.07475000" → "0.07475"
+    "100.000000" → "100"
+    """
+    return s.rstrip("0").rstrip(".")
+
+
+def _fmt_price(x) -> str:
+    """Format a price: up to 6 significant decimals, trailing zeros trimmed."""
+    if x is None:
+        return "—"
+    return _trim_num(f"{x:.6f}")
+
+
+def _fmt_qty(x) -> str:
+    """Format a quantity: up to 8 decimals, trailing zeros trimmed."""
+    if x is None:
+        return "—"
+    return _trim_num(f"{x:.8f}")
+
+
+def _fmt_usd(x, signed: bool = False) -> str:
+    """Format a USD value to exactly 2 decimal places.
+
+    signed=True  → "+11.62$" / "-3.00$"
+    signed=False → "24.30$"
+    """
+    if x is None:
+        return "—"
+    return f"{x:+.2f}$" if signed else f"{x:.2f}$"
+
+
+def _fmt_r(x) -> str:
+    """Format an R value with sign, or '—' when unavailable."""
+    if x is None:
+        return "—"
+    return f"{x:+.2f}R"
+
+
+def _fmt_pct(x) -> str:
+    """Format a percent with sign and 2 decimal places: '-8.18%'."""
+    return f"{x:+.2f}%"
+
+
+# ── Separator ─────────────────────────────────────────────────────────────────
+
 _SEP = "➖➖➖➖➖➖➖➖"
 
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _sl_pct(entry_price: float, stop_val: float) -> float:
     """Return the stop-loss distance as a negative percentage of entry price.
@@ -24,17 +77,18 @@ def _sl_pct(entry_price: float, stop_val: float) -> float:
     return -abs(entry_price - stop_val) / entry_price * 100
 
 
+# ── Signal cards (plain text) ─────────────────────────────────────────────────
+
 def format_market_signal(sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag):
     """Plain-text card for a market (CMP) signal."""
     side_icon = "🟢" if side == "LONG" else "🔴"
-    sl_pct = _sl_pct(entry_price, stop_val)
     return (
         f"⚡️ {sym} • MARKET\n"
         f"{side_icon} {side} | x{lev}\n"
         f"{_SEP}\n"
-        f"🎯 Entry: ~{entry_price}\n"
-        f"🛡 Stop Loss: {stop_val} ({sl_pct:.2f}%)\n"
-        f"📦 Volume: {qty} (~{pos_value_usd:.1f}$)\n"
+        f"🎯 Entry: ≈{_fmt_price(entry_price)}\n"
+        f"🛡 Stop Loss: {_fmt_price(stop_val)} ({_fmt_pct(_sl_pct(entry_price, stop_val))})\n"
+        f"📦 Volume: {_fmt_qty(qty)} (~{_fmt_usd(pos_value_usd)})\n"
         f"📡 Src: {source_tag}"
     )
 
@@ -42,14 +96,13 @@ def format_market_signal(sym, side, lev, entry_price, stop_val, qty, pos_value_u
 def format_limit_signal(sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag):
     """Plain-text card for a limit signal."""
     side_icon = "🟢" if side == "LONG" else "🔴"
-    sl_pct = _sl_pct(entry_price, stop_val)
     return (
         f"🚀 {sym} • LIMIT\n"
         f"{side_icon} {side} | x{lev}\n"
         f"{_SEP}\n"
-        f"🎯 Entry: {entry_price}\n"
-        f"🛡 Stop Loss: {stop_val} ({sl_pct:.2f}%)\n"
-        f"📦 Volume: {qty} (~{pos_value_usd:.1f}$)\n"
+        f"🎯 Entry: {_fmt_price(entry_price)}\n"
+        f"🛡 Stop Loss: {_fmt_price(stop_val)} ({_fmt_pct(_sl_pct(entry_price, stop_val))})\n"
+        f"📦 Volume: {_fmt_qty(qty)} (~{_fmt_usd(pos_value_usd)})\n"
         f"📡 Src: {source_tag}"
     )
 
@@ -87,9 +140,8 @@ def format_position_card(sym, side, pnl, current_r):
     """
     side_label = "LONG" if side == "Buy" else "SHORT"
     side_icon  = "🟢"   if side == "Buy" else "🔴"
-    r_str = f"{current_r:+.2f}R" if current_r is not None else "—"
     return (
         f"💼 {sym} • {side_icon} {side_label}\n"
         f"{_SEP}\n"
-        f"💰 PnL: {pnl:+.2f}$ ({r_str})"
+        f"💰 PnL: {_fmt_usd(pnl, signed=True)} ({_fmt_r(current_r)})"
     )
