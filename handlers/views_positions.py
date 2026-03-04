@@ -50,7 +50,7 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p in active:
             sym, pnl, side = p['symbol'], float(p['unrealisedPnl']), p['side']
             trade_risk = get_risk_for_symbol(sym)
-            current_r = pnl / trade_risk if trade_risk != 0 else 0
+            current_r = pnl / trade_risk if trade_risk else None
 
             cnt = orders_count.get(sym, 0)
 
@@ -69,7 +69,6 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=ALLOWED_ID,
                 text=msg,
                 reply_markup=InlineKeyboardMarkup([row1, row2]),
-                parse_mode='HTML'
             )
 
     except Exception as e:
