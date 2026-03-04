@@ -7,7 +7,7 @@ Usage:
                      dedup_key="daily_limit")
 
 Alert classes (also importable as string constants):
-    RATE_LIMIT, AUTH, INSUFFICIENT_MARGIN, INVALID_QTY, FAIL_CLOSED, WARNING, INFO
+    RATE_LIMIT, AUTH, INSUFFICIENT_MARGIN, INVALID_QTY, FAIL_CLOSED, WARNING, INFO, TIMEOUT
 
 Error classifier:
     from core.notifier import classify_error
@@ -33,6 +33,7 @@ INVALID_QTY = "INVALID_QTY"
 FAIL_CLOSED = "FAIL_CLOSED"
 WARNING = "WARNING"
 INFO = "INFO"
+TIMEOUT = "TIMEOUT"
 
 # Default cooldown between repeated alerts with the same dedup_key (seconds)
 DEFAULT_COOLDOWN = 300  # 5 minutes
@@ -56,6 +57,7 @@ _ICONS = {
     FAIL_CLOSED:         "⛔",
     WARNING:             "⚠️",
     INFO:                "ℹ️",
+    TIMEOUT:             "⏱",
 }
 
 
@@ -71,6 +73,8 @@ _MARGIN_HINTS      = ("110007", "110012", "110045", "insufficient", "not enough 
                       "available balance")
 _QTY_HINTS         = ("110017", "110006", "invalid qty", "invalid price",
                       "qty precision", "qty step", "min order qty")
+_TIMEOUT_HINTS     = ("read timed out", "connect timeout", "connection timeout",
+                      "timed out", "timeout", "readtimeout", "connecttimeout")
 
 
 def classify_error(exc: Exception) -> str:
@@ -78,7 +82,7 @@ def classify_error(exc: Exception) -> str:
     Map an exception to one of the alert class constants.
 
     Checks exception message and, when available, HTTP status code.
-    Returns one of: RATE_LIMIT, AUTH, INSUFFICIENT_MARGIN, INVALID_QTY, WARNING.
+    Returns one of: RATE_LIMIT, AUTH, INSUFFICIENT_MARGIN, INVALID_QTY, TIMEOUT, WARNING.
     """
     msg = str(exc).lower()
     if any(h in msg for h in _RATE_LIMIT_HINTS):
@@ -89,6 +93,8 @@ def classify_error(exc: Exception) -> str:
         return INSUFFICIENT_MARGIN
     if any(h in msg for h in _QTY_HINTS):
         return INVALID_QTY
+    if any(h in msg for h in _TIMEOUT_HINTS):
+        return TIMEOUT
     return WARNING
 
 
@@ -120,10 +126,11 @@ async def alert_bybit_error(exc: Exception, fn_name: str) -> None:
     dedup_key = f"bybit_err_{cls}_{fn_name}"
     safe_msg = html.escape(str(exc)[:120])
     safe_fn = html.escape(fn_name)
+    level = "WARNING" if cls == TIMEOUT else "ERROR"
     await send_alert(
         _alert_bot,
         _alert_owner_id,
-        level="ERROR",
+        level=level,
         alert_class=cls,
         msg=f"Bybit error in <code>{safe_fn}</code>:\n<code>{safe_msg}</code>",
         dedup_key=dedup_key,

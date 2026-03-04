@@ -18,6 +18,7 @@ from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_
 from handlers.orders import place_market_with_retry, close_position_market, bybit_call, set_leverage_safe
 from handlers.views_orders import view_orders, view_symbol_orders
 from handlers.views_positions import check_positions
+from handlers.ui import h
 
 
 # Preview timestamp store: sym → epoch when user tapped "PREVIEW TRADE".
@@ -180,7 +181,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]]
             _PREVIEW_TS[sym] = time.time()
             await query.edit_message_text(
-                preview_msg, parse_mode='HTML',
+                preview_msg,
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(kb),
             )
 
@@ -188,7 +190,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, sym = data.split("|")
             _PREVIEW_TS.pop(sym, None)
             await query.edit_message_text(
-                f"❌ <b>Отменено.</b> {sym} не торгуется.", parse_mode='HTML'
+                f"❌ Отменено. <b>{h(sym)}</b> не торгуется.", parse_mode='HTML'
             )
 
         elif data.startswith("buy_market|"):
@@ -345,6 +347,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(msg_text)
             else:
                 await query.edit_message_text(msg_text)
+
+        elif data.startswith("close_confirm|"):
+            _, sym = data.split("|")
+            kb = [[
+                InlineKeyboardButton("✅ CONFIRM CLOSE", callback_data=f"close_mkt_confirm|{sym}"),
+                InlineKeyboardButton("↩ Back to Orders", callback_data=f"show_orders|{sym}"),
+            ]]
+            await query.edit_message_text(
+                f"⚠️ Close <b>{h(sym)}</b> at MARKET price?\n"
+                f"This will close the FULL position immediately.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+
+        elif data.startswith("close_mkt_confirm|"):
+            _, sym = data.split("|")
+            try:
+                success, msg_text, _ = await bybit_call(close_position_market, sym)
+                if success:
+                    await query.answer(f"✅ {sym} closed!", show_alert=True)
+                    await query.edit_message_text(msg_text)
+                else:
+                    await query.answer(msg_text, show_alert=True)
+                    await check_positions(update, context)
+            except Exception as e:
+                await query.answer(f"❌ Close error: {e}", show_alert=True)
 
         elif data.startswith("emergency_close|"):
             _, sym = data.split("|")

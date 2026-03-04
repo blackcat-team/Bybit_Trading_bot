@@ -2,12 +2,18 @@
 UI helpers — message templates for Telegram.
 Pure functions, return strings (no await / side-effects).
 
-format_market_signal, format_limit_signal, format_position_card
-  → plain text (no parse_mode needed).
-
-format_market_preview
-  → HTML (sent with parse_mode='HTML' by buttons.py; kept separate).
+All card renderers return HTML strings — callers must use parse_mode='HTML'.
+h(text) escapes arbitrary dynamic values for safe HTML insertion.
 """
+
+import html as _html
+
+# ── HTML safety ────────────────────────────────────────────────────────────────
+
+def h(text) -> str:
+    """Escape arbitrary text for safe insertion into Telegram HTML."""
+    return _html.escape(str(text))
+
 
 # ── Number-formatting helpers ─────────────────────────────────────────────────
 
@@ -77,59 +83,57 @@ def _sl_pct(entry_price: float, stop_val: float) -> float:
     return -abs(entry_price - stop_val) / entry_price * 100
 
 
-# ── Signal cards (plain text) ─────────────────────────────────────────────────
+# ── Signal cards (HTML) ───────────────────────────────────────────────────────
 
 def format_market_signal(sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag):
-    """Plain-text card for a market (CMP) signal."""
+    """HTML card for a market (CMP) signal."""
     side_icon = "🟢" if side == "LONG" else "🔴"
     return (
-        f"⚡️ {sym} • MARKET\n"
-        f"{side_icon} {side} | x{lev}\n"
+        f"⚡️ <b>{h(sym)} • MARKET</b>\n"
+        f"<i>{side_icon} {h(side)} | x{lev}</i>\n"
         f"{_SEP}\n"
-        f"🎯 Entry: ≈{_fmt_price(entry_price)}\n"
-        f"🛡 Stop Loss: {_fmt_price(stop_val)} ({_fmt_pct(_sl_pct(entry_price, stop_val))})\n"
-        f"📦 Volume: {_fmt_qty(qty)} (~{_fmt_usd(pos_value_usd)})\n"
-        f"📡 Src: {source_tag}"
+        f"🎯 <b>Entry:</b> ≈{_fmt_price(entry_price)}\n"
+        f"🛡 <b>Stop Loss:</b> {_fmt_price(stop_val)} ({_fmt_pct(_sl_pct(entry_price, stop_val))})\n"
+        f"📦 <b>Volume:</b> {_fmt_qty(qty)} (≈{_fmt_usd(pos_value_usd)})\n"
+        f"📡 <b>Src:</b> {h(source_tag)}"
     )
 
 
 def format_limit_signal(sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag):
-    """Plain-text card for a limit signal."""
+    """HTML card for a limit signal."""
     side_icon = "🟢" if side == "LONG" else "🔴"
     return (
-        f"🚀 {sym} • LIMIT\n"
-        f"{side_icon} {side} | x{lev}\n"
+        f"🚀 <b>{h(sym)} • LIMIT</b>\n"
+        f"<i>{side_icon} {h(side)} | x{lev}</i>\n"
         f"{_SEP}\n"
-        f"🎯 Entry: {_fmt_price(entry_price)}\n"
-        f"🛡 Stop Loss: {_fmt_price(stop_val)} ({_fmt_pct(_sl_pct(entry_price, stop_val))})\n"
-        f"📦 Volume: {_fmt_qty(qty)} (~{_fmt_usd(pos_value_usd)})\n"
-        f"📡 Src: {source_tag}"
+        f"🎯 <b>Entry:</b> {_fmt_price(entry_price)}\n"
+        f"🛡 <b>Stop Loss:</b> {_fmt_price(stop_val)} ({_fmt_pct(_sl_pct(entry_price, stop_val))})\n"
+        f"📦 <b>Volume:</b> {_fmt_qty(qty)} (≈{_fmt_usd(pos_value_usd)})\n"
+        f"📡 <b>Src:</b> {h(source_tag)}"
     )
 
 
 def format_market_preview(sym, side, lev, entry_price, stop_val, qty, pos_value_usd,
                            risk_usd, source_tag, heat_after, max_heat):
-    """Detailed preview card shown before market execution when REQUIRE_MARKET_CONFIRM=1.
-
-    Returns HTML — sent with parse_mode='HTML' in buttons.py.
-    """
-    stop_dist_pct = abs(entry_price - stop_val) / entry_price * 100 if entry_price else 0
+    """HTML preview card shown before market execution when REQUIRE_MARKET_CONFIRM=1."""
+    side_icon = "🟢" if side == "LONG" else "🔴"
     heat_str = f"{heat_after:.1f}$ / {max_heat:.1f}$" if max_heat > 0 else "disabled"
     return (
-        f"👁 <b>MARKET PREVIEW — {sym}</b>\n"
-        f"Side:    {side} | x{lev}\n"
-        f"Price:   ~{entry_price:.4f}\n"
-        f"SL:      {stop_val} ({stop_dist_pct:.2f}%)\n"
-        f"Risk:    {risk_usd:.2f}$  →  Notional: ~{pos_value_usd:.1f}$\n"
-        f"Qty:     {qty}\n"
-        f"Heat ↑:  {heat_str}\n"
-        f"Source:  {source_tag}\n\n"
-        f"<i>Tap ✅ CONFIRM to place or ❌ CANCEL to abort.</i>"
+        f"👁 <b>{h(sym)} • MARKET PREVIEW</b>\n"
+        f"<i>{side_icon} {h(side)} | x{lev}</i>\n"
+        f"{_SEP}\n"
+        f"🎯 <b>Entry:</b> ≈{_fmt_price(entry_price)}\n"
+        f"🛡 <b>Stop Loss:</b> {_fmt_price(stop_val)} ({_fmt_pct(_sl_pct(entry_price, stop_val))})\n"
+        f"📦 <b>Volume:</b> {_fmt_qty(qty)} (≈{_fmt_usd(pos_value_usd)})\n"
+        f"💰 <b>Risk:</b> {_fmt_usd(risk_usd)} → Notional: ≈{_fmt_usd(pos_value_usd)}\n"
+        f"🔥 <b>Heat ↑:</b> {h(heat_str)}\n"
+        f"📡 <b>Src:</b> {h(source_tag)}\n\n"
+        f"Tap ✅ CONFIRM to place or ❌ CANCEL to abort."
     )
 
 
 def format_position_card(sym, side, pnl, current_r):
-    """Plain-text position card.
+    """HTML position card.
 
     Args:
         sym:       symbol string, e.g. "ETHUSDT"
@@ -141,7 +145,24 @@ def format_position_card(sym, side, pnl, current_r):
     side_label = "LONG" if side == "Buy" else "SHORT"
     side_icon  = "🟢"   if side == "Buy" else "🔴"
     return (
-        f"💼 {sym} • {side_icon} {side_label}\n"
+        f"💼 <b>{h(sym)} • {side_icon} {side_label}</b>\n"
         f"{_SEP}\n"
-        f"💰 PnL: {_fmt_usd(pnl, signed=True)} ({_fmt_r(current_r)})"
+        f"💰 <b>PnL:</b> {_fmt_usd(pnl, signed=True)} ({_fmt_r(current_r)})"
     )
+
+
+def format_orders_menu_html(symbol: str, orders: list) -> str:
+    """HTML orders detail menu for view_symbol_orders.
+
+    Each order is rendered as a <code> block with all dynamic fields escaped.
+    """
+    n = len(orders)
+    lines = [f"📂 <b>Ордера {h(symbol)} ({n}):</b>"]
+    for o in orders:
+        side     = o.get('side', '')
+        price    = o.get('price', '')
+        qty      = o.get('qty', '')
+        is_reduce = o.get('reduceOnly', False)
+        type_str = "TakeProfit/Exit" if is_reduce else "Entry Limit"
+        lines.append(f"<code>{h(side)}: {h(price)} ({type_str}) Qty: {h(qty)}</code>")
+    return "\n".join(lines)

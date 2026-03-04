@@ -1,5 +1,6 @@
 import logging
 import sys
+import warnings
 import pytz
 from datetime import time
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters
@@ -164,7 +165,10 @@ if __name__ == '__main__':
     jq.run_repeating(reconcile_journal_job, interval=3600, first=120)
 
     # 8. Weekly source stats report (Каждый понедельник в 09:00 UTC)
-    jq.run_daily(weekly_source_report_job, time=time(hour=9, minute=0, tzinfo=pytz.UTC), days=(0,))
+    # Suppress PTBUserWarning about run_daily days= convention (harmless; 0=Monday in PTB 20.7+)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="telegram")
+        jq.run_daily(weekly_source_report_job, time=time(hour=9, minute=0, tzinfo=pytz.UTC), days=(0,))
 
     print("✅ Background jobs started...")
 

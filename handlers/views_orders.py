@@ -11,6 +11,7 @@ from core.config import ALLOWED_ID
 from core.trading_core import session
 from handlers.orders import bybit_call
 from handlers.views_positions import check_positions
+from handlers.ui import format_orders_menu_html, h
 
 
 async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -36,14 +37,14 @@ async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = []
 
         for o in active_orders:
-            sym = o['symbol']
+            sym  = o['symbol']
             side = o['side']
             price = o['price']
-            qty = o['qty']
-            oid = o['orderId']
+            qty  = o['qty']
+            oid  = o['orderId']
 
             icon = "🟢" if side == "Buy" else "🔴"
-            msg_text += f"{icon} <b>{sym}</b> {side} @ {price}\n"
+            msg_text += f"{icon} <b>{h(sym)}</b> {h(side)} @ {h(price)}\n"
 
             btn_text = f"❌ {sym} {price}"
             cb_data = f"cancel_o|{sym}|{oid}|list"
@@ -76,26 +77,18 @@ async def view_symbol_orders(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await check_positions(update, context)
             return
 
-        msg_text = f"📂 <b>Ордера {symbol} ({len(orders)}):</b>\n\n"
-        keyboard = []
-
         orders.sort(key=lambda x: x.get('reduceOnly', False))
 
+        msg_text = format_orders_menu_html(symbol, orders)
+
+        keyboard = []
         for o in orders:
-            side = o['side']
             price = o['price']
-            qty = o['qty']
-            oid = o['orderId']
-            is_reduce = o.get('reduceOnly', False)
-            type_str = "TakeProfit/Exit" if is_reduce else "Entry Limit"
-
-            icon = "🎯" if is_reduce else ("🟢" if side == "Buy" else "🔴")
-
-            msg_text += f"{icon} <b>{side}</b>: {price} ({type_str})\nQty: {qty}\n\n"
-
+            oid   = o['orderId']
             cb_data = f"cancel_o|{symbol}|{oid}|sym"
             keyboard.append([InlineKeyboardButton(f"❌ Cancel {price}", callback_data=cb_data)])
 
+        keyboard.append([InlineKeyboardButton(f"❌ Close Market {symbol}", callback_data=f"close_confirm|{symbol}")])
         keyboard.append([InlineKeyboardButton("🔙 Назад к позициям", callback_data="back_to_pos")])
 
         reply_markup = InlineKeyboardMarkup(keyboard)

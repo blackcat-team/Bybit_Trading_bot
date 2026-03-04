@@ -40,6 +40,11 @@ async def on_startup_check(context: ContextTypes.DEFAULT_TYPE):
 
         if not active_positions:
             logging.info("✅ No active positions found.")
+            await context.bot.send_message(
+                chat_id=ALLOWED_ID,
+                text="🤖 <b>RESTART:</b> 0 active positions.",
+                parse_mode='HTML',
+            )
             return
 
         orders_resp = await bybit_call(session.get_open_orders, category="linear", settleCoin="USDT")

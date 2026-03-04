@@ -358,7 +358,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sym, side, stop_val, qty, effective_lev, REQUIRE_MARKET_CONFIRM
             )
             kb = [[InlineKeyboardButton(btn_label, callback_data=cb_data)]]
-            await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+            await update.message.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
         else:
             msg = format_limit_signal(
                 sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag
@@ -377,7 +377,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "order_type": "limit",
                 },
             )
-            await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+            await update.message.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
 
     except Exception as e:
         logging.error(f"Trade Error: {e}")

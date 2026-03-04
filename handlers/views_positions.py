@@ -68,6 +68,7 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=ALLOWED_ID,
                 text=msg,
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([row1, row2]),
             )
 
