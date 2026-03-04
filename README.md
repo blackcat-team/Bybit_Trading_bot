@@ -133,7 +133,7 @@ cp sources_log.example.json sources_log.json
 | `data/sources_log.json` | Лог источников сигналов |
 | `data/trade_journal.jsonl` | Торговый журнал (JSONL, append-only) |
 | `data/disabled_sources.json` | Источники в карантине |
-| `data/heat_queue.json` | Очередь сделок (ожидают снижения тепла) |
+| `data/heat_queue.json` | Очередь сделок при HEAT_ACTION=queue (без автоисполнения) |
 
 ---
 

@@ -69,7 +69,7 @@ SOURCE_ALLOW_ADD = os.getenv('SOURCE_ALLOW_ADD', '0') == '1'
 MAX_TOTAL_HEAT_USDT = float(os.getenv('MAX_TOTAL_HEAT_USDT', 0))
 # HEAT_ACTION: действие при превышении лимита heat.
 #   "reject" — fail-closed, заблокировать сделку (по умолчанию)
-#   "queue"  — припарковать сделку с TTL, повторить при снижении heat
+#   "queue"  — сохранить сигнал в очередь (без автоисполнения); требует внешнего воркера
 HEAT_ACTION = os.getenv('HEAT_ACTION', 'reject').lower()
 # HEAT_QUEUE_TTL_MIN: время действия поставленных в очередь сделок (минуты).
 HEAT_QUEUE_TTL_MIN = int(os.getenv('HEAT_QUEUE_TTL_MIN', 30))
