@@ -1,16 +1,16 @@
 """
-C7 — Signal conflict resolver tests.
+C7 — Тесты резолвера конфликтов сигналов.
 
-Tests:
-- resolve_signal_conflict: no existing → allow
-- same direction + ignore policy → ignore
-- same direction + add_if_allowed + SOURCE_ALLOW_ADD=1 → add
-- same direction + add_if_allowed but SOURCE_ALLOW_ADD=0 → ignore
-- opposite direction → block
-- API error in _get_existing_side → block (fail-closed)
-- pending entry order detection via _get_existing_side unit tests
+Тесты:
+- resolve_signal_conflict: нет существующей позиции → allow
+- то же направление + политика ignore → ignore
+- то же направление + add_if_allowed + SOURCE_ALLOW_ADD=1 → add
+- то же направление + add_if_allowed, но SOURCE_ALLOW_ADD=0 → ignore
+- противоположное направление → block
+- ошибка API в _get_existing_side → block (fail-closed)
+- обнаружение ожидающего entry-ордера через юнит-тесты _get_existing_side
 
-All tests patch _get_existing_side directly to avoid Bybit API calls.
+Все тесты напрямую патчат _get_existing_side, чтобы не делать вызовы к Bybit API.
 """
 
 import sys

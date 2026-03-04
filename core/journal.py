@@ -25,7 +25,7 @@ from core.config import (
 )
 
 # ---------------------------------------------------------------------------
-# Event type constants
+# Константы типов событий журнала
 # ---------------------------------------------------------------------------
 
 ENTRY_PLACED = "ENTRY_PLACED"
@@ -33,7 +33,7 @@ CLOSED       = "CLOSED"
 FAIL         = "FAIL"
 
 # ---------------------------------------------------------------------------
-# Disabled sources (in-memory + persisted)
+# Отключённые источники (в памяти + на диске)
 # ---------------------------------------------------------------------------
 
 _DISABLED_SOURCES: dict = {}   # {source_tag: reason_str}
@@ -90,7 +90,7 @@ def get_disabled_sources() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Journal I/O
+# Ввод-вывод журнала
 # ---------------------------------------------------------------------------
 
 def append_event(event: dict) -> None:
@@ -146,7 +146,7 @@ def read_events(
 
 
 # ---------------------------------------------------------------------------
-# Source statistics
+# Статистика источников сигналов
 # ---------------------------------------------------------------------------
 
 def compute_source_stats(
@@ -163,7 +163,7 @@ def compute_source_stats(
     if events is None:
         events = read_events(event_type=CLOSED, since_ts=since_ts)
 
-    raw: dict = {}   # tag → list of {"pnl": float, "R": float}
+    raw: dict = {}   # tag → список {"pnl": float, "R": float}
     for ev in events:
         tag = ev.get("source_tag") or "unknown"
         raw.setdefault(tag, []).append(
@@ -178,14 +178,14 @@ def compute_source_stats(
         losses = sum(1 for p in pnls if p <= 0)
         total  = wins + losses
 
-        # Max drawdown: biggest peak-to-trough in cumulative PnL
+        # Максимальная просадка: наибольшее падение кумулятивного PnL от пика до дна
         max_dd, peak, cum = 0.0, 0.0, 0.0
         for p in pnls:
             cum += p
             peak = max(peak, cum)
             max_dd = max(max_dd, peak - cum)
 
-        # Current loss streak (counting from most recent trade backwards)
+        # Текущая серия убытков (с последней сделки в обратном порядке)
         streak = 0
         for p in reversed(pnls):
             if p <= 0:
@@ -208,7 +208,7 @@ def compute_source_stats(
 
 
 # ---------------------------------------------------------------------------
-# Auto-quarantine
+# Автокарантин источников
 # ---------------------------------------------------------------------------
 
 def check_and_quarantine_sources(
@@ -228,7 +228,7 @@ def check_and_quarantine_sources(
     """
     newly_quarantined = []
 
-    # Compute stats on demand if not provided
+    # Вычисляем статистику по требованию, если не передана
     if stats is None:
         stats = compute_source_stats()
     if daily_stats is None and QUARANTINE_DAILY_PNL_USDT != 0:
@@ -244,9 +244,9 @@ def check_and_quarantine_sources(
 
     for tag in all_tags:
         if not is_source_enabled(tag):
-            continue   # already quarantined
+            continue   # уже в карантине
 
-        # 1. Loss streak (from all-time stats)
+        # 1. Серия убытков (из общей статистики)
         if QUARANTINE_LOSS_STREAK > 0:
             streak = stats.get(tag, {}).get("loss_streak", 0)
             if streak >= QUARANTINE_LOSS_STREAK:
@@ -255,7 +255,7 @@ def check_and_quarantine_sources(
                 newly_quarantined.append((tag, reason))
                 continue
 
-        # 2. Daily PnL threshold
+        # 2. Порог дневного PnL
         if QUARANTINE_DAILY_PNL_USDT != 0 and daily_stats:
             dpnl = daily_stats.get(tag, {}).get("total_pnl", 0.0)
             if dpnl < QUARANTINE_DAILY_PNL_USDT:
@@ -264,7 +264,7 @@ def check_and_quarantine_sources(
                 newly_quarantined.append((tag, reason))
                 continue
 
-        # 3. Weekly PnL threshold
+        # 3. Порог недельного PnL
         if QUARANTINE_WEEKLY_PNL_USDT != 0 and weekly_stats:
             wpnl = weekly_stats.get(tag, {}).get("total_pnl", 0.0)
             if wpnl < QUARANTINE_WEEKLY_PNL_USDT:

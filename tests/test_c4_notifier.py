@@ -1,8 +1,8 @@
 """
-C4 — Notifier: dedup / cooldown tests.
+C4 — Notifier: тесты дедупликации и cooldown.
 
-Tests the pure-logic layer of core.notifier — no Telegram or Bybit calls needed.
-All tests run at unit-test speed (no I/O, no network).
+Проверяет чистую логику core.notifier — без вызовов Telegram или Bybit.
+Все тесты выполняются на скорости юнит-тестов (без I/O и сети).
 """
 
 import sys
@@ -10,7 +10,7 @@ import time
 from pathlib import Path as _Path
 from unittest.mock import MagicMock, AsyncMock
 
-# ── Mock heavy deps before any project import ────────────────────────────────
+# ── Мокируем тяжёлые зависимости перед любым импортом проекта ────────────────
 for _mod in [
     "telegram", "telegram.ext", "telegram.request",
     "pybit", "pybit.unified_trading",
@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest  # noqa: E402
 
 
-# ── Helper: fresh notifier module ────────────────────────────────────────────
+# ── Вспомогатель: чистый модуль notifier ─────────────────────────────────
 
 def _fresh_notifier():
     """Return core.notifier with a clean dedup store (safe across test runs)."""
@@ -99,7 +99,7 @@ class TestSendAlert:
         bot = MagicMock()
         bot.send_message = AsyncMock()
 
-        # Simulate that last send was 200s ago; cooldown is 100s
+        # Симулируем, что последняя отправка была 200с назад; cooldown равен 100с
         n._dedup["key_old"] = time.time() - 200
 
         sent = await n.send_alert(
@@ -160,7 +160,7 @@ class TestSendAlert:
 
         call_kwargs = bot.send_message.call_args
         text_sent = call_kwargs.kwargs.get("text", "") or call_kwargs.args[0] if call_kwargs.args else ""
-        # The alert class must appear in the sent text
+        # Класс алерта должен присутствовать в отправленном тексте
         assert n.INSUFFICIENT_MARGIN in text_sent or "INSUFFICIENT_MARGIN" in str(call_kwargs)
 
     @pytest.mark.asyncio

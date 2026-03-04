@@ -1,12 +1,12 @@
 """
-C5 — Error classifier + bybit_call alerting integration tests.
+C5 — Классификатор ошибок + интеграционные тесты алертинга bybit_call.
 
-Tests:
-- classify_error() maps representative errors to the correct alert class
-- bybit_call() calls alert_bybit_error on exception and re-raises
-- alert_bybit_error is a no-op when bot is not configured
+Тесты:
+- classify_error() правильно отображает ошибки на классы алертов
+- bybit_call() вызывает alert_bybit_error при исключении и пробрасывает его далее
+- alert_bybit_error — no-op, если бот не настроен
 
-No network calls — all Bybit/Telegram I/O is mocked.
+Без сетевых вызовов — весь I/O Bybit/Telegram замокирован.
 """
 
 import sys
@@ -34,7 +34,7 @@ class TestClassifyError:
     """classify_error maps representative exceptions to alert class constants."""
 
     def setup_method(self):
-        # Ensure fresh import
+        # Обеспечиваем чистый импорт
         import core.notifier as n
         n._dedup.clear()
 
@@ -109,7 +109,7 @@ class TestBybitCallAlerting:
 
         with patch("core.bybit_call.asyncio.to_thread", side_effect=exc_raised), \
              patch("core.notifier.alert_bybit_error", new=fake_alert):
-            # Need to import after patching
+            # Импортируем после патчинга
             sys.modules.pop("core.bybit_call", None)
             import core.bybit_call as bc_mod
 
@@ -123,7 +123,7 @@ class TestBybitCallAlerting:
         n._alert_bot = None
         n._alert_owner_id = ""
 
-        # Should not raise
+        # Не должно бросать исключение
         await n.alert_bybit_error(RuntimeError("some error"), "test_fn")
 
     @pytest.mark.asyncio
@@ -157,7 +157,7 @@ class TestBybitCallAlerting:
         await n.alert_bybit_error(Exception("invalid api key"), "get_wallet_balance")
         await n.alert_bybit_error(Exception("invalid api key"), "get_wallet_balance")
 
-        # Only one message despite two calls
+        # Только одно сообщение несмотря на два вызова
         assert bot.send_message.call_count == 1
 
 

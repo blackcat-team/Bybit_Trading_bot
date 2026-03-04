@@ -382,7 +382,7 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
         _closed_evs = await asyncio.to_thread(read_events, event_type=CLOSED)
         already_closed = {
             ev["symbol"] for ev in _closed_evs
-            if ev.get("ts", 0) > time.time() - 7 * 86400  # last 7 days
+            if ev.get("ts", 0) > time.time() - 7 * 86400  # последние 7 дней
         }
 
         for sym in closed_candidates:
@@ -390,7 +390,7 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
             try:
                 now_ms = int(time.time() * 1000)
-                start_ms = now_ms - 7 * 24 * 60 * 60 * 1000  # last 7 days
+                start_ms = now_ms - 7 * 24 * 60 * 60 * 1000  # последние 7 дней
                 pnl_resp = await bybit_call(
                     session.get_closed_pnl,
                     category="linear", symbol=sym,

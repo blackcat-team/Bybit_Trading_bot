@@ -1,16 +1,16 @@
 """
-P12 — GO MARKET fallback safety tests.
+P12 — Тесты безопасности fallback GO MARKET.
 
-Verifies that qty_from_cb is never passed raw to place_market_with_retry when
-the preflight try-block raises an exception.
+Проверяет, что qty_from_cb никогда не передаётся напрямую в place_market_with_retry,
+когда try-блок preflight выбрасывает исключение.
 
-Decision matrix after a preflight exception:
-  qty_step == 0  (lot filter never fetched)    → block (fail-closed)
-  qty_step >  0, qty < min_order_qty           → block
-  qty_step >  0, validate_qty raises           → block
-  qty_step >  0, qty valid                     → place order with validated qty
+Матрица решений при ошибке preflight:
+  qty_step == 0  (лот-фильтр не загружен)    → блок (fail-closed)
+  qty_step >  0, qty < min_order_qty           → блок
+  qty_step >  0, validate_qty выбрасывает   → блок
+  qty_step >  0, qty валиден               → размещение ордера с валидированным qty
 
-No network calls; all Bybit/Telegram I/O is mocked.
+Без сетевых вызовов; весь I/O Bybit/Telegram замокирован.
 """
 import sys
 import os
@@ -30,12 +30,12 @@ _cfg.ALLOWED_ID = "0"
 _cfg.MARGIN_BUFFER_USD = 1.0
 _cfg.MARGIN_BUFFER_PCT = 0.03
 _cfg.DATA_DIR = _Path(__file__).resolve().parent.parent / "data"
-_cfg.REQUIRE_MARKET_CONFIRM = 0   # preview mode OFF for all p12 tests
+_cfg.REQUIRE_MARKET_CONFIRM = 0   # режим превью отключён для всех p12-тестов
 _cfg.MARKET_PREVIEW_TTL_SEC = 300
 sys.modules["core.config"] = _cfg
 
-# The ALLOWED_ID name is bound at module-import time in handlers.buttons (may be "0"
-# from an earlier test file's MagicMock). We patch it per-test to guarantee matching.
+# Имя ALLOWED_ID привязывается при импорте модуля handlers.buttons (может быть "0"
+# из MagicMock более раннего тест-файла). Патчим пер тест, чтобы гарантировать совпадение.
 _UID = "0"
 
 _tc_mock = MagicMock()
@@ -93,10 +93,10 @@ def _seq_bybit(responses: list):
     return mock
 
 
-# Reusable API response stubs
+# Многоразово используемые заглушки API-ответов
 _TICKER_OK = {"result": {"list": [{"lastPrice": "50000"}]}}
 _WALLET_OK = {"result": {"list": [{"totalAvailableBalance": "1000"}]}}
-# lot filter: step=0.001, min=0.001 → qty=0.01 is VALID, qty=0.0001 is INVALID
+# lot filter: step=0.001, min=0.001 → qty=0.01 ДОПУСТИМ, qty=0.0001 НЕДОПУСТИМ
 _INSTRUMENTS_OK = {
     "result": {"list": [{
         "lotSizeFilter": {

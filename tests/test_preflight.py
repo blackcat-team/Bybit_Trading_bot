@@ -1,16 +1,16 @@
 """
-Unit tests for preflight qty clipping logic.
-No network calls — pure math only.
+Юнит-тесты для логики обрезки qty в preflight.
+Без сетевых вызовов — только чистая математика.
 
-We mock heavy dependencies (telegram, pybit, etc.) so tests run
-without installing the full bot stack.
+Тяжёлые зависимости (telegram, pybit и др.) замокированы,
+чтобы тесты запускались без установки полного стека бота.
 """
 import sys
 import os
 from pathlib import Path as _Path
 from unittest.mock import MagicMock
 
-# --- Mock heavy deps before importing handlers ---
+# --- Мокируем тяжёлые зависимости перед импортом handlers ---
 _MOCKED_MODULES = [
     "telegram", "telegram.ext", "telegram.request",
     "pybit", "pybit.unified_trading",
@@ -19,7 +19,7 @@ _MOCKED_MODULES = [
 for mod in _MOCKED_MODULES:
     sys.modules.setdefault(mod, MagicMock())
 
-# Stub config constants that handlers imports at module level
+# Заглушка для констант конфига, которые handlers импортирует на уровне модуля
 _config_mock = MagicMock()
 _config_mock.ALLOWED_ID = "0"
 _config_mock.MARGIN_BUFFER_USD = 1.0
@@ -27,22 +27,22 @@ _config_mock.MARGIN_BUFFER_PCT = 0.03
 _config_mock.DATA_DIR = _Path(__file__).resolve().parent.parent / "data"
 sys.modules["core.config"] = _config_mock
 
-# Stub trading_core
+# Заглушка для trading_core
 _tc_mock = MagicMock()
 _tc_mock.session = MagicMock()
 sys.modules["core.trading_core"] = _tc_mock
 
-# Stub database
+# Заглушка для database
 sys.modules["core.database"] = MagicMock()
 
-# Now safe to import
+# Теперь импорт безопасен
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from handlers.preflight import floor_qty, validate_qty, clip_qty, _safe_float, get_available_usd
 
 import pytest
 
 
-# --- floor_qty ---
+# --- floor_qty --- #
 
 class TestFloorQty:
     def test_exact_step(self):
@@ -72,7 +72,7 @@ class TestFloorQty:
         assert floor_qty(1.5, 0) == 1.5
 
 
-# --- clip_qty ---
+# --- clip_qty --- #
 
 class TestClipQty:
     """All tests use buffer_usd=1.0, buffer_pct=0.03 (defaults)."""
@@ -169,7 +169,7 @@ class TestClipQty:
         assert reason == "OK"
 
 
-# --- validate_qty ---
+# --- validate_qty --- #
 
 class TestValidateQty:
     def test_valid_qty(self):
@@ -225,7 +225,7 @@ class TestValidateQty:
         assert valid is False
 
 
-# --- _safe_float ---
+# --- _safe_float --- #
 
 class TestSafeFloat:
     def test_normal_number(self):
@@ -253,7 +253,7 @@ class TestSafeFloat:
         assert _safe_float(42.5) == pytest.approx(42.5)
 
 
-# --- get_available_usd ---
+# --- get_available_usd --- #
 
 class TestGetAvailableUsd:
     def test_primary_totalAvailableBalance(self):
@@ -340,13 +340,13 @@ class TestGetAvailableUsd:
         assert src == "coin_fallback"
 
 
-# --- Market re-preflight scenario ---
+# --- Сценарий повторного preflight для маркет-ордера ---
 
 class TestMarketRePreflight:
     def test_market_reclip_on_price_increase(self):
         """If price went up since signal, same qty costs more → might clip."""
-        # Original: qty=10 at price=100 → pos=$1000
-        # Now: price=120, same qty=10 → pos=$1200 (more margin needed)
+        # Исходно: qty=10 при price=100 → pos=$1000
+        # Теперь: price=120, та же qty=10 → pos=$1200 (нужно больше маржина)
         original_qty = 10.0
         fresh_price = 120.0
         desired_pos = original_qty * fresh_price  # 1200
@@ -354,7 +354,7 @@ class TestMarketRePreflight:
         qty, reason, d = clip_qty(
             desired_pos_usd=desired_pos,
             entry_price=fresh_price,
-            available_usd=50.0,  # only $50 available
+            available_usd=50.0,  # доступно только $50
             lev=5,
             qty_step=0.1,
             min_order_qty=0.1,

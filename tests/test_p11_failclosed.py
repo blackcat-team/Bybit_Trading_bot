@@ -1,21 +1,21 @@
 """
-P11 + C1 fail-closed patches — unit tests.
+P11 + C1 — юнит-тесты fail-closed.
 
-Covers:
-- has_open_trade() fail-closed on API exception (M3 audit finding)
-- has_open_trade() fail-closed on malformed API response
-- has_open_trade() normal happy-paths still work correctly
-- check_daily_limit() fail-closed on API exception (C1 audit finding)
-- check_daily_limit() fail-closed on malformed API response
-- check_daily_limit() happy-paths (within limit, over limit)
-No network calls — session is fully mocked.
+Покрывает:
+- has_open_trade(): fail-closed при исключении API (аудит M3)
+- has_open_trade(): fail-closed при некорректном ответе API
+- has_open_trade(): обычные happy-path сценарии работают корректно
+- check_daily_limit(): fail-closed при исключении API (аудит C1)
+- check_daily_limit(): fail-closed при некорректном ответе API
+- check_daily_limit(): happy-path (в рамках лимита, превышение лимита)
+Без сетевых вызовов — session полностью замокирован.
 """
 import sys
 import os
 from pathlib import Path as _Path
 from unittest.mock import MagicMock, patch
 
-# --- Mock heavy deps before any project import ---
+# --- Мокируем тяжёлые зависимости перед любым импортом проекта ---
 for _mod in [
     "telegram", "telegram.ext", "telegram.request",
     "pybit", "pybit.unified_trading",
@@ -38,8 +38,8 @@ sys.modules["core.database"] = MagicMock()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Other test files cache core.trading_core as a MagicMock; remove it so we
-# import the real module here. core.bybit_call is pure-stdlib, leave it alone.
+# Другие тест-файлы кешируют core.trading_core как MagicMock; удаляем его,
+# чтобы импортировать реальный модуль. core.bybit_call — чистый stdlib, не трогаем.
 sys.modules.pop("core.trading_core", None)
 
 import pytest  # noqa: E402

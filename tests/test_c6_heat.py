@@ -1,14 +1,14 @@
 """
-C6 — Heat / Risk Budget tests.
+C6 — Тесты heat / бюджета риска.
 
-Tests:
-- heat_for_position(): SL-based, fallback, zero-size
-- compute_heat_from_data(): sum of positions + pending
-- check_heat_sync(): disabled (0), allowed, rejected
-- enforce_heat(): reject action, queue action, disabled passthrough
-- database heat queue: add, prune (expired), remove
+Тесты:
+- heat_for_position(): на основе SL, fallback, нулевой размер
+- compute_heat_from_data(): сумма позиций + ожидающих
+- check_heat_sync(): отключено (0), допустимо, отклонено
+- enforce_heat(): отклонение, постановка в очередь, passthrough при отключении
+- очередь heat в database: добавление, pruning (просроченных), удаление
 
-No network calls — all Bybit / Telegram I/O is mocked.
+Сетевых вызовов нет — весь Bybit/Telegram I/O замокирован.
 """
 
 import sys

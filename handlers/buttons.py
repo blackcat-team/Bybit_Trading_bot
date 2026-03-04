@@ -204,11 +204,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode='HTML',
                 )
                 return
-            _PREVIEW_TS.pop(sym, None)  # consume the preview token
+            _PREVIEW_TS.pop(sym, None)  # удаляем токен превью
             qty_from_cb = float(qty_str)
             order_side = "Buy" if side == "LONG" else "Sell"
 
-            # Ставим плечо перед входом — set_leverage_safe silently swallows 110043 ("not modified")
+            # Ставим плечо перед входом — set_leverage_safe тихо игнорирует 110043 ("not modified")
             try:
                 await bybit_call(set_leverage_safe, sym, lev)
             except Exception as lev_err:
@@ -268,7 +268,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as pf_err:
                 logging.warning(f"Market preflight error for {sym}: {pf_err}")
                 if qty_step <= 0:
-                    # No lot-filter data — cannot safely validate qty; block order.
+                    # Нет данных лот-фильтра — безопасная валидация qty невозможна; блокируем ордер.
                     logging.warning(f"Market order for {sym} blocked: no lot-filter data after preflight error")
                     await query.edit_message_text(
                         f"❌ <b>Недостаточно маржи</b> для Market {sym}.\n"
@@ -304,7 +304,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sym, order_side, final_qty, sl, qty_step, min_order_qty
             )
             if success:
-                # Write risk+source to disk only after the order is confirmed.
+                # Записываем риск+источник на диск только после подтверждения ордера.
                 risk_val, src_val = None, None
                 try:
                     pending = pop_market_pending(sym)
@@ -314,7 +314,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await asyncio.to_thread(log_source, sym, src_val)
                 except Exception as pend_err:
                     logging.warning("post-market pending write failed for %s: %s", sym, pend_err)
-                # Poll for real fill price; fallback to fresh_price from preflight
+                # Опрашиваем реальную цену исполнения; fallback — fresh_price из preflight
                 entry_price = fresh_price
                 try:
                     for _ in range(3):
@@ -329,8 +329,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 entry_price = ep
                                 break
                 except Exception:
-                    pass  # keep fresh_price as fallback
-                # Journal ENTRY_PLACED for market order
+                    pass  # оставляем fresh_price как fallback
+                # Записываем ENTRY_PLACED в журнал для маркет-ордера
                 try:
                     await asyncio.to_thread(
                         append_event,

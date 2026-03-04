@@ -1,15 +1,15 @@
 """
-C2 — Persistence & async-DB-safety tests.
+C2 — Тесты персистентности и async-безопасности БД.
 
-Covers:
-- settings.json corrupted/empty → trading_enabled=False (fail-closed)
-- settings.json missing (first run) → trading_enabled=True (normal default)
-- save_json() atomic write: no leftover .tmp on success
-- save_json() atomic write: corrupted data raises and leaves no .tmp
-- _MARKET_PENDING: set_market_pending / pop_market_pending roundtrip
-- pop_market_pending returns None for unknown symbol
+Покрывает:
+- settings.json повреждён/пустой → trading_enabled=False (fail-closed)
+- settings.json отсутствует (первый запуск) → trading_enabled=True (нормально)
+- save_json() атомарная запись: нет лишнего .tmp при успехе
+- save_json() атомарная запись: некорректные данные выбрасывают исключение и не оставляют .tmp
+- _MARKET_PENDING: roundtrip set_market_pending / pop_market_pending
+- pop_market_pending возвращает None для неизвестного символа
 
-No network calls; core.database is pure Python.
+Без сетевых вызовов; core.database — чистый Python.
 """
 import sys
 import os
@@ -26,7 +26,7 @@ for _mod in [
 ]:
     sys.modules.setdefault(_mod, MagicMock())
 
-# We need real core.database — pop any cached mock.
+# Нужен реальный core.database — удаляем любой кэшированный мок.
 sys.modules.pop("core.database", None)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -57,7 +57,7 @@ class TestSettingsFailClosed:
         cfg_mock.SETTINGS_FILE.write_text("{ NOT VALID JSON !!!", encoding="utf-8")
 
         with patch.dict(sys.modules, {"core.config": cfg_mock}):
-            # Force re-import of real database with our tmp config
+            # Принудительно переимпортируем реальный database с нашей tmp-конфигурацией
             sys.modules.pop("core.database", None)
             import core.database as db
             result = db._load_settings_fail_closed()
@@ -81,7 +81,7 @@ class TestSettingsFailClosed:
     def test_missing_file_enables_trading(self, tmp_path):
         """Missing settings.json (first run) → trading_enabled=True (normal default)."""
         cfg_mock = _make_config_mock(tmp_path)
-        # Don't create the file — it should be absent.
+        # Не создаём файл — он должен отсутствовать.
 
         with patch.dict(sys.modules, {"core.config": cfg_mock}):
             sys.modules.pop("core.database", None)
@@ -174,7 +174,7 @@ class TestMarketPending:
         with patch.dict(sys.modules, {"core.config": cfg_mock}):
             sys.modules.pop("core.database", None)
             import core.database as db
-            # Clear any leftover pending state
+            # Очищаем остатки пендинга из прошлого запуска
             db._MARKET_PENDING.clear()
             return db
 

@@ -1,8 +1,8 @@
 """
-Unit tests for handlers/ui.py number-formatting helpers and signal cards.
+Юнит-тесты вспомогательных функций форматирования чисел и карточек сигналов в handlers/ui.py.
 
-handlers/ui.py has zero module-level imports — no mocking required.
-All tests are synchronous and run at sub-millisecond speed.
+handlers/ui.py не имеет импортов на уровне модуля — мокирование не требуется.
+Все тесты синхронные и выполняются за доли миллисекунды.
 """
 import sys
 import os
@@ -44,7 +44,7 @@ class TestFmtPrice:
         assert _fmt_price(100.0) == "100"
 
     def test_six_sig_decimals_trimmed(self):
-        # 0.074750 → 6-decimal repr is "0.074750" → trimmed "0.07475"
+        # 0.074750 → 6-знаковое представление "0.074750" → обрезанное "0.07475"
         assert _fmt_price(0.074750) == "0.07475"
 
     def test_none_returns_dash(self):
@@ -147,7 +147,7 @@ class TestFormatLimitSignal:
         assert "🔴" in self._make(side="SHORT")
 
     def test_trimmed_entry_price(self):
-        # 29.95 → "29.95" (not "29.950000")
+        # 29.95 → "29.95" (не "29.950000")
         msg = self._make(entry_price=29.95)
         assert "29.95" in msg
         assert "29.950000" not in msg
@@ -196,7 +196,7 @@ class TestFormatMarketSignal:
         assert "MARKET" in self._make()
 
     def test_approx_symbol_is_unicode(self):
-        # Entry line must use ≈, not ~
+        # В строке Entry должен использоваться символ ≈, а не ~
         msg = self._make()
         assert "≈" in msg
         entry_line = next(l for l in msg.splitlines() if "Entry:" in l)

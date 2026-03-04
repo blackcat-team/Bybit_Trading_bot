@@ -1,22 +1,22 @@
 """
-Smoke tests for config paths and database read/write to data/.
+Smoke-тесты для путей конфига и операций чтения/записи базы данных в data/.
 """
 import sys
 import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# Mock heavy deps
+# Мокируем тяжёлые зависимости
 for mod in ["pybit", "pybit.unified_trading", "telegram", "telegram.ext", "telegram.request"]:
     sys.modules.setdefault(mod, MagicMock())
 
-# dotenv and colorama must be real-ish for config to load
+# dotenv и colorama должны быть «настоящими» для загрузки конфига
 _dotenv_mock = MagicMock()
 _dotenv_mock.load_dotenv = lambda: None
 sys.modules.setdefault("dotenv", _dotenv_mock)
 sys.modules.setdefault("colorama", MagicMock())
 
-# Set required env vars so config.py doesn't sys.exit
+# Задаём обязательные переменные окружения, чтобы config.py не вызывал sys.exit
 os.environ.setdefault("TELEGRAM_TOKEN", "test_token")
 os.environ.setdefault("BYBIT_API_KEY", "test_key")
 os.environ.setdefault("BYBIT_API_SECRET", "test_secret")
@@ -24,7 +24,7 @@ os.environ.setdefault("ALLOWED_TELEGRAM_ID", "0")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Clear any mock config installed by other test files so we get the real one
+# Удаляем мок-конфиг, установленный другими тест-файлами, чтобы получить настоящий
 sys.modules.pop("core.config", None)
 from core import config
 

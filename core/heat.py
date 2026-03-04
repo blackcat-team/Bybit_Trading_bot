@@ -48,7 +48,7 @@ def heat_for_position(pos: dict, risk_mapping: dict) -> float:
         if sl > 0:
             entry = float(pos.get("avgPrice", 0))
             return abs(entry - sl) * size
-        # Fallback: сохранённый риск
+        # Резерв: сохранённый риск из risk_mapping
         stored = risk_mapping.get(sym, 0.0)
         return float(stored) if stored else 0.0
     except (TypeError, ValueError):
@@ -71,7 +71,7 @@ def compute_heat_from_data(positions: list, market_pending: dict, risk_mapping: 
         sym = pos.get("symbol", "")
         seen_syms.add(sym)
         total += heat_for_position(pos, risk_mapping)
-    # Добавляем ожидающие маркет-входы, по которым ещё нет открытой позиции
+    # Добавляем ожидающие маркет-входы по символам без открытой позиции
     for sym, (risk_usd, _) in market_pending.items():
         if sym not in seen_syms:
             total += float(risk_usd)

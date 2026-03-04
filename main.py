@@ -123,7 +123,7 @@ if __name__ == '__main__':
 
     # Строим бота с новыми настройками сети
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).request(req).build()
-    # Wire alert notifier so bybit_call can send owner alerts without a context
+    # Подключаем нотификатор алертов, чтобы bybit_call мог отправлять владельцу алерты без контекста
     configure_alerts(app.bot, ALLOWED_ID)
     # ---------------------------------------------
 

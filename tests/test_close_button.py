@@ -1,7 +1,7 @@
 """
-Unit tests for the _has_open_position helper in handlers/views_orders.py.
+Юнит-тесты вспомогательной функции _has_open_position в handlers/views_orders.py.
 
-Pure function — no Telegram, no Bybit, no network.
+Чистая функция — без Telegram, Bybit и сетевых вызовов.
 """
 
 import sys
@@ -9,7 +9,7 @@ import os
 from pathlib import Path as _Path
 from unittest.mock import MagicMock
 
-# ── Mock heavy deps before any project import ─────────────────────────────────
+# ── Мокируем тяжёлые зависимости перед любым импортом проекта ───────────────
 for _mod in [
     "telegram", "telegram.ext", "telegram.request",
     "pybit", "pybit.unified_trading",
@@ -71,7 +71,7 @@ class TestHasOpenPosition:
         assert _has_open_position(positions, "BTCUSDT") is False
 
     def test_handles_missing_size_field(self):
-        # size field absent → treated as 0
+        # поле size отсутствует → трактуется как 0
         positions = [{"symbol": "BTCUSDT"}]
         assert _has_open_position(positions, "BTCUSDT") is False
 

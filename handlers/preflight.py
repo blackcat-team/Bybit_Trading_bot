@@ -34,12 +34,12 @@ def get_available_usd(account_data: dict) -> tuple:
 
     Returns: (available_usd, source_tag)
     """
-    # 1. Primary: totalAvailableBalance
+    # 1. Основной: totalAvailableBalance
     raw = account_data.get('totalAvailableBalance', '')
     if raw and str(raw).strip() != '':
         return _safe_float(raw), "totalAvailableBalance"
 
-    # 2. Coin-level USDT
+    # 2. На уровне монеты USDT
     coins = account_data.get('coin', [])
     usdt_coin = None
     for c in coins:
@@ -64,7 +64,7 @@ def get_available_usd(account_data: dict) -> tuple:
             )
             return available, "coin_fallback"
 
-    # 3. Account-level fallback
+    # 3. Резерв на уровне аккаунта
     equity = _safe_float(account_data.get('totalEquity'))
     im = _safe_float(account_data.get('totalInitialMargin'))
     if equity > 0:
@@ -74,7 +74,7 @@ def get_available_usd(account_data: dict) -> tuple:
         )
         return available, "equity_fallback"
 
-    # 4. Fail-closed
+    # 4. Fail-closed — все источники пусты
     logging.error("❌ Cannot determine available balance — all sources empty, using 0")
     return 0.0, "fail_closed"
 
@@ -127,7 +127,7 @@ def clip_qty(
     Returns: (qty, reason, details_dict)
         reason: "OK" | "CLIPPED" | "REJECT"
     """
-    # 1. Desired qty (floor + max cap)
+    # 1. Желаемый объём (floor + ограничение по максимуму)
     raw_desired = desired_pos_usd / entry_price if entry_price > 0 else 0.0
     desired_qty, _, _ = validate_qty(raw_desired, qty_step, min_order_qty, max_order_qty)
 

@@ -14,12 +14,12 @@ from core.config import (
     USER_RISK_USD, DATA_DIR
 )
 
-# In-memory store for pending market signals: sym → (risk_usd, source_tag).
-# Written to disk only after the GO MARKET button order succeeds.
+# Хранилище ожидающих маркет-сигналов: sym → (risk_usd, source_tag).
+# Записывается на диск только после успешного исполнения ордера GO MARKET.
 _MARKET_PENDING: dict = {}
 
-# In-memory + persisted heat queue: list of trade dicts waiting for heat to drop.
-# Each item: {sym, side, entry_val, stop_val, risk_usd, source_tag, queued_at, ttl_min}
+# Очередь тепла (в памяти + на диске): список сделок, ожидающих снижения heat.
+# Каждый элемент: {sym, side, entry_val, stop_val, risk_usd, source_tag, queued_at, ttl_min}
 HEAT_QUEUE: list = []
 
 # --- 1. Глобальные переменные (Кэш в памяти) ---
@@ -226,24 +226,24 @@ def pop_market_pending(symbol: str):
 
 def add_to_heat_queue(item: dict) -> None:
     """
-    Add a trade to the heat queue and persist to disk.
-    item must include: sym, side, entry_val, stop_val, risk_usd, source_tag,
-                       queued_at (epoch seconds), ttl_min.
+    Добавляет сделку в очередь тепла и сохраняет на диск.
+    item должен содержать: sym, side, entry_val, stop_val, risk_usd, source_tag,
+                           queued_at (секунды эпохи), ttl_min.
     """
     HEAT_QUEUE.append(item)
     save_json(HEAT_QUEUE_FILE, HEAT_QUEUE)
 
 
 def get_heat_queue() -> list:
-    """Return a shallow copy of the current heat queue (all items, expired or not)."""
+    """Возвращает поверхностную копию текущей очереди тепла (все элементы, включая просроченные)."""
     return list(HEAT_QUEUE)
 
 
 def prune_heat_queue() -> list:
     """
-    Remove expired items (queued_at + ttl_min * 60 < now) from the queue.
-    Returns list of removed items.
-    Persists updated queue to disk.
+    Удаляет просроченные элементы (queued_at + ttl_min * 60 < now) из очереди.
+    Возвращает список удалённых элементов.
+    Сохраняет обновлённую очередь на диск.
     """
     global HEAT_QUEUE
     now = time.time()
@@ -262,7 +262,7 @@ def prune_heat_queue() -> list:
 
 
 def remove_from_heat_queue(sym: str) -> bool:
-    """Remove the first queue item matching sym. Returns True if removed."""
+    """Удаляет первый элемент очереди с совпадающим sym. Возвращает True при успехе."""
     global HEAT_QUEUE
     for i, item in enumerate(HEAT_QUEUE):
         if item.get("sym") == sym:

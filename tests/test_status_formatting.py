@@ -1,20 +1,21 @@
 """
-Tests for /status message builder — pure-function layer only.
+Тесты построителя сообщения /status — только чистый функциональный слой.
 
-_truncate and _build_status_msg have no I/O, no network, no Telegram.
-They can be tested without any async machinery.
+_truncate и _build_status_msg не имеют I/O, сети и Telegram.
+Их можно тестировать без асинхронной инфраструктуры.
 
-Module-pollution note: we use setdefault() for every sys.modules entry so
-this file never overwrites a real module that another test file already loaded.
+Замечание о загрязнении модулей: для каждой записи sys.modules используется
+setdefault(), чтобы этот файл никогда не перезаписывал реальный модуль,
+уже загруженный другим тест-файлом.
 """
 import sys
 import os
 from pathlib import Path as _Path
 from unittest.mock import MagicMock
 
-# ── Mock heavy deps before any project import ────────────────────────────────
-# Use setdefault: if the real module is already in sys.modules (loaded by a
-# test file collected earlier), leave it intact.
+# ── Мокируем тяжёлые зависимости перед любым импортом проекта ───────────────
+# Используем setdefault: если реальный модуль уже загружен другим тест-файлом,
+# не перезаписываем его.
 for _mod in [
     "telegram", "telegram.ext", "telegram.request",
     "pybit", "pybit.unified_trading",
@@ -22,7 +23,7 @@ for _mod in [
 ]:
     sys.modules.setdefault(_mod, MagicMock())
 
-# core.config — only inject our stub if nothing is there yet
+# core.config — подставляем заглушку только если ничего ещё не загружено
 if "core.config" not in sys.modules:
     _cfg = MagicMock()
     _cfg.ALLOWED_ID = "123"
@@ -33,17 +34,17 @@ if "core.config" not in sys.modules:
     _cfg.MARGIN_BUFFER_PCT = 0.03
     sys.modules["core.config"] = _cfg
 
-# core.database / core.bybit_call — only needed for import-time resolution
-# of handlers.commands; setdefault so we don't break tests that use the real ones.
+# core.database / core.bybit_call — нужны только для разрешения импортов
+# handlers.commands; используем setdefault, чтобы не сломать тесты с реальными модулями.
 sys.modules.setdefault("core.database", MagicMock())
 sys.modules.setdefault("core.bybit_call", MagicMock())
-# core.trading_core may be needed transitively
+# core.trading_core может потребоваться транзитивно
 sys.modules.setdefault("core.trading_core", MagicMock())
 
-# NOTE: do NOT mock core.notifier / core.heat / core.journal here —
-# those modules are NOT imported at the module level of handlers.commands,
-# only inside function bodies, so they are irrelevant for testing
-# _truncate / _build_status_msg and mocking them would break test_c5 / test_c6.
+# ВАЖНО: не мокировать core.notifier / core.heat / core.journal здесь —
+# эти модули НЕ импортируются на уровне модуля handlers.commands,
+# только внутри тел функций, поэтому они не нужны для тестирования
+# _truncate / _build_status_msg; их мокирование сломает test_c5 / test_c6.
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

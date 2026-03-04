@@ -16,7 +16,7 @@ import logging
 import os
 import time
 
-_SLOW_CALL_THRESHOLD = 0.5  # seconds
+_SLOW_CALL_THRESHOLD = 0.5  # секунды
 # Предупреждения о медленных вызовах включаются опционально: BYBIT_SLOW_CALL_WARN=1.
 # По умолчанию логируем на уровне DEBUG, чтобы не засорять продакшн-логи.
 _SLOW_CALL_WARN = os.getenv("BYBIT_SLOW_CALL_WARN", "").lower() in ("1", "true")
@@ -41,7 +41,7 @@ async def bybit_call(fn, *args, **kwargs):
             from core.notifier import alert_bybit_error
             await alert_bybit_error(exc, name)
         except Exception:
-            pass  # алертинг не должен глушить реальное исключение
+            pass  # ошибка алертинга не должна подавлять реальное исключение
         raise
 
     elapsed = time.monotonic() - t0

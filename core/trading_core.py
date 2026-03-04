@@ -88,7 +88,7 @@ def check_daily_limit():
         ts_start = int(start_of_day.timestamp() * 1000)
 
         # Запрашиваем закрытые сделки
-        # (limit=100 обычно хватает, если сделок тысячи - нужна пагинация, но для защиты депозита ок)
+        # (limit=100 обычно хватает; при тысячах сделок нужна пагинация, но для защиты депозита достаточно)
         closed_resp = session.get_closed_pnl(category="linear", startTime=ts_start, limit=100)
 
         # Суммируем всё, что наторговали и закрыли сегодня
@@ -104,7 +104,7 @@ def check_daily_limit():
         # 3. Итоговая "Живая" просадка
         total_daily_pnl = realized_pnl + unrealized_pnl
 
-        # Для отладки можно раскомментировать:
+        # Для отладки при необходимости раскомментировать:
         # logging.info(f"Daily Check: Realized={realized_pnl:.2f} + Floating={unrealized_pnl:.2f} = {total_daily_pnl:.2f}")
 
         if total_daily_pnl <= DAILY_LOSS_LIMIT:
@@ -210,7 +210,7 @@ async def place_tp_ladder(symbol):
                 legs_note = " (degraded: qty too small for 3 legs → placed 2)"
                 logs.append("⚠️ Позиция слишком маленькая для 3 TP: поставлено 2 ордера.")
             else:
-                # 1-leg: full position at TP1
+                # 1 уровень: вся позиция на TP1
                 await send_limit(total_qty, targets['tp1'], "TP1 (1R)")
                 legs_note = " (degraded: qty too small to split → placed 1)"
                 logs.append("⚠️ Позиция слишком маленькая для сплита: поставлен 1 TP-ордер.")

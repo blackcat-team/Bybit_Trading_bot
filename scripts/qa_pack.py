@@ -19,12 +19,12 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 
-# ---- Config (adjust once, reuse forever) ----
+# ---- Конфигурация (задаётся один раз, используется везде) ----
 
 DEFAULT_PYTEST_ARGS = "tests/ -q"
 DEFAULT_COMPILE_TARGETS = ["core/", "handlers/", "app/", "main.py"]
 
-# Grep gates (best-effort; SKIP if rg missing)
+# Grep-проверки (best-effort; ПРОПУСКАЮТСЯ если rg отсутствует)
 RG_GATES = [
     ("rg_session_jobs_startup", [r"session\.\w+\(", "app/jobs.py", "handlers/startup.py"]),
     ("rg_session_trading_core", [r"session\.\w+\(", "core/trading_core.py"]),
@@ -145,9 +145,9 @@ def zip_dir(src_dir: Path, zip_path: Path) -> None:
 
 def safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
     """
-    Safe extract for tar archives:
-    - blocks path traversal
-    - blocks symlinks/hardlinks
+    Безопасная распаковка tar-архивов:
+    - блокирует обход пути (path traversal)
+    - блокирует символические/жёсткие ссылки
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     base = dest_dir.resolve()
@@ -237,7 +237,7 @@ def which_rg() -> Optional[str]:
 
 
 def _scan_file(compiled: re.Pattern, path: Path, cwd: Path) -> List[str]:
-    """Scan a single file for regex matches; return lines in 'rel/path:lineno:text' format."""
+    """Сканирует один файл на совпадения с регулярным выражением; возвращает строки в формате 'rel/path:lineno:text'."""
     results: List[str] = []
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -251,10 +251,10 @@ def _scan_file(compiled: re.Pattern, path: Path, cwd: Path) -> List[str]:
 
 
 def python_grep_gate(pattern: str, paths: List[str], cwd: Path) -> str:
-    """Pure-Python fallback for 'rg -n pattern path...' producing identical output format.
+    """Чистый Python-fallback для 'rg -n pattern path...' с идентичным форматом вывода.
 
-    Paths ending with '/' (or that are directories) are walked recursively for *.py files.
-    Single .py file paths are scanned directly.
+    Пути, оканчивающиеся на '/' (или являющиеся директориями), обходятся рекурсивно для *.py файлов.
+    Одиночные .py файлы сканируются напрямую.
     """
     compiled = re.compile(pattern)
     lines: List[str] = []
@@ -272,7 +272,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Build QA pack zip (src+evidence) for an exact git commit.")
     ap.add_argument("--stage", required=True, help="Stage name (e.g. p10_asyncwrap)")
     ap.add_argument("--commit", default="HEAD", help="Git ref to pack (default: HEAD)")
-    ap.add_argument("--base", default="", help="Optional base ref for range diff evidence (e.g. v0.7.0). If empty, uses first parent.")
+    ap.add_argument("--base", default="", help="Optional base ref for range diff evidence (e.g. tag_xxx). If empty, uses first parent.")
     ap.add_argument("--out", default="", help="Output directory (default: <repo_parent>/qa_packs)")
     ap.add_argument("--allow-dirty", action="store_true", help="Allow dirty worktree (NOT recommended for release QA)")
     ap.add_argument("--skip-tests", action="store_true", help="Do not run pytest")
@@ -326,18 +326,18 @@ def main() -> None:
         evi_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
 
-        # Evidence (commit-consistent)
+        # Доказательства (привязаны к коммиту)
         write_text(evi_dir / f"{prefix}_head.txt", info.commit + "\n")
         write_text(evi_dir / f"{prefix}_describe.txt", info.describe + "\n")
         write_text(evi_dir / f"{prefix}_last_commit.txt", info.last_commit_oneline + "\n")
         write_text(evi_dir / f"{prefix}_status.txt", raw_status or "\n")
 
-        # Touched + patch/stat for the commit (single-commit view)
+        # Изменённые файлы + patch/stat для коммита (вид одного коммита)
         write_text(evi_dir / f"{prefix}_touched_files.txt", git(["show", "--name-only", "--pretty=", info.commit], repo=repo) + "\n")
         write_text(evi_dir / f"{prefix}_head_stat.txt", git(["show", "--stat", info.commit], repo=repo) + "\n")
         write_text(evi_dir / f"{prefix}_head_patch.diff", git(["show", info.commit], repo=repo) + "\n")
 
-        # Range evidence (base..head) if base known
+        # Range-доказательства (base..head), если base известен
         if base_ref:
             try:
                 write_text(evi_dir / f"{prefix}_range_base.txt", base_ref + "\n")
@@ -350,7 +350,7 @@ def main() -> None:
             write_text(evi_dir / f"{prefix}_diff.patch", "# no base ref; range diff unavailable\n")
             write_text(evi_dir / f"{prefix}_diff_stat.txt", "# no base ref; range diff stat unavailable\n")
 
-        # src snapshot from exact commit
+        # Снимок исходников точного коммита
         tar_path = evi_dir / f"{prefix}_src.tar"
         try:
             run(["git", "archive", "--format=tar", "-o", str(tar_path), info.commit], cwd=repo, capture=True, check=True)
@@ -358,12 +358,12 @@ def main() -> None:
             raise SystemExit(f"git archive failed:\n{e.stdout}") from e
         safe_extract_tar(tar_path, src_dir)
 
-        # Tests + gates: run in a detached worktree at EXACT commit
+        # Тесты + gates: запуск в detached worktree на ТОЧНОМ коммите
         worktree_dir = build_root / f"{prefix}_worktree"
         if not args.skip_tests or not args.skip_compile or not args.skip_grep:
             create_worktree(repo, info.commit, worktree_dir)
             try:
-                # pytest (PowerShell friendly): python -m pytest ...
+                # pytest (совместимо с PowerShell): python -m pytest ...
                 if not args.skip_tests:
                     pytest_args = shlex.split(args.pytest_args)
                     rc = run_capture_to_file([sys.executable, "-m", "pytest", *pytest_args], worktree_dir, logs_dir / f"{prefix}_pytest_full.txt")
@@ -375,7 +375,7 @@ def main() -> None:
                             rc2 = run_capture_to_file([sys.executable, "-m", "pytest", str(st), "-q"], worktree_dir, logs_dir / f"{prefix}_pytest_{stage_safe}.txt")
                             write_text(logs_dir / f"{prefix}_pytest_{stage_safe}_rc.txt", f"{rc2}\n")
 
-                # compileall
+                # compileall (проверка синтаксиса)
                 if not args.skip_compile:
                     rc = run_capture_to_file(
                         [sys.executable, "-m", "compileall", *DEFAULT_COMPILE_TARGETS, "-q"],
@@ -384,7 +384,7 @@ def main() -> None:
                     )
                     write_text(logs_dir / f"{prefix}_compileall_rc.txt", f"{rc}\n")
 
-                # grep gates: always produce outputs (Python fallback when rg is missing)
+                # grep gates: всегда записываем вывод (Python fallback при отсутствии rg)
                 if not args.skip_grep:
                     rg_path = which_rg()
                     write_text(logs_dir / f"{prefix}_rg_present.txt", (rg_path or "NOT_FOUND") + "\n")
@@ -410,7 +410,7 @@ def main() -> None:
                 else:
                     remove_worktree(repo, worktree_dir)
 
-        # Build zip from pack_dir
+        # Упаковываем zip из pack_dir
         zip_dir(pack_dir, zip_path)
         sha = sha256_file(zip_path)
         write_text(sha_path, f"{sha}  {zip_path.name}\n")

@@ -1,6 +1,6 @@
 """
-Unit tests for bybit_call async helper.
-No network calls — mock functions only.
+Юнит-тесты для async-хелпера bybit_call.
+Без сетевых вызовов — только замокированные функции.
 """
 import sys
 import os
@@ -9,7 +9,7 @@ import logging
 from pathlib import Path as _Path
 from unittest.mock import MagicMock
 
-# --- Mock heavy deps before importing handlers ---
+# --- Мокируем тяжёлые зависимости перед импортом handlers ---
 _MOCKED_MODULES = [
     "telegram", "telegram.ext", "telegram.request",
     "pybit", "pybit.unified_trading",

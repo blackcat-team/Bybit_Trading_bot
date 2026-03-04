@@ -1,14 +1,14 @@
 """
-HTML-safety tests for handlers/ui.py card renderers.
+Тесты HTML-безопасности рендереров карточек в handlers/ui.py.
 
-Verifies for each renderer:
-  1. Balanced HTML tags (<b>…</b>, <i>…</i>, <code>…</code>)
-  2. Special chars in dynamic fields are escaped (&lt; &gt; &amp;)
-  3. Smoke: expected labels/separators present
-  4. No raw tilde (~) in any output
+Проверяется для каждого рендерера:
+  1. Сбалансированные HTML-теги (<b>…</b>, <i>…</i>, <code>…</code>)
+  2. Спецсимволы в динамических полях экранируются (&lt; &gt; &amp;)
+  3. Smoke: ожидаемые метки и разделители присутствуют
+  4. Отсутствие сырой тильды (~) в любом выводе
 
-handlers/ui.py has zero module-level project imports — no mocking required.
-All tests are synchronous and run at sub-millisecond speed.
+handlers/ui.py не имеет импортов на уровне модуля — мокирование не требуется.
+Все тесты синхронные и выполняются за доли миллисекунды.
 """
 
 import sys
@@ -25,7 +25,7 @@ from handlers.ui import (  # noqa: E402
     format_orders_menu_html,
 )
 
-# A value that triggers all three HTML escapes
+# Значение, которое задействует все три вида HTML-экранирования
 _EVIL = 'X<script>&amp;>'
 
 

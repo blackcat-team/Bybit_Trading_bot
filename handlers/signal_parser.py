@@ -27,7 +27,7 @@ from handlers.ui import format_market_signal, format_limit_signal
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Вспомогательные функции
 # ---------------------------------------------------------------------------
 
 def _market_callback(sym: str, side: str, stop_val, qty, lev,
@@ -46,7 +46,7 @@ def _market_callback(sym: str, side: str, stop_val, qty, lev,
 
 
 # ---------------------------------------------------------------------------
-# Pure parsing
+# Чистый парсинг
 # ---------------------------------------------------------------------------
 
 def parse_signal(txt: str) -> dict | None:
@@ -59,7 +59,7 @@ def parse_signal(txt: str) -> dict | None:
         is_market (bool), source_tag (str)
     Или None, если текст не распознан как сигнал.
     """
-    # Normalise spaced decimals so "0. 0745" → "0.0745" before any regex parsing.
+    # Нормализуем пробелы в десятичных числах: "0. 0745" → "0.0745" перед разбором регулярками.
     txt = re.sub(r'(?<=\d)\.\s+(?=\d)', '.', txt)
 
     coin = None
@@ -92,7 +92,7 @@ def parse_signal(txt: str) -> dict | None:
     if not (coin and stop_val is not None):
         return None
 
-    # --- is_market ---
+    # --- Рыночный вход ---
     is_market = False
     if entry_val is not None and entry_val == 0:
         is_market = True
@@ -100,14 +100,14 @@ def parse_signal(txt: str) -> dict | None:
         if re.search(r'(?i)\b(MARKET|CMP|РЫНОК)\b', txt):
             is_market = True
 
-    # --- Explicit side ---
+    # --- Явное направление ---
     dir_match = re.search(r'(?i)\b(LONG|SHORT|BUY|SELL)\b', txt)
     explicit_side = None
     if dir_match:
         raw_dir = dir_match.group(1).upper()
         explicit_side = "LONG" if raw_dir in ["LONG", "BUY"] else "SHORT"
 
-    # --- Source ---
+    # --- Источник ---
     source_tag = None
     if "binance killers" in txt.lower():
         source_tag = "#BinanceKillers"
@@ -134,7 +134,7 @@ def parse_signal(txt: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# TG handler
+# Обработчик Telegram
 # ---------------------------------------------------------------------------
 
 async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -236,8 +236,8 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             side = "LONG" if entry_price > stop_val else "SHORT"
 
         # ── Conflict resolver ──────────────────────────────────────────────
-        # Default (CONFLICT_POLICY_SAME_DIR=ignore): same behavior as before.
-        # Opposite direction: fail-closed + owner alert.
+        # По умолчанию (CONFLICT_POLICY_SAME_DIR=ignore): поведение как раньше.
+        # Противоположное направление: fail-closed + алерт владельцу.
         conflict_action, conflict_reason = await resolve_signal_conflict(sym, side)
         if conflict_action == "block":
             await update.message.reply_text(
@@ -257,7 +257,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ <b>ИГНОР {sym}:</b> {conflict_reason}", parse_mode='HTML'
             )
             return
-        # "allow" or "add" → continue with normal flow
+        # "allow" или "add" → продолжаем обычный поток
 
         # Расчет риска и плеча
         current_risk = get_global_risk()
@@ -349,7 +349,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if is_market:
-            # Park risk+source in memory; written to disk only after GO MARKET succeeds.
+            # Сохраняем риск+источник в памяти; на диск записываем только после успешного GO MARKET.
             set_market_pending(sym, current_risk, source_tag)
             msg = format_market_signal(
                 sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag
@@ -365,7 +365,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             kb = [[InlineKeyboardButton("🎯 SET AUTO-TPs", callback_data=f"set_tps|{sym}")]]
             await bybit_call(place_limit_order, sym, side, qty, entry_price, stop_val)
-            # Write risk+source only after successful limit order placement.
+            # Записываем риск+источник на диск только после успешного размещения лимитного ордера.
             await asyncio.to_thread(update_risk_for_symbol, sym, current_risk)
             await asyncio.to_thread(log_source, sym, source_tag)
             await asyncio.to_thread(

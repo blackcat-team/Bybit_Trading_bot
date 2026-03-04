@@ -15,6 +15,7 @@ from handlers.orders import bybit_call
 
 
 async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /pos — выводит карточки всех открытых позиций с кнопками управления."""
     if str(update.effective_user.id) != ALLOWED_ID: return
     try:
         pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")

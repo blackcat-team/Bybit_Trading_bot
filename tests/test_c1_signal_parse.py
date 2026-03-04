@@ -1,17 +1,17 @@
 """
-C1 — parse_signal() spaced-decimal normalisation tests.
+C1 — Тесты нормализации пробельных десятичных дробей в parse_signal().
 
-Verifies that "0. 0745" style spaced decimals (OCR artefacts in TG signals)
-are correctly collapsed to "0.0745" before regex parsing.
+Проверяет, что числа вида "0. 0745" (артефакты OCR в TG-сигналах)
+корректно сворачиваются до "0.0745" до применения regex-парсинга.
 
-No network calls — parse_signal() is pure regex.
+Сетевых вызовов нет — parse_signal() является чистым regex.
 """
 import sys
 import os
 from pathlib import Path as _Path
 from unittest.mock import MagicMock
 
-# ── Mock heavy deps before any project import ────────────────────────────────
+# ── Мокируем тяжёлые зависимости перед любым импортом проекта ────────────────
 for _mod in [
     "telegram", "telegram.ext", "telegram.request",
     "pybit", "pybit.unified_trading",

@@ -1,12 +1,12 @@
 """
-C3 — Reliability & ops polish tests.
+C3 — Тесты надёжности и опс-доработки.
 
-Covers:
-- validate_qty: max_order_qty=0 means unlimited (no capping)
-- close_position_market: empty/missing position list → (False, msg, 0.0)
-- auto_cleanup_orders_job: cancels stale orders, skips fresh ones
+Покрывает:
+- validate_qty: max_order_qty=0 означает без верхней границы
+- close_position_market: пустой/отсутствующий список позиций → (False, msg, 0.0)
+- auto_cleanup_orders_job: отменяет устаревшие ордера, пропускает свежие
 
-No network calls — all Bybit/Telegram I/O is mocked.
+Без сетевых вызовов — весь I/O Bybit/Telegram замокирован.
 """
 import sys
 import os
@@ -224,7 +224,7 @@ class TestAutoCleanupOrdersJob:
             "symbol": "SOLUSDT",
             "orderId": "tp-789",
             "price": "200",
-            "reduceOnly": True,  # This is a TP/SL order
+            "reduceOnly": True,  # Это TP/SL ордер
             "createdTime": str(old_ms),
         }
 

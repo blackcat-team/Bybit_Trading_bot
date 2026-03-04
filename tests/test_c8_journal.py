@@ -1,13 +1,13 @@
 """
-C8 — Trade journal + source stats + auto-quarantine tests.
+C8 — Тесты торгового журнала + статистики источников + авто-карантина.
 
-Tests:
-- append_event / read_events: roundtrip, filter by type/symbol/time
-- compute_source_stats: totals, winrate, avg_R, max_dd, loss_streak, last20
-- check_and_quarantine_sources: streak trigger, disabled-when-0, threshold
-- is_source_enabled / quarantine_source / enable_source state machine
+Тесты:
+- append_event / read_events: roundtrip, фильтрация по type/symbol/time
+- compute_source_stats: итоги, winrate, avg_R, max_dd, loss_streak, last20
+- check_and_quarantine_sources: триггер по серии, отключение при 0, порог
+- is_source_enabled / quarantine_source / enable_source — машина состояний
 
-All tests use tmp_path for isolation; no network calls.
+Все тесты используют tmp_path для изоляции; сетевых вызовов нет.
 """
 
 import sys
@@ -145,21 +145,21 @@ class TestComputeSourceStats:
 
     def test_loss_streak_from_most_recent(self, tmp_path):
         j = _fresh_journal(tmp_path)
-        # Win, Loss, Loss, Loss (most recent = last 3 are losses → streak=3)
+        # Win, Loss, Loss, Loss (последние 3 — Loss → streak=3)
         self._make_events(j, [("#C", 10.0, 1.0), ("#C", -5.0, -0.5), ("#C", -5.0, -0.5), ("#C", -5.0, -0.5)])
         stats = j.compute_source_stats()
         assert stats["#C"]["loss_streak"] == 3
 
     def test_loss_streak_reset_by_win(self, tmp_path):
         j = _fresh_journal(tmp_path)
-        # Loss, Loss, Win, Loss → streak=1 (last is loss, but preceded by win)
+        # Loss, Loss, Win, Loss → streak=1 (последняя — Loss, но ей предшествует Win)
         self._make_events(j, [("#D", -5.0, -0.5), ("#D", -5.0, -0.5), ("#D", 10.0, 1.0), ("#D", -5.0, -0.5)])
         stats = j.compute_source_stats()
         assert stats["#D"]["loss_streak"] == 1
 
     def test_max_drawdown(self, tmp_path):
         j = _fresh_journal(tmp_path)
-        # PnL: +10, +10, -30, +5 → peak at +20, trough at +20-30=-10 → DD=30
+        # PnL: +10, +10, -30, +5 → пик +20, дно +20-30=-10 → DD=30
         self._make_events(j, [
             ("#E", 10.0, 1.0), ("#E", 10.0, 1.0),
             ("#E", -30.0, -3.0), ("#E", 5.0, 0.5)

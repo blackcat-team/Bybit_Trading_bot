@@ -1,14 +1,14 @@
 """
-C9 — Market trade preview + confirm tests.
+C9 — Тесты превью маркет-сделки и подтверждения.
 
-Tests:
-- format_market_preview: all fields present, heat disabled case, stop_pct calc
-- _market_callback (signal_parser helper): require_confirm=0 → buy_market|,
+Тесты:
+- format_market_preview: все поля присутствуют, heat отключён, расчёт stop_pct
+- _market_callback (хелпер signal_parser): require_confirm=0 → buy_market|,
   require_confirm=1 → mkt_preview|
-- _preview_is_fresh (buttons helper): fresh → True, expired → False
-- mkt_cancel clears _PREVIEW_TS entry
+- _preview_is_fresh (хелпер buttons): свежий → True, устаревший → False
+- mkt_cancel очищает запись _PREVIEW_TS
 
-All tests are pure/unit — no network calls, no Telegram SDK needed.
+Все тесты — чистые/юнит, без сетевых вызовов и Telegram SDK.
 """
 
 import sys

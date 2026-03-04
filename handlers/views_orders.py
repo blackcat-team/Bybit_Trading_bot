@@ -76,7 +76,7 @@ def _has_open_position(positions: list, symbol: str) -> bool:
 
 
 async def view_symbol_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str):
-    """(НОВОЕ) Показывает ВСЕ ордера конкретной монеты (Тейки, Стопы, Лимитки)."""
+    """Показывает ВСЕ ордера конкретной монеты (тейки, стопы, лимитки)."""
     if str(update.effective_user.id) != ALLOWED_ID: return
     msg_obj = update.message if update.message else update.callback_query.message
 
@@ -88,7 +88,7 @@ async def view_symbol_orders(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await check_positions(update, context)
             return
 
-        # Fail-closed: hide Close Market button if position check fails or size=0.
+        # Fail-closed: скрываем кнопку «Закрыть по рынку», если проверка позиции не удалась или size=0.
         has_position = False
         try:
             pos_resp = await bybit_call(session.get_positions, category="linear", symbol=symbol)

@@ -108,10 +108,10 @@ def _build_status_msg(
     alert_msg: str,
 ) -> str:
     """
-    Build the HTML /status message from pre-collected data.
+    Формирует HTML-сообщение команды /status из заранее собранных данных.
 
-    Pure function — no I/O, no awaits.
-    ALL dynamic strings are passed through html.escape() before embedding.
+    Чистая функция — без I/O и await.
+    Все динамические строки экранируются через html.escape() перед встраиванием.
     """
     status_icon = "✅ ON" if trading_on else "🛑 OFF"
 
@@ -176,10 +176,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ALLOWED_ID:
         return
 
-    # ── 1. Trading enabled ────────────────────────────────────────────────
+    # ── 1. Торговля включена ──────────────────────────────────────────────
     trading_on = is_trading_enabled()
 
-    # ── 2. Daily PnL + open positions (Bybit, graceful) ──────────────────
+    # ── 2. Дневной PnL + открытые позиции (Bybit, graceful) ──────────────
     daily_pnl = None
     pos_count = None
     entry_orders_count = None
@@ -204,13 +204,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # ── 3. Pending market entries (in-memory) ────────────────────────────
+    # ── 3. Ожидающие маркет-входы (в памяти) ────────────────────────────
     mkt_pending = len(_MARKET_PENDING)
 
-    # ── 4. Risk ───────────────────────────────────────────────────────────
+    # ── 4. Риск ───────────────────────────────────────────────────────────
     current_risk = get_global_risk()
 
-    # ── 5. Sources (seen + quarantined) ──────────────────────────────────
+    # ── 5. Источники (активные + в карантине) ────────────────────────────
     sources_seen = len(SOURCES_DB)
     quarantined: list = []
     try:
@@ -219,7 +219,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # ── 6. Last alert ─────────────────────────────────────────────────────
+    # ── 6. Последний алерт ────────────────────────────────────────────────
     from core.notifier import get_last_alert
     last = get_last_alert()
     alert_ts = last["ts"] if last else None
@@ -227,7 +227,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     alert_class = last.get("class", "") if last else ""
     alert_msg_raw = last.get("msg", "") if last else ""
 
-    # ── 7. Heat ───────────────────────────────────────────────────────────
+    # ── 7. Тепло (heat) ───────────────────────────────────────────────────
     from core.config import MAX_TOTAL_HEAT_USDT
     heat_usd = None
     if MAX_TOTAL_HEAT_USDT > 0:
