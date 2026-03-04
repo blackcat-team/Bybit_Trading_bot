@@ -1,3 +1,9 @@
+"""
+Точка входа бота: сборка PTB-приложения и запуск планировщика.
+
+Регистрирует обработчики команд, кнопок и сообщений, подключает фоновые
+задачи APScheduler и запускает polling-цикл Telegram.
+"""
 import logging
 import sys
 import warnings
@@ -138,7 +144,7 @@ if __name__ == '__main__':
         logging.error("Unhandled PTB exception: %s", context.error, exc_info=context.error)
     app.add_error_handler(_ptb_error_handler)
 
-    print(f"{Fore.GREEN}{Style.BRIGHT}🤖 Bot Modular v2.0 Running...{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}{Style.BRIGHT}🤖 Бот запущен.{Style.RESET_ALL}")
 
     # --- ЗАПУСК ФОНОВЫХ ЗАДАЧ (AUTOPILOT) ---
     jq = app.job_queue

@@ -18,6 +18,13 @@ from handlers.orders import bybit_call
 
 
 async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Команда /report [мм.гггг] — отчёт о закрытых сделках за месяц.
+
+    Без аргументов: показывает текстовый список последних 15 сделок.
+    С аргументом даты (например, /report 01.2026): отправляет CSV-файл с полной
+    выборкой. Данные получаются чанками по 6 дней для обхода лимитов API.
+    """
     if str(update.effective_user.id) != ALLOWED_ID: return
 
     now = datetime.now()

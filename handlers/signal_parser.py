@@ -32,11 +32,11 @@ from handlers.ui import format_market_signal, format_limit_signal
 
 def _market_callback(sym: str, side: str, stop_val, qty, lev,
                      require_confirm: int) -> tuple:
-    """Return (button_label, callback_data) for the market-entry inline button.
+    """Возвращает (label, callback_data) для кнопки входа по рынку.
 
-    Pure function — testable without mocking config.
-    When require_confirm=1: first tap shows a preview; confirm tap executes.
-    When require_confirm=0: tap immediately executes (backward-compatible).
+    Чистая функция — тестируется без мока конфига.
+    require_confirm=1: первый тап показывает preview; confirm-тап исполняет.
+    require_confirm=0: тап немедленно исполняет (режим совместимости).
     """
     if require_confirm:
         return ("👁 PREVIEW TRADE",

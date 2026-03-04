@@ -22,18 +22,21 @@ from core.bybit_call import bybit_call
 
 
 async def start_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start — включает приём сигналов."""
     if str(update.effective_user.id) != ALLOWED_ID: return
     await asyncio.to_thread(set_trading_enabled, True)
     await update.message.reply_text("✅ <b>STARTED</b>. Бот принимает сигналы.", parse_mode='HTML')
 
 
 async def stop_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /stop — приостанавливает приём сигналов."""
     if str(update.effective_user.id) != ALLOWED_ID: return
     await asyncio.to_thread(set_trading_enabled, False)
     await update.message.reply_text("🛑 <b>STOPPED</b>. Бот игнорирует сигналы.", parse_mode='HTML')
 
 
 async def set_risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /risk [сумма] — показывает или изменяет глобальный риск на сделку."""
     if str(update.effective_user.id) != ALLOWED_ID: return
 
     msg = update.message if update.message else update.callback_query.message
@@ -63,6 +66,7 @@ async def set_risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /note SYMBOL текст — сохраняет заметку к монете в торговом журнале."""
     if str(update.effective_user.id) != ALLOWED_ID: return
     try:
         if len(context.args) < 2:
@@ -80,7 +84,7 @@ async def add_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /status helpers ───────────────────────────────────────────────────────────
 
 def _truncate(text: str, n: int = 400) -> str:
-    """Truncate *text* to *n* chars, appending '…' if trimmed."""
+    """Обрезает *text* до *n* символов, добавляя '…' при усечении."""
     if len(text) <= n:
         return text
     return text[:n] + "…"

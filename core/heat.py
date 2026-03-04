@@ -1,19 +1,20 @@
 """
-Account Risk Budget / Heat enforcement.
+Контроль совокупного риска портфеля (heat enforcement).
 
-heat = sum of risk-at-stop in USDT across all tracked open + pending trades.
+heat = сумма риска-под-стопом в USDT по всем отслеживаемым открытым и
+ожидающим сделкам.
 
-For each open position:
-  - If stopLoss is set: abs(avgPrice - stopLoss) * size
-  - Else: fall back to stored risk_usd from RISK_MAPPING (approximation)
-For pending market entries (_MARKET_PENDING): add stored risk_usd.
+Для каждой открытой позиции:
+  - Если stopLoss задан: abs(avgPrice - stopLoss) * size
+  - Иначе: сохранённый risk_usd из RISK_MAPPING (приближение)
+Для ожидающих маркет-входов (_MARKET_PENDING): добавляется сохранённый risk_usd.
 
-Config env vars (all default to disabled / 0):
-    MAX_TOTAL_HEAT_USDT  — 0 = feature disabled; >0 = limit in USDT
-    HEAT_ACTION          — "reject" (default) | "queue"
-    HEAT_QUEUE_TTL_MIN   — 30 (minutes)
+Переменные окружения (по умолчанию отключены / 0):
+    MAX_TOTAL_HEAT_USDT  — 0 = функция отключена; >0 = лимит в USDT
+    HEAT_ACTION          — "reject" (по умолчанию) | "queue"
+    HEAT_QUEUE_TTL_MIN   — 30 (минут)
 
-All config values read from core.config at import time.
+Все значения конфигурации читаются из core.config при импорте.
 """
 
 import logging
@@ -24,18 +25,18 @@ from core.database import add_to_heat_queue
 
 
 # ---------------------------------------------------------------------------
-# Heat calculation helpers (pure / near-pure)
+# Вспомогательные функции расчёта тепла (чистые / почти чистые)
 # ---------------------------------------------------------------------------
 
 def heat_for_position(pos: dict, risk_mapping: dict) -> float:
     """
-    Compute heat contribution of a single position dict (from get_positions API).
+    Рассчитывает вклад одной позиции (из API get_positions) в совокупный heat.
 
-    Priority:
-    1. abs(avgPrice - stopLoss) * size  — if stopLoss is non-zero
-    2. Stored risk_usd from risk_mapping — fallback when SL not set
+    Приоритет:
+    1. abs(avgPrice - stopLoss) * size  — если stopLoss ненулевой
+    2. Сохранённый risk_usd из risk_mapping — fallback при отсутствии SL
 
-    Returns heat in USDT (≥ 0).
+    Возвращает heat в USDT (≥ 0).
     """
     sym = pos.get("symbol", "")
     try:
@@ -47,7 +48,7 @@ def heat_for_position(pos: dict, risk_mapping: dict) -> float:
         if sl > 0:
             entry = float(pos.get("avgPrice", 0))
             return abs(entry - sl) * size
-        # Fallback: stored risk
+        # Fallback: сохранённый риск
         stored = risk_mapping.get(sym, 0.0)
         return float(stored) if stored else 0.0
     except (TypeError, ValueError):
@@ -56,13 +57,13 @@ def heat_for_position(pos: dict, risk_mapping: dict) -> float:
 
 def compute_heat_from_data(positions: list, market_pending: dict, risk_mapping: dict) -> float:
     """
-    Pure function: compute total heat from already-fetched data.
+    Чистая функция: рассчитывает суммарный heat из уже полученных данных.
 
-    positions     — list of position dicts from get_positions API (size > 0 only)
-    market_pending — dict sym→(risk_usd, source_tag) from _MARKET_PENDING
-    risk_mapping  — RISK_MAPPING dict (sym→risk_usd)
+    positions      — список dict позиций из get_positions API (только size > 0)
+    market_pending — dict sym→(risk_usd, source_tag) из _MARKET_PENDING
+    risk_mapping   — RISK_MAPPING dict (sym→risk_usd)
 
-    Returns total heat in USDT.
+    Возвращает суммарный heat в USDT.
     """
     total = 0.0
     seen_syms = set()
@@ -70,7 +71,7 @@ def compute_heat_from_data(positions: list, market_pending: dict, risk_mapping: 
         sym = pos.get("symbol", "")
         seen_syms.add(sym)
         total += heat_for_position(pos, risk_mapping)
-    # Add pending market entries whose symbol has no open position yet
+    # Добавляем ожидающие маркет-входы, по которым ещё нет открытой позиции
     for sym, (risk_usd, _) in market_pending.items():
         if sym not in seen_syms:
             total += float(risk_usd)
@@ -78,16 +79,16 @@ def compute_heat_from_data(positions: list, market_pending: dict, risk_mapping: 
 
 
 # ---------------------------------------------------------------------------
-# Async heat computation (requires live Bybit session)
+# Асинхронный расчёт тепла (требует живой сессии Bybit)
 # ---------------------------------------------------------------------------
 
 async def compute_current_heat() -> tuple[float, str]:
     """
-    Fetch open positions from Bybit and compute total heat.
+    Получает открытые позиции с Bybit и рассчитывает суммарный heat.
 
-    Returns (heat_usd: float, source: str).
-    On API error: returns (0.0, "api_error") — fail-open for heat
-    (avoids blocking all trades when API is temporarily down).
+    Возвращает (heat_usd: float, source: str).
+    При ошибке API: возвращает (0.0, "api_error") — fail-open для heat
+    (чтобы временная недоступность API не блокировала все сделки).
     """
     if MAX_TOTAL_HEAT_USDT <= 0:
         return 0.0, "disabled"
@@ -106,20 +107,20 @@ async def compute_current_heat() -> tuple[float, str]:
         heat = compute_heat_from_data(positions, _MARKET_PENDING, RISK_MAPPING)
         return heat, "live"
     except Exception as exc:
-        logging.warning("heat: cannot compute (API error) — fail-open: %s", exc)
+        logging.warning("heat: невозможно рассчитать (ошибка API) — fail-open: %s", exc)
         return 0.0, "api_error"
 
 
 # ---------------------------------------------------------------------------
-# Heat enforcement
+# Применение ограничения тепла
 # ---------------------------------------------------------------------------
 
 def check_heat_sync(new_risk_usd: float, current_heat: float) -> tuple[bool, float, float]:
     """
-    Pure enforcement check (no I/O).
+    Чистая проверка ограничения (без I/O).
 
-    Returns (allowed: bool, current_heat: float, heat_after: float).
-    If MAX_TOTAL_HEAT_USDT == 0: always allowed.
+    Возвращает (allowed: bool, current_heat: float, heat_after: float).
+    Если MAX_TOTAL_HEAT_USDT == 0: всегда разрешено.
     """
     heat_after = current_heat + new_risk_usd
     if MAX_TOTAL_HEAT_USDT <= 0:
@@ -135,13 +136,13 @@ async def enforce_heat(
     owner_id: str,
 ) -> tuple[bool, str]:
     """
-    Full async heat enforcement (fetches live heat, checks limit, queues if needed).
+    Полная асинхронная проверка heat (получает живой heat, проверяет лимит, при необходимости ставит в очередь).
 
-    trade_info keys: sym, side, entry_val, stop_val, risk_usd, source_tag.
+    Ключи trade_info: sym, side, entry_val, stop_val, risk_usd, source_tag.
 
-    Returns (allowed: bool, reason: str).
-    allowed=True  → proceed with trade
-    allowed=False → trade was blocked or queued; caller should abort placement
+    Возвращает (allowed: bool, reason: str).
+    allowed=True  → продолжить сделку
+    allowed=False → сделка заблокирована или поставлена в очередь; вызывающий должен прервать размещение
     """
     if MAX_TOTAL_HEAT_USDT <= 0:
         return True, "heat_disabled"
@@ -152,13 +153,13 @@ async def enforce_heat(
     if allowed:
         return True, "ok"
 
-    # Heat exceeded
+    # Лимит превышен
     sym = trade_info.get("sym", "?")
     msg = (
-        f"⛔ Heat limit: {cur:.1f} + {new_risk_usd:.1f} = {heat_after:.1f}$ "
-        f"(max {MAX_TOTAL_HEAT_USDT:.1f}$)"
+        f"⛔ Лимит heat: {cur:.1f} + {new_risk_usd:.1f} = {heat_after:.1f}$ "
+        f"(макс. {MAX_TOTAL_HEAT_USDT:.1f}$)"
     )
-    logging.warning("Heat limit for %s: current=%.1f new=%.1f after=%.1f max=%.1f",
+    logging.warning("Лимит heat для %s: текущий=%.1f новый=%.1f после=%.1f макс=%.1f",
                     sym, cur, new_risk_usd, heat_after, MAX_TOTAL_HEAT_USDT)
 
     from core.notifier import send_alert, FAIL_CLOSED
@@ -176,9 +177,9 @@ async def enforce_heat(
         item.update({"queued_at": time.time(), "ttl_min": HEAT_QUEUE_TTL_MIN})
         try:
             add_to_heat_queue(item)
-            logging.info("Heat queue: %s added (TTL %dmin)", sym, HEAT_QUEUE_TTL_MIN)
+            logging.info("Heat queue: %s добавлен (TTL %dмин)", sym, HEAT_QUEUE_TTL_MIN)
         except Exception as qe:
-            logging.warning("Heat queue add failed: %s", qe)
+            logging.warning("Ошибка добавления в heat queue: %s", qe)
         return False, f"queued:{msg}"
 
     return False, f"rejected:{msg}"

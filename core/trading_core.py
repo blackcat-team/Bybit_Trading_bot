@@ -1,3 +1,10 @@
+"""
+Торговое ядро: HTTP-сессия Bybit, расчёт целей и размещение TP-лестницы.
+
+Содержит глобальный объект `session` (pybit V5), функции расчёта тейков
+(`calculate_targets`), управления дневным лимитом (`check_daily_limit`) и
+асинхронного выставления TP-ордеров (`place_tp_ladder`).
+"""
 import logging
 import math
 import time
@@ -106,7 +113,7 @@ def check_daily_limit():
         return True, total_daily_pnl
 
     except Exception as e:
-        # Fail-closed: cannot verify daily PnL, block new trades to prevent overexposure.
+        # Fail-closed: невозможно проверить дневной PnL — блокируем новые сделки.
         logging.error(f"check_daily_limit() API error — blocking trading: {e}")
         return False, 0.0
 
@@ -187,14 +194,14 @@ async def place_tp_ladder(symbol):
         # 7. Выбираем схему сплита с учётом minOrderQty
         qty_30 = round(math.floor((total_qty * 0.30) / qty_step) * qty_step, 6)
         if qty_30 >= min_order_qty:
-            # Normal 3-leg: 30% / 30% / remainder
+            # Стандартная 3-ступенчатая схема: 30% / 30% / остаток
             qty_rem = round(total_qty - qty_30 - qty_30, 6)
             await send_limit(qty_30, targets['tp1'], "TP1 (1R)")
             await send_limit(qty_30, targets['tp2'], "TP2 (2R)")
             await send_limit(qty_rem, targets['tp3'], "TP3 (3R)")
             legs_note = ""
         else:
-            # Try 2-leg: 50% / remainder
+            # Попытка 2-ступенчатой схемы: 50% / остаток
             qty_half = round(math.floor((total_qty * 0.50) / qty_step) * qty_step, 6)
             if qty_half >= min_order_qty:
                 qty_rem2 = round(total_qty - qty_half, 6)
@@ -241,6 +248,6 @@ def has_open_trade(symbol):
         return False, None
 
     except Exception as e:
-        # Fail-closed: treat API errors as "trade exists" to prevent duplicate positions.
+        # Fail-closed: ошибка API трактуется как "сделка существует" — защита от дублей.
         logging.error(f"has_open_trade({symbol}) API error — blocking to prevent duplicate: {e}")
         return True, "API error (fail-closed)"

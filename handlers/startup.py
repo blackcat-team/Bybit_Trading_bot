@@ -18,6 +18,13 @@ STARTUP_MARKER_FILE = DATA_DIR / "startup_last.txt"
 
 
 async def on_startup_check(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Запускается через 5 секунд после старта бота.
+
+    Сканирует открытые позиции на наличие проблем (отсутствие SL или TP).
+    Отправляет сводку восстановления владельцу. Кулдаун 5 минут предотвращает
+    повторные уведомления при частых перезапусках.
+    """
     now = time.time()
     if os.path.exists(STARTUP_MARKER_FILE):
         try:

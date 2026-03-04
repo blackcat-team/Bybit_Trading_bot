@@ -1,18 +1,18 @@
 """
-Trade journal (append-only JSONL) + source statistics + auto-quarantine.
+Торговый журнал (append-only JSONL) + статистика источников + автокарантин.
 
-Journal events (one JSON object per line in trade_journal.jsonl):
-  ENTRY_PLACED — signal accepted, order placed or shown as button
-  CLOSED       — position closed (detected by reconcile job)
-  FAIL         — trade attempt blocked or failed
+События журнала (один JSON-объект на строку в trade_journal.jsonl):
+  ENTRY_PLACED — сигнал принят, ордер размещён или показан как кнопка
+  CLOSED       — позиция закрыта (обнаружено задачей reconcile)
+  FAIL         — попытка сделки заблокирована или провалилась
 
-Source stats are computed from CLOSED events on demand.
-Auto-quarantine disables a source for new signals when thresholds are crossed.
+Статистика источников рассчитывается из событий CLOSED по запросу.
+Автокарантин отключает источник для новых сигналов при превышении порогов.
 
-Config env vars (all default = disabled / 0):
-  QUARANTINE_LOSS_STREAK       — 0 = off; N = quarantine after N consecutive losses
-  QUARANTINE_DAILY_PNL_USDT    — 0 = off; negative = allow some loss
-  QUARANTINE_WEEKLY_PNL_USDT   — 0 = off
+Переменные окружения (по умолчанию отключены / 0):
+  QUARANTINE_LOSS_STREAK       — 0 = выкл; N = карантин после N убытков подряд
+  QUARANTINE_DAILY_PNL_USDT    — 0 = выкл; отрицательное = допустимый дневной убыток
+  QUARANTINE_WEEKLY_PNL_USDT   — 0 = выкл
 """
 
 import json
@@ -40,7 +40,7 @@ _DISABLED_SOURCES: dict = {}   # {source_tag: reason_str}
 
 
 def load_disabled_sources() -> None:
-    """Load disabled sources from disk into _DISABLED_SOURCES."""
+    """Загружает список отключённых источников с диска в _DISABLED_SOURCES."""
     global _DISABLED_SOURCES
     if not DISABLED_SOURCES_FILE.exists():
         return
@@ -62,14 +62,14 @@ def _save_disabled_sources() -> None:
 
 
 def is_source_enabled(tag: str | None) -> bool:
-    """Return True when the source is not quarantined (or tag is None / empty)."""
+    """Возвращает True, если источник не в карантине (или tag пустой / None)."""
     if not tag:
         return True
     return tag not in _DISABLED_SOURCES
 
 
 def quarantine_source(tag: str, reason: str) -> None:
-    """Disable a source for new signals; persist to disk."""
+    """Отключает источник для новых сигналов и сохраняет состояние на диск."""
     if tag not in _DISABLED_SOURCES:
         _DISABLED_SOURCES[tag] = reason
         _save_disabled_sources()
@@ -77,7 +77,7 @@ def quarantine_source(tag: str, reason: str) -> None:
 
 
 def enable_source(tag: str) -> None:
-    """Re-enable a previously quarantined source."""
+    """Повторно включает ранее отключённый (карантинный) источник."""
     if tag in _DISABLED_SOURCES:
         del _DISABLED_SOURCES[tag]
         _save_disabled_sources()
@@ -85,7 +85,7 @@ def enable_source(tag: str) -> None:
 
 
 def get_disabled_sources() -> dict:
-    """Return a copy of the current disabled-sources mapping."""
+    """Возвращает копию текущего словаря отключённых источников."""
     return dict(_DISABLED_SOURCES)
 
 
@@ -95,10 +95,10 @@ def get_disabled_sources() -> dict:
 
 def append_event(event: dict) -> None:
     """
-    Append a single JSON event to the journal file (JSONL format).
+    Дописывает одно JSON-событие в файл журнала (формат JSONL).
 
-    Safe for sequential calls from async handlers via asyncio.to_thread.
-    Adds 'ts' (epoch seconds) if not already set.
+    Безопасно вызывать из async-хендлеров через asyncio.to_thread.
+    Добавляет 'ts' (Unix-секунды), если не задан.
     """
     DATA_DIR.mkdir(exist_ok=True)
     event.setdefault("ts", time.time())
@@ -116,9 +116,9 @@ def read_events(
     symbol: str | None = None,
 ) -> list:
     """
-    Read journal events, optionally filtered by type, time, and/or symbol.
+    Читает события журнала с опциональной фильтрацией по типу, времени и символу.
 
-    Skips malformed lines silently.
+    Повреждённые строки пропускаются без ошибок.
     """
     events = []
     if not JOURNAL_FILE.exists():
@@ -154,9 +154,9 @@ def compute_source_stats(
     since_ts: float = 0.0,
 ) -> dict:
     """
-    Compute per-source statistics from CLOSED events.
+    Рассчитывает статистику по источникам из событий CLOSED.
 
-    Returns:
+    Возвращает:
         {source_tag: {total_pnl, wins, losses, winrate, avg_r, max_dd,
                       loss_streak, trade_count, last20}}
     """
@@ -217,14 +217,14 @@ def check_and_quarantine_sources(
     weekly_stats: dict | None = None,
 ) -> list:
     """
-    Evaluate all sources against configured quarantine thresholds.
+    Проверяет все источники по заданным порогам карантина.
 
-    Quarantine triggers (when their config threshold > 0):
-      - Loss streak >= QUARANTINE_LOSS_STREAK
-      - daily total_pnl  < QUARANTINE_DAILY_PNL_USDT  (only when threshold != 0)
-      - weekly total_pnl < QUARANTINE_WEEKLY_PNL_USDT (only when threshold != 0)
+    Триггеры карантина (когда соответствующий порог > 0):
+      - Серия убытков >= QUARANTINE_LOSS_STREAK
+      - Дневной total_pnl  < QUARANTINE_DAILY_PNL_USDT  (только при threshold != 0)
+      - Недельный total_pnl < QUARANTINE_WEEKLY_PNL_USDT (только при threshold != 0)
 
-    Returns list of (tag, reason) for sources quarantined in this call.
+    Возвращает список (tag, reason) для источников, помещённых в карантин в этом вызове.
     """
     newly_quarantined = []
 

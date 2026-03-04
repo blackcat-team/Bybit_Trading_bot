@@ -1,14 +1,15 @@
 """
-bybit_call — canonical async wrapper for synchronous pybit V5 SDK calls.
+Асинхронная обёртка для синхронных вызовов pybit V5 SDK.
 
-Centralised in core/ so that modules that cannot import from handlers/
-(e.g. core/trading_core.py, app/jobs.py) can use it without circular imports.
+Размещена в core/ чтобы модули, которые не могут импортировать из handlers/
+(например, core/trading_core.py, app/jobs.py), могли использовать её без
+циклических зависимостей.
 
-Usage:
+Использование:
     from core.bybit_call import bybit_call
     result = await bybit_call(session.get_positions, category="linear", ...)
 
-Exceptions from the wrapped function propagate unchanged to the caller.
+Исключения из обёрнутой функции пробрасываются вызывающему без изменений.
 """
 import asyncio
 import logging
@@ -16,19 +17,20 @@ import os
 import time
 
 _SLOW_CALL_THRESHOLD = 0.5  # seconds
-# Slow-call WARNING is opt-in: set BYBIT_SLOW_CALL_WARN=1 (or =true) to enable.
-# Default: log at DEBUG to avoid production log noise.
+# Предупреждения о медленных вызовах включаются опционально: BYBIT_SLOW_CALL_WARN=1.
+# По умолчанию логируем на уровне DEBUG, чтобы не засорять продакшн-логи.
 _SLOW_CALL_WARN = os.getenv("BYBIT_SLOW_CALL_WARN", "").lower() in ("1", "true")
 
 
 async def bybit_call(fn, *args, **kwargs):
-    """Run a synchronous Bybit SDK call in a thread pool, keeping the event loop free.
+    """Запускает синхронный вызов Bybit SDK в пуле потоков, не блокируя event loop.
 
-    Calls slower than _SLOW_CALL_THRESHOLD seconds log at DEBUG by default.
-    Set BYBIT_SLOW_CALL_WARN=1 to promote slow-call logs to WARNING.
+    Вызовы медленнее _SLOW_CALL_THRESHOLD секунд логируются на уровне DEBUG.
+    Установите BYBIT_SLOW_CALL_WARN=1, чтобы повысить их до WARNING.
 
-    On exception: classifies the error and sends a deduped owner alert
-    (if configure_alerts() was called at startup), then re-raises unchanged.
+    При исключении: классифицирует ошибку и отправляет дедуплицированный
+    алерт владельцу (если configure_alerts() был вызван при старте), затем
+    пробрасывает исключение без изменений.
     """
     name = getattr(fn, "__name__", None) or getattr(fn, "__qualname__", str(fn))
     t0 = time.monotonic()
@@ -39,7 +41,7 @@ async def bybit_call(fn, *args, **kwargs):
             from core.notifier import alert_bybit_error
             await alert_bybit_error(exc, name)
         except Exception:
-            pass  # never let alerting suppress the real exception
+            pass  # алертинг не должен глушить реальное исключение
         raise
 
     elapsed = time.monotonic() - t0

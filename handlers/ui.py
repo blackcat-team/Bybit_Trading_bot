@@ -1,9 +1,9 @@
 """
-UI helpers — message templates for Telegram.
-Pure functions, return strings (no await / side-effects).
+UI-хелперы — шаблоны сообщений для Telegram.
+Чистые функции, возвращают строки (без await и побочных эффектов).
 
-All card renderers return HTML strings — callers must use parse_mode='HTML'.
-h(text) escapes arbitrary dynamic values for safe HTML insertion.
+Все карточки возвращают HTML-строки — вызывающий должен использовать parse_mode='HTML'.
+h(text) экранирует произвольные динамические значения для безопасной вставки в HTML.
 """
 
 import html as _html
@@ -11,14 +11,14 @@ import html as _html
 # ── HTML safety ────────────────────────────────────────────────────────────────
 
 def h(text) -> str:
-    """Escape arbitrary text for safe insertion into Telegram HTML."""
+    """Экранирует произвольный текст для безопасной вставки в Telegram HTML."""
     return _html.escape(str(text))
 
 
 # ── Number-formatting helpers ─────────────────────────────────────────────────
 
 def _trim_num(s: str) -> str:
-    """Strip trailing zeros then trailing dot from a decimal string.
+    """Убирает хвостовые нули и точку из десятичной строки.
 
     "27.500000" → "27.5"
     "0.07475000" → "0.07475"
@@ -28,21 +28,21 @@ def _trim_num(s: str) -> str:
 
 
 def _fmt_price(x) -> str:
-    """Format a price: up to 6 significant decimals, trailing zeros trimmed."""
+    """Форматирует цену: до 6 знаков после запятой, хвостовые нули обрезаны."""
     if x is None:
         return "—"
     return _trim_num(f"{x:.6f}")
 
 
 def _fmt_qty(x) -> str:
-    """Format a quantity: up to 8 decimals, trailing zeros trimmed."""
+    """Форматирует объём: до 8 знаков после запятой, хвостовые нули обрезаны."""
     if x is None:
         return "—"
     return _trim_num(f"{x:.8f}")
 
 
 def _fmt_usd(x, signed: bool = False) -> str:
-    """Format a USD value to exactly 2 decimal places.
+    """Форматирует сумму в USD с точностью до 2 знаков.
 
     signed=True  → "+11.62$" / "-3.00$"
     signed=False → "24.30$"
@@ -53,14 +53,14 @@ def _fmt_usd(x, signed: bool = False) -> str:
 
 
 def _fmt_r(x) -> str:
-    """Format an R value with sign, or '—' when unavailable."""
+    """Форматирует значение R со знаком или возвращает '—' при отсутствии данных."""
     if x is None:
         return "—"
     return f"{x:+.2f}R"
 
 
 def _fmt_pct(x) -> str:
-    """Format a percent with sign and 2 decimal places: '-8.18%'."""
+    """Форматирует процент со знаком и двумя знаками: '-8.18%'."""
     return f"{x:+.2f}%"
 
 
@@ -72,11 +72,11 @@ _SEP = "➖➖➖➖➖➖➖➖"
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _sl_pct(entry_price: float, stop_val: float) -> float:
-    """Return the stop-loss distance as a negative percentage of entry price.
+    """Возвращает расстояние до стопа как отрицательный процент от цены входа.
 
-    Always negative: represents the loss-to-stop regardless of direction.
-    e.g. entry=30, sl=27.5  → -8.33%
-         entry=30, sl=32.5  → -8.33%
+    Всегда отрицательное: представляет потерю-до-стопа независимо от направления.
+    пример: entry=30, sl=27.5  → -8.33%
+            entry=30, sl=32.5  → -8.33%
     """
     if not entry_price:
         return 0.0
@@ -86,7 +86,7 @@ def _sl_pct(entry_price: float, stop_val: float) -> float:
 # ── Signal cards (HTML) ───────────────────────────────────────────────────────
 
 def format_market_signal(sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag):
-    """HTML card for a market (CMP) signal."""
+    """HTML-карточка сигнала на вход по рынку (CMP)."""
     side_icon = "🟢" if side == "LONG" else "🔴"
     return (
         f"⚡️ <b>{h(sym)} • MARKET</b>\n"
@@ -100,7 +100,7 @@ def format_market_signal(sym, side, lev, entry_price, stop_val, qty, pos_value_u
 
 
 def format_limit_signal(sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag):
-    """HTML card for a limit signal."""
+    """HTML-карточка лимитного сигнала на вход."""
     side_icon = "🟢" if side == "LONG" else "🔴"
     return (
         f"🚀 <b>{h(sym)} • LIMIT</b>\n"
@@ -115,7 +115,7 @@ def format_limit_signal(sym, side, lev, entry_price, stop_val, qty, pos_value_us
 
 def format_market_preview(sym, side, lev, entry_price, stop_val, qty, pos_value_usd,
                            risk_usd, source_tag, heat_after, max_heat):
-    """HTML preview card shown before market execution when REQUIRE_MARKET_CONFIRM=1."""
+    """HTML-карточка превью, отображаемая до исполнения при REQUIRE_MARKET_CONFIRM=1."""
     side_icon = "🟢" if side == "LONG" else "🔴"
     heat_str = f"{heat_after:.1f}$ / {max_heat:.1f}$" if max_heat > 0 else "disabled"
     return (
@@ -133,14 +133,13 @@ def format_market_preview(sym, side, lev, entry_price, stop_val, qty, pos_value_
 
 
 def format_position_card(sym, side, pnl, current_r):
-    """HTML position card.
+    """HTML-карточка открытой позиции.
 
-    Args:
-        sym:       symbol string, e.g. "ETHUSDT"
-        side:      Bybit side string — "Buy" (long) or "Sell" (short)
-        pnl:       unrealised PnL in USDT (float)
-        current_r: PnL expressed in R units (float), or None if planned
-                   risk is unavailable / zero.
+    Аргументы:
+        sym:       символ, например "ETHUSDT"
+        side:      направление Bybit — "Buy" (лонг) или "Sell" (шорт)
+        pnl:       нереализованный PnL в USDT (float)
+        current_r: PnL в единицах R (float) или None, если риск недоступен / нулевой
     """
     side_label = "LONG" if side == "Buy" else "SHORT"
     side_icon  = "🟢"   if side == "Buy" else "🔴"
@@ -152,9 +151,9 @@ def format_position_card(sym, side, pnl, current_r):
 
 
 def format_orders_menu_html(symbol: str, orders: list) -> str:
-    """HTML orders detail menu for view_symbol_orders.
+    """HTML-меню детализации ордеров для view_symbol_orders.
 
-    Each order is rendered as a <code> block with all dynamic fields escaped.
+    Каждый ордер отображается в блоке <code> с экранированием всех динамических полей.
     """
     n = len(orders)
     lines = [f"📂 <b>Ордера {h(symbol)} ({n}):</b>"]

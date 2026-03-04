@@ -1,17 +1,17 @@
 """
-Signal conflict resolver — same-symbol direction rules.
+Разрешение конфликтов сигналов — правила по направлению для одного символа.
 
-Rules (applied when a new signal arrives for a symbol):
-  No existing position/order → "allow"
-  Same direction + CONFLICT_POLICY_SAME_DIR=ignore → "ignore" (default)
-  Same direction + CONFLICT_POLICY_SAME_DIR=add_if_allowed
-                + SOURCE_ALLOW_ADD=1               → "add" (heat check still applies)
-  Opposite direction                               → "block" (always fail-closed)
-  API error                                        → "block" (fail-closed)
+Правила (применяются при поступлении нового сигнала по символу):
+  Нет позиции/ордера              → "allow"
+  То же направление + CONFLICT_POLICY_SAME_DIR=ignore → "ignore" (по умолчанию)
+  То же направление + CONFLICT_POLICY_SAME_DIR=add_if_allowed
+                   + SOURCE_ALLOW_ADD=1               → "add" (heat-проверка всё равно проводится)
+  Противоположное направление                         → "block" (всегда, fail-closed)
+  Ошибка API                                          → "block" (fail-closed)
 
-Config env vars:
-  CONFLICT_POLICY_SAME_DIR — "ignore" (default) | "add_if_allowed"
-  SOURCE_ALLOW_ADD          — "0" (default)      | "1"
+Переменные окружения:
+  CONFLICT_POLICY_SAME_DIR — "ignore" (по умолчанию) | "add_if_allowed"
+  SOURCE_ALLOW_ADD          — "0" (по умолчанию)      | "1"
 """
 
 import logging
@@ -20,19 +20,19 @@ from core.config import CONFLICT_POLICY_SAME_DIR, SOURCE_ALLOW_ADD
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Внутренние вспомогательные функции
 # ---------------------------------------------------------------------------
 
 async def _get_existing_side(symbol: str) -> str | None:
     """
-    Return 'LONG' or 'SHORT' if there is an open position or non-reduceOnly
-    entry order for *symbol*.  Returns None when none found.
-    Raises on API errors (caller handles fail-closed).
+    Возвращает 'LONG' или 'SHORT', если по символу есть открытая позиция или
+    ордер на вход (non-reduceOnly). Возвращает None, если ничего нет.
+    При ошибке API — бросает исключение (вызывающий обрабатывает fail-closed).
     """
     from core.bybit_call import bybit_call
     from core.trading_core import session
 
-    # 1. Open position
+    # 1. Открытая позиция
     pos_resp = await bybit_call(
         session.get_positions, category="linear", symbol=symbol
     )
@@ -40,7 +40,7 @@ async def _get_existing_side(symbol: str) -> str | None:
         if float(pos.get("size", 0)) > 0:
             return "LONG" if pos["side"] == "Buy" else "SHORT"
 
-    # 2. Pending entry order (non-reduceOnly = opening order)
+    # 2. Ожидающий ордер на вход (non-reduceOnly = открывающий)
     orders_resp = await bybit_call(
         session.get_open_orders, category="linear", symbol=symbol, limit=10
     )
@@ -52,7 +52,7 @@ async def _get_existing_side(symbol: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Публичный API
 # ---------------------------------------------------------------------------
 
 async def resolve_signal_conflict(
@@ -60,14 +60,14 @@ async def resolve_signal_conflict(
     new_side: str,
 ) -> tuple[str, str]:
     """
-    Evaluate whether a new signal for *symbol* / *new_side* conflicts with an
-    existing position or pending entry.
+    Проверяет, конфликтует ли новый сигнал по *symbol* / *new_side* с
+    существующей позицией или ожидающим ордером на вход.
 
-    Returns (action, reason):
-      "allow"  — no conflict, proceed normally
-      "ignore" — same direction, CONFLICT_POLICY_SAME_DIR=ignore → drop signal
-      "add"    — same direction, SOURCE_ALLOW_ADD=1 → allow adding
-      "block"  — opposite direction (always) or API error (fail-closed)
+    Возвращает (action, reason):
+      "allow"  — конфликта нет, можно торговать
+      "ignore" — то же направление, CONFLICT_POLICY_SAME_DIR=ignore → сигнал отброшен
+      "add"    — то же направление, SOURCE_ALLOW_ADD=1 → разрешить добор
+      "block"  — противоположное направление (всегда) или ошибка API (fail-closed)
     """
     try:
         existing_side = await _get_existing_side(symbol)
@@ -85,11 +85,11 @@ async def resolve_signal_conflict(
     if not same_dir:
         return (
             "block",
-            f"Opposite direction conflict: existing={existing_side} new={new_side}",
+            f"Opposite direction: existing={existing_side} new={new_side}",
         )
 
-    # Same direction
+    # То же направление
     if CONFLICT_POLICY_SAME_DIR == "add_if_allowed" and SOURCE_ALLOW_ADD:
-        return "add", f"Same direction {existing_side} on {symbol} — adding (SOURCE_ALLOW_ADD=1)"
+        return "add", f"Совпадение направления {existing_side} по {symbol} — добор разрешён (SOURCE_ALLOW_ADD=1)"
 
-    return "ignore", f"Already {existing_side} on {symbol} — signal ignored"
+    return "ignore", f"Уже {existing_side} по {symbol} — сигнал проигнорирован"

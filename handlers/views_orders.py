@@ -64,6 +64,17 @@ async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Orders error: {e}")
 
 
+def _has_open_position(positions: list, symbol: str) -> bool:
+    """Return True if *positions* contains an active (size > 0) entry for *symbol*.
+
+    Pure helper — no I/O, safe to unit-test with fake data.
+    """
+    return any(
+        p.get('symbol') == symbol and float(p.get('size', 0) or 0) > 0
+        for p in positions
+    )
+
+
 async def view_symbol_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str):
     """(НОВОЕ) Показывает ВСЕ ордера конкретной монеты (Тейки, Стопы, Лимитки)."""
     if str(update.effective_user.id) != ALLOWED_ID: return
@@ -77,6 +88,14 @@ async def view_symbol_orders(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await check_positions(update, context)
             return
 
+        # Fail-closed: hide Close Market button if position check fails or size=0.
+        has_position = False
+        try:
+            pos_resp = await bybit_call(session.get_positions, category="linear", symbol=symbol)
+            has_position = _has_open_position(pos_resp['result']['list'], symbol)
+        except Exception as pos_err:
+            logging.warning("view_symbol_orders: position check failed for %s: %s", symbol, pos_err)
+
         orders.sort(key=lambda x: x.get('reduceOnly', False))
 
         msg_text = format_orders_menu_html(symbol, orders)
@@ -88,7 +107,8 @@ async def view_symbol_orders(update: Update, context: ContextTypes.DEFAULT_TYPE,
             cb_data = f"cancel_o|{symbol}|{oid}|sym"
             keyboard.append([InlineKeyboardButton(f"❌ Cancel {price}", callback_data=cb_data)])
 
-        keyboard.append([InlineKeyboardButton(f"❌ Close Market {symbol}", callback_data=f"close_confirm|{symbol}")])
+        if has_position:
+            keyboard.append([InlineKeyboardButton(f"❌ Close Market {symbol}", callback_data=f"close_confirm|{symbol}")])
         keyboard.append([InlineKeyboardButton("🔙 Назад к позициям", callback_data="back_to_pos")])
 
         reply_markup = InlineKeyboardMarkup(keyboard)

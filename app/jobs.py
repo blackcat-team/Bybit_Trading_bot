@@ -1,3 +1,11 @@
+"""
+Фоновые задачи планировщика APScheduler.
+
+Включает: пульс (heartbeat), авто-трейлинг стопа (breakeven),
+очистку устаревших ордеров, утренний отчёт о балансе,
+управление по времени (5/7 дней), сверку журнала сделок
+и еженедельный отчёт по источникам сигналов.
+"""
 import asyncio
 import time
 import logging
@@ -41,13 +49,10 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
 # --- 2. Auto-Breakeven (Перевод в Безубыток) ---
 async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Ступенчатый трейлинг (Smart Breakeven v2.1 PRO):
-    1. Если прибыль >= 1R -> Risk Cut (Стоп в -0.3R).
-    2. Если прибыль >= 2R -> Breakeven (Вход + 0.05R).
+    Авто-трейлинг стопа: ступенчатое подтягивание по R.
 
-    Исправления:
-    - Убран опасный fallback риска (10$).
-    - Offset теперь динамический (5% от длины стопа), а не фикс %.
+    1. Прибыль >= 1R → Risk Cut (стоп в -0.3R).
+    2. Прибыль >= 2R → Безубыток (вход + 0.05R, динамический offset).
     """
     if not is_trading_enabled(): return
 
@@ -232,8 +237,10 @@ async def daily_balance_job(context: ContextTypes.DEFAULT_TYPE):
 # --- 5. TIME MANAGEMENT ---
 async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Time-based management (v1.2 FIX)
-    Проверяет возраст позиций по времени ПОСЛЕДНЕГО ИСПОЛНЕНИЯ (Trade Execution).
+    Управление позициями по времени.
+
+    Проверяет возраст каждой позиции по времени последнего исполнения.
+    Предупреждение на 5-й день, принудительный сигнал на 7-й.
     """
     try:
         # 1. Получаем все позиции
@@ -345,14 +352,14 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
 # --- 6. Reconcile journal (detect closed trades) ---
 async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Detect positions that closed since the last check.
+    Обнаруживает позиции, закрытые с момента последней проверки.
 
-    Strategy:
-    - List symbols in RISK_MAPPING (had entries placed)
-    - Get current open positions from Bybit
-    - For each symbol that was tracked but has no open position:
-        Fetch last closed PnL via get_closed_pnl and write CLOSED event.
-    - Run auto-quarantine check on updated stats.
+    Алгоритм:
+    - Берёт символы из RISK_MAPPING (по которым были входы)
+    - Получает текущие открытые позиции с Bybit
+    - Для каждого отслеживаемого символа без открытой позиции:
+        запрашивает последний закрытый PnL через get_closed_pnl и пишет событие CLOSED
+    - Запускает проверку автокарантина по обновлённой статистике
     """
     try:
         _pos_resp = await bybit_call(
@@ -362,14 +369,14 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
             p["symbol"] for p in _pos_resp["result"]["list"] if float(p.get("size", 0)) > 0
         }
 
-        # Symbols we track but no longer open
+        # Символы, которые мы отслеживаем, но позиции по ним уже нет
         tracked_syms = set(RISK_MAPPING.keys())
         closed_candidates = tracked_syms - open_syms
 
         if not closed_candidates:
             return
 
-        # Get journal to avoid duplicate CLOSED events
+        # Читаем журнал, чтобы не писать дублирующиеся события CLOSED
         _closed_evs = await asyncio.to_thread(read_events, event_type=CLOSED)
         already_closed = {
             ev["symbol"] for ev in _closed_evs
@@ -418,7 +425,7 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception as sym_err:
                 logging.debug("reconcile: %s: %s", sym, sym_err)
 
-        # Auto-quarantine check
+        # Проверка условий автокарантина
         try:
             quarantined = await asyncio.to_thread(check_and_quarantine_sources)
             for tag, reason in quarantined:
@@ -444,7 +451,7 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
 
 # --- 7. Weekly source stats report ---
 async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
-    """Send weekly source statistics report to owner."""
+    """Еженедельный отчёт по статистике источников сигналов."""
     try:
         stats = await asyncio.to_thread(compute_source_stats, since_ts=time.time() - 7 * 86400)
         disabled = get_disabled_sources()

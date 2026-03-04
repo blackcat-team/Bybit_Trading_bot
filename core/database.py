@@ -1,3 +1,9 @@
+"""
+Персистентное хранилище данных бота (JSON-файлы).
+
+Управляет настройками торговли, риском по символам, комментариями и
+источниками сигналов. Все записи атомарны (tmp-файл + os.replace).
+"""
 import json
 import os
 import time
@@ -114,10 +120,7 @@ def get_global_risk():
         return float(USER_RISK_USD)
 
 def set_global_risk(amount):
-    """
-    Сохраняет новый глобальный риск в память и в файл settings.json.
-    Именно этой функции не хватало!
-    """
+    """Сохраняет новый глобальный риск в память и в settings.json."""
     global SETTINGS
     try:
         # Превращаем в float для точности, но сохраняем как число
@@ -149,10 +152,12 @@ def update_risk_for_symbol(symbol, risk_amount):
 
 # --- 5. Управление Настройками (Вкл/Выкл бота) ---
 def is_trading_enabled():
+    """Возвращает True, если торговля разрешена (флаг из settings.json)."""
     return SETTINGS.get("trading_enabled", True)
 
 
 def set_trading_enabled(status: bool):
+    """Устанавливает флаг торговли и сохраняет его в settings.json."""
     global SETTINGS
     SETTINGS["trading_enabled"] = status
     save_json(SETTINGS_FILE, SETTINGS)

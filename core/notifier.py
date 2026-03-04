@@ -1,19 +1,19 @@
 """
-Notifier — owner alert with per-key dedup / cooldown + error classifier.
+Алерты владельцу с дедупликацией/кулдауном и классификатором ошибок.
 
-Usage:
+Использование:
     from core.notifier import send_alert, RATE_LIMIT, AUTH, FAIL_CLOSED
     await send_alert(bot, owner_id, "WARNING", FAIL_CLOSED, "Daily limit hit",
                      dedup_key="daily_limit")
 
-Alert classes (also importable as string constants):
+Классы алертов (импортируемые строковые константы):
     RATE_LIMIT, AUTH, INSUFFICIENT_MARGIN, INVALID_QTY, FAIL_CLOSED, WARNING, INFO, TIMEOUT
 
-Error classifier:
+Классификатор ошибок:
     from core.notifier import classify_error
-    cls = classify_error(exc)  # → one of the alert class constants
+    cls = classify_error(exc)  # → одна из констант классов алертов
 
-Startup wiring (called once from main.py so bybit_call can send alerts):
+Инициализация (вызывается один раз из main.py, чтобы bybit_call мог слать алерты):
     from core.notifier import configure_alerts
     configure_alerts(app.bot, ALLOWED_ID)
 """
@@ -23,7 +23,7 @@ import logging
 import time
 
 # ---------------------------------------------------------------------------
-# Alert class constants
+# Константы классов алертов
 # ---------------------------------------------------------------------------
 
 RATE_LIMIT = "RATE_LIMIT"
@@ -35,17 +35,17 @@ WARNING = "WARNING"
 INFO = "INFO"
 TIMEOUT = "TIMEOUT"
 
-# Default cooldown between repeated alerts with the same dedup_key (seconds)
-DEFAULT_COOLDOWN = 300  # 5 minutes
+# Кулдаун по умолчанию между повторными алертами с одним dedup_key (секунды)
+DEFAULT_COOLDOWN = 300  # 5 минут
 
 # ---------------------------------------------------------------------------
-# Internal state (module-level, reset by tests via _dedup.clear())
+# Внутреннее состояние (модульный уровень, очищается в тестах через _dedup.clear())
 # ---------------------------------------------------------------------------
 
-_dedup: dict[str, float] = {}   # dedup_key → last_sent timestamp
-_last_alert: dict = {}           # info about the most recent alert that was sent
+_dedup: dict[str, float] = {}   # dedup_key → timestamp последней отправки
+_last_alert: dict = {}           # метаданные последнего отправленного алерта
 
-# Optional bot/owner wired at startup by configure_alerts(); used by alert_bybit_error.
+# Бот и ID владельца, задаются при старте через configure_alerts(); нужны alert_bybit_error.
 _alert_bot = None
 _alert_owner_id: str = ""
 
@@ -62,10 +62,10 @@ _ICONS = {
 
 
 # ---------------------------------------------------------------------------
-# Error classifier
+# Классификатор ошибок
 # ---------------------------------------------------------------------------
 
-# Bybit retCode strings that indicate specific error classes
+# Подстроки retCode / сообщений Bybit для каждого класса ошибок
 _RATE_LIMIT_HINTS  = ("429", "rate limit", "10006", "too many request")
 _AUTH_HINTS        = ("10003", "10004", "api key", "api-key", "invalid signature",
                       "signature", "authentication", "unauthorized")
@@ -79,10 +79,10 @@ _TIMEOUT_HINTS     = ("read timed out", "connect timeout", "connection timeout",
 
 def classify_error(exc: Exception) -> str:
     """
-    Map an exception to one of the alert class constants.
+    Сопоставляет исключение с одной из констант классов алертов.
 
-    Checks exception message and, when available, HTTP status code.
-    Returns one of: RATE_LIMIT, AUTH, INSUFFICIENT_MARGIN, INVALID_QTY, TIMEOUT, WARNING.
+    Проверяет сообщение исключения и HTTP-код (если доступен).
+    Возвращает одну из: RATE_LIMIT, AUTH, INSUFFICIENT_MARGIN, INVALID_QTY, TIMEOUT, WARNING.
     """
     msg = str(exc).lower()
     if any(h in msg for h in _RATE_LIMIT_HINTS):
@@ -99,14 +99,14 @@ def classify_error(exc: Exception) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Startup wiring
+# Инициализация при старте
 # ---------------------------------------------------------------------------
 
 def configure_alerts(bot, owner_id: str) -> None:
     """
-    Wire the Telegram bot and owner chat-id so that alert_bybit_error()
-    can send alerts without a request context.
-    Call once from main.py after ApplicationBuilder().build().
+    Привязывает Telegram-бот и chat_id владельца, чтобы alert_bybit_error()
+    мог отправлять алерты без контекста запроса.
+    Вызывается один раз из main.py после ApplicationBuilder().build().
     """
     global _alert_bot, _alert_owner_id
     _alert_bot = bot
@@ -115,10 +115,10 @@ def configure_alerts(bot, owner_id: str) -> None:
 
 async def alert_bybit_error(exc: Exception, fn_name: str) -> None:
     """
-    Send a classified alert for a Bybit API error.
+    Отправляет классифицированный алерт об ошибке Bybit API.
 
-    Best-effort: if no bot is configured, or on send failure, logs only.
-    Always deduped per (class, fn_name) with DEFAULT_COOLDOWN.
+    Best-effort: если бот не настроен или отправка не удалась — только логирует.
+    Всегда дедуплицируется по (класс, fn_name) с кулдауном DEFAULT_COOLDOWN.
     """
     if not _alert_bot or not _alert_owner_id:
         return
@@ -138,21 +138,21 @@ async def alert_bybit_error(exc: Exception, fn_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Public helpers
+# Публичные вспомогательные функции
 # ---------------------------------------------------------------------------
 
 def is_suppressed(dedup_key: str, cooldown_sec: int = DEFAULT_COOLDOWN) -> bool:
-    """Return True when the cooldown for *dedup_key* has NOT expired yet."""
+    """Возвращает True, если кулдаун для *dedup_key* ещё не истёк."""
     return (time.time() - _dedup.get(dedup_key, 0.0)) < cooldown_sec
 
 
 def reset_dedup(dedup_key: str) -> None:
-    """Remove a key from the dedup store so the next send is allowed immediately."""
+    """Удаляет ключ из хранилища дедупликации, разрешая немедленную отправку."""
     _dedup.pop(dedup_key, None)
 
 
 def get_last_alert() -> dict | None:
-    """Return a copy of the last-sent alert metadata, or None if none sent yet."""
+    """Возвращает копию метаданных последнего отправленного алерта или None."""
     return _last_alert.copy() if _last_alert else None
 
 
@@ -166,13 +166,13 @@ async def send_alert(
     cooldown_sec: int = DEFAULT_COOLDOWN,
 ) -> bool:
     """
-    Send an HTML alert to *owner_id* with dedup / cooldown.
+    Отправляет HTML-алерт на *owner_id* с дедупликацией и кулдауном.
 
-    Returns True if the message was dispatched, False if suppressed or on error.
-    Never raises — bot errors are logged at WARNING level.
+    Возвращает True, если сообщение было отправлено; False — если подавлено или ошибка.
+    Никогда не бросает исключений — ошибки бота логируются на уровне WARNING.
     """
     if is_suppressed(dedup_key, cooldown_sec):
-        logging.debug("Alert suppressed (cooldown %ds): %s", cooldown_sec, dedup_key)
+        logging.debug("Алерт подавлен (кулдаун %dс): %s", cooldown_sec, dedup_key)
         return False
 
     _dedup[dedup_key] = time.time()
@@ -192,5 +192,5 @@ async def send_alert(
         )
         return True
     except Exception as exc:
-        logging.warning("send_alert failed (owner=%s key=%s): %s", owner_id, dedup_key, exc)
+        logging.warning("send_alert ошибка (owner=%s key=%s): %s", owner_id, dedup_key, exc)
         return False
