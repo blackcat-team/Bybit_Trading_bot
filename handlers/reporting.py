@@ -24,6 +24,29 @@ class _BybitReportError(Exception):
     """Ошибка API Bybit при сборе отчёта."""
 
 
+def _validate_resp(resp, current_start: int, current_end: int) -> list:
+    """
+    Проверяет ответ одного чанка get_closed_pnl.
+
+    Возвращает список сделок при retCode == 0.
+    При любом отклонении (не dict, отсутствует retCode, retCode != 0) — поднимает
+    _BybitReportError с деталями для пользователя и лога.
+    """
+    if not isinstance(resp, dict):
+        raise _BybitReportError(
+            f"retCode=—, retMsg=неожиданный тип ответа: {type(resp).__name__}"
+        )
+    if "retCode" not in resp:
+        raise _BybitReportError(
+            "нет ключа retCode: пустой/невалидный ответ от Bybit; возможно bybit_call swallowed exception"
+        )
+    ret_code = resp["retCode"]
+    if ret_code != 0:
+        ret_msg = resp.get("retMsg", "—")
+        raise _BybitReportError(f"retCode={ret_code}, retMsg={ret_msg}")
+    return resp.get("result", {}).get("list", [])
+
+
 async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Команда /report [мм.гггг] — отчёт о закрытых сделках за месяц.
@@ -59,9 +82,10 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(f"⏳ Сбор данных за {month_name} (по 7 дней)...")
 
     status_deleted = False
+    current_start = start_ts
+    current_end = start_ts   # инициализируем до цикла — доступно в except
     try:
         all_trades = []
-        current_start = start_ts
 
         while current_start < end_ts:
             current_end = min(current_start + _CHUNK_MS, end_ts)
@@ -72,17 +96,7 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 endTime=current_end,
                 limit=100
             )
-
-            # Защита от нештатного ответа
-            if not isinstance(resp, dict):
-                raise _BybitReportError(f"retCode=—, retMsg=неожиданный тип ответа: {type(resp).__name__}")
-
-            ret_code = resp.get("retCode")
-            if ret_code not in (0, None):
-                ret_msg = resp.get("retMsg", "—")
-                raise _BybitReportError(f"retCode={ret_code}, retMsg={ret_msg}")
-
-            chunk_trades = resp.get('result', {}).get('list', [])
+            chunk_trades = _validate_resp(resp, current_start, current_end)
             all_trades.extend(chunk_trades)
             current_start = current_end + 1          # шаг на 1 мс — без пробелов и перекрытий
             await asyncio.sleep(0.1)
@@ -161,10 +175,9 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"{header}\n\n📝 <b>Последние 15:</b>\n{short_list}", parse_mode='HTML')
 
     except Exception as e:
-        logging.error(
-            "Report error for %s (start=%s end=%s): %s",
-            month_name, start_ts, end_ts, e,
-            exc_info=True,
+        logging.exception(
+            "Report error for %s (chunk %s–%s): %s",
+            month_name, current_start, current_end, e,
         )
         err_text = f"❌ Ошибка отчета (Bybit API): {e}"
         if not status_deleted:
