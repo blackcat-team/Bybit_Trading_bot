@@ -5,6 +5,7 @@ TG command handlers — /start, /stop, /risk, /note, /status.
 import asyncio
 import logging
 from datetime import datetime
+from html import escape
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -76,91 +77,176 @@ async def add_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка заметки: {e}")
 
 
+# ── /status helpers ───────────────────────────────────────────────────────────
+
+def _truncate(text: str, n: int = 400) -> str:
+    """Truncate *text* to *n* chars, appending '…' if trimmed."""
+    if len(text) <= n:
+        return text
+    return text[:n] + "…"
+
+
+def _build_status_msg(
+    *,
+    trading_on: bool,
+    daily_pnl,          # float | None
+    current_risk: float,
+    heat_usd,           # float | None
+    max_heat: float,
+    pos_count,          # int | None
+    entry_orders,       # int | None
+    mkt_pending: int,
+    sources_seen: int,
+    quarantined: list,
+    alert_ts,           # float | None
+    alert_level: str,
+    alert_class: str,
+    alert_msg: str,
+) -> str:
+    """
+    Build the HTML /status message from pre-collected data.
+
+    Pure function — no I/O, no awaits.
+    ALL dynamic strings are passed through html.escape() before embedding.
+    """
+    status_icon = "✅ ON" if trading_on else "🛑 OFF"
+
+    if daily_pnl is not None:
+        pnl_icon = "📈" if daily_pnl >= 0 else "📉"
+        pnl_str = escape(f"{daily_pnl:+.2f}$")
+    else:
+        pnl_icon = "📊"
+        pnl_str = "N/A"
+
+    risk_str = escape(f"{int(current_risk)}$")
+
+    if max_heat <= 0:
+        heat_line = "disabled"
+    elif heat_usd is not None:
+        heat_line = escape(f"{heat_usd:.1f}$ / {max_heat:.1f}$")
+    else:
+        heat_line = "N/A"
+
+    pos_str = escape(str(pos_count)) if pos_count is not None else "N/A"
+    orders_str = escape(str(entry_orders)) if entry_orders is not None else "N/A"
+
+    quar_str = escape(", ".join(quarantined)) if quarantined else "None"
+
+    if alert_ts is not None:
+        ts_str = datetime.fromtimestamp(alert_ts).strftime("%H:%M:%S")
+        alert_header = (
+            f"[{escape(alert_level)}/{escape(alert_class)}] {escape(ts_str)}"
+        )
+        alert_body = escape(_truncate(alert_msg, 400))
+    else:
+        alert_header = "—"
+        alert_body = "none"
+
+    return (
+        f"🤖 <b>BOT STATUS</b> 📊\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"⚙️ <b>Engine:</b> {status_icon}\n"
+        f"{pnl_icon} <b>Daily PnL:</b> {pnl_str}\n"
+        f"🎯 <b>Base Risk:</b> {risk_str}\n"
+        f"🔥 <b>Live Heat:</b> {heat_line}\n\n"
+        f"📈 <b>MARKET DATA</b>\n"
+        f"├ 💼 Open Positions: {pos_str}\n"
+        f"├ 📝 Limit Orders: {orders_str}\n"
+        f"└ ⏳ Pending Mkt: {mkt_pending}\n\n"
+        f"📡 <b>SIGNALS &amp; SOURCES</b>\n"
+        f"├ 👀 Seen active: {sources_seen}\n"
+        f"└ 🛡 Quarantined: {quar_str}\n\n"
+        f"⚠️ <b>LAST ALERT</b> [{alert_header}]\n"
+        f"<code>{alert_body}</code>"
+    )
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /status — быстрый снимок состояния бота.
     Выводит: торговля вкл/выкл, дневной PnL, позиции, ожидающие маркет-входы,
     последний алерт, сводку источников.
     Все Bybit-вызовы — graceful fallback при ошибке API.
+    HTML-safe: все динамические поля экранированы через html.escape().
     """
     if str(update.effective_user.id) != ALLOWED_ID:
         return
 
     # ── 1. Trading enabled ────────────────────────────────────────────────
-    trading_str = "✅ ON" if is_trading_enabled() else "🛑 OFF"
+    trading_on = is_trading_enabled()
 
     # ── 2. Daily PnL + open positions (Bybit, graceful) ──────────────────
-    daily_pnl_str = "N/A"
-    pos_count_str = "N/A"
-    pending_orders_str = "N/A"
+    daily_pnl = None
+    pos_count = None
+    entry_orders_count = None
     try:
         from core.trading_core import session, check_daily_limit
         _, pnl = await bybit_call(check_daily_limit)
-        daily_pnl_str = f"{pnl:+.2f}$"
+        daily_pnl = pnl
 
         pos_resp = await bybit_call(
             session.get_positions, category="linear", settleCoin="USDT"
         )
         positions = [p for p in pos_resp["result"]["list"] if float(p["size"]) > 0]
-        pos_count_str = str(len(positions))
+        pos_count = len(positions)
 
         orders_resp = await bybit_call(
             session.get_open_orders, category="linear", settleCoin="USDT"
         )
-        entry_orders = [
+        entry_orders_count = len([
             o for o in orders_resp["result"]["list"]
             if not o.get("reduceOnly", False)
-        ]
-        pending_orders_str = str(len(entry_orders))
+        ])
     except Exception:
         pass
 
     # ── 3. Pending market entries (in-memory) ────────────────────────────
-    mkt_pending_str = str(len(_MARKET_PENDING))
+    mkt_pending = len(_MARKET_PENDING)
 
-    # ── 4. Sources (seen + quarantined) ──────────────────────────────────
-    src_count = len(SOURCES_DB)
+    # ── 4. Risk ───────────────────────────────────────────────────────────
+    current_risk = get_global_risk()
+
+    # ── 5. Sources (seen + quarantined) ──────────────────────────────────
+    sources_seen = len(SOURCES_DB)
+    quarantined: list = []
     try:
         from core.journal import get_disabled_sources
-        disabled = get_disabled_sources()
-        dis_str = ", ".join(disabled.keys()) if disabled else "none"
+        quarantined = list(get_disabled_sources().keys())
     except Exception:
-        dis_str = "N/A"
-    sources_str = f"{src_count} seen | quarantined: {dis_str}"
+        pass
 
-    # ── 5. Last alert ─────────────────────────────────────────────────────
+    # ── 6. Last alert ─────────────────────────────────────────────────────
     from core.notifier import get_last_alert
     last = get_last_alert()
-    if last:
-        ts_str = datetime.fromtimestamp(last["ts"]).strftime("%H:%M:%S")
-        last_alert_str = f"[{last['level']}/{last['class']}] {ts_str} — {last['msg'][:60]}"
-    else:
-        last_alert_str = "none"
+    alert_ts = last["ts"] if last else None
+    alert_level = last.get("level", "") if last else ""
+    alert_class = last.get("class", "") if last else ""
+    alert_msg_raw = last.get("msg", "") if last else ""
 
-    # ── 6. Heat ───────────────────────────────────────────────────────────
+    # ── 7. Heat ───────────────────────────────────────────────────────────
     from core.config import MAX_TOTAL_HEAT_USDT
-    if MAX_TOTAL_HEAT_USDT <= 0:
-        heat_str = "disabled"
-    else:
+    heat_usd = None
+    if MAX_TOTAL_HEAT_USDT > 0:
         try:
             from core.heat import compute_current_heat
-            heat_usd, heat_src = await compute_current_heat()
-            heat_str = f"{heat_usd:.1f}$ / {MAX_TOTAL_HEAT_USDT:.1f}$ ({heat_src})"
+            heat_usd, _ = await compute_current_heat()
         except Exception:
-            heat_str = "N/A"
+            pass
 
-    risk_str = f"{get_global_risk():.1f}$"
-
-    lines = [
-        "📊 BOT STATUS",
-        f"Trading:         {trading_str}",
-        f"Risk:            {risk_str}",
-        f"Daily PnL:       {daily_pnl_str}",
-        f"Open positions:  {pos_count_str}",
-        f"Entry orders:    {pending_orders_str}",
-        f"Mkt pending:     {mkt_pending_str}",
-        f"Sources seen:    {sources_str}",
-        f"Heat:            {heat_str}",
-        f"Last alert:      {last_alert_str}",
-    ]
-    await update.message.reply_text("\n".join(lines))
+    msg = _build_status_msg(
+        trading_on=trading_on,
+        daily_pnl=daily_pnl,
+        current_risk=current_risk,
+        heat_usd=heat_usd,
+        max_heat=MAX_TOTAL_HEAT_USDT,
+        pos_count=pos_count,
+        entry_orders=entry_orders_count,
+        mkt_pending=mkt_pending,
+        sources_seen=sources_seen,
+        quarantined=quarantined,
+        alert_ts=alert_ts,
+        alert_level=alert_level,
+        alert_class=alert_class,
+        alert_msg=alert_msg_raw,
+    )
+    await update.message.reply_text(msg, parse_mode='HTML')
