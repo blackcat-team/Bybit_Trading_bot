@@ -6,7 +6,6 @@
 """
 import logging
 import sys
-import warnings
 import pytz
 from datetime import time
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters
@@ -27,6 +26,7 @@ from app.jobs import (
     daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job,
     heartbeat_job, time_management_job,
     reconcile_journal_job, weekly_source_report_job,
+    _next_monday_9utc_secs,
 )
 from core.notifier import configure_alerts
 
@@ -141,7 +141,20 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), parse_and_trade))
 
     async def _ptb_error_handler(update, context):
+        import html as _html
         logging.error("Unhandled PTB exception: %s", context.error, exc_info=context.error)
+        try:
+            from core.notifier import send_alert
+            safe_msg = _html.escape(str(context.error)[:200])
+            await send_alert(
+                context.bot, ALLOWED_ID,
+                level="ERROR", alert_class="PTB",
+                msg=f"Необработанное исключение PTB:\n<code>{safe_msg}</code>",
+                dedup_key="ptb_unhandled",
+                cooldown_sec=300,
+            )
+        except Exception:
+            pass
     app.add_error_handler(_ptb_error_handler)
 
     print(f"{Fore.GREEN}{Style.BRIGHT}🤖 Бот запущен.{Style.RESET_ALL}")
@@ -170,11 +183,9 @@ if __name__ == '__main__':
     # 7. Reconcile journal (Раз в час — после cleanup)
     jq.run_repeating(reconcile_journal_job, interval=3600, first=120)
 
-    # 8. Weekly source stats report (Каждый понедельник в 09:00 UTC)
-    # Suppress PTBUserWarning about run_daily days= convention (harmless; 0=Monday in PTB 20.7+)
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=UserWarning, module="telegram")
-        jq.run_daily(weekly_source_report_job, time=time(hour=9, minute=0, tzinfo=pytz.UTC), days=(0,))
+    # 8. Еженедельный отчёт по источникам (каждый понедельник 09:00 UTC)
+    #    run_once + самоперепланирование внутри задачи — без PTBUserWarning.
+    jq.run_once(weekly_source_report_job, _next_monday_9utc_secs())
 
     print("✅ Background jobs started...")
 

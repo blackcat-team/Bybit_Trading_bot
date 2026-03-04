@@ -9,7 +9,7 @@
 import asyncio
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telegram.ext import ContextTypes
 
 
@@ -447,8 +447,28 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+
+def _next_monday_9utc_secs() -> float:
+    """Возвращает количество секунд до ближайшего понедельника 09:00 UTC.
+
+    Если до него менее 60 секунд (уже прошёл или почти) — возвращает задержку
+    до следующего понедельника (+7 дней), чтобы не запускать задачу немедленно.
+    """
+    now = datetime.now(timezone.utc)
+    days_ahead = (0 - now.weekday()) % 7          # 0=Mon; 0 если сегодня понедельник
+    target = now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+    delta = (target - now).total_seconds()
+    if delta < 60:
+        delta += 7 * 86400
+    return delta
+
+
 async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
-    """Еженедельный отчёт по статистике источников сигналов."""
+    """Еженедельный отчёт по статистике источников сигналов.
+
+    Запускается каждый понедельник в 09:00 UTC через механизм самоперепланирования
+    (run_once + finally), чтобы избежать PTBUserWarning от run_daily(days=).
+    """
     try:
         stats = await asyncio.to_thread(compute_source_stats, since_ts=time.time() - 7 * 86400)
         disabled = get_disabled_sources()
@@ -476,3 +496,7 @@ async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logging.error("Weekly report job error: %s", e)
+    finally:
+        # Перепланируем на следующий понедельник 09:00 UTC
+        delay = _next_monday_9utc_secs()
+        context.job_queue.run_once(weekly_source_report_job, delay)

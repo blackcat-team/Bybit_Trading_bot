@@ -48,3 +48,21 @@ qa_packs/
 # Windows reserved device file (accidentally created in bash)
 nul
 
+repo_mirror.git/
+.claude/
+.serena/
+qa_packs/
+data/*.json
+data/*.jsonl
+__pycache__/
+*.pyc
+.venv/
+repo_mirror.git/
+.claude/
+.serena/
+qa_packs/
+data/*.json
+data/*.jsonl
+__pycache__/
+*.pyc
+.venv/

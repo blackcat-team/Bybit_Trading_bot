@@ -13,8 +13,12 @@ from colorama import init, Fore, Style
 # Инициализация цветов для консоли
 init(autoreset=True)
 
-# Загрузка .env
-load_dotenv()
+# Загрузка .env (файл должен быть сохранён в UTF-8)
+try:
+    load_dotenv(encoding='utf-8')
+except UnicodeDecodeError:
+    print(f"{Fore.RED}❌ Файл .env должен быть UTF-8. Пересохраните в UTF-8 (без BOM).{Style.RESET_ALL}")
+    raise
 
 # --- API KEYS ---
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
