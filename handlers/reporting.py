@@ -30,20 +30,22 @@ def _validate_resp(resp, current_start: int, current_end: int) -> list:
 
     Возвращает список сделок при retCode == 0.
     При любом отклонении (не dict, отсутствует retCode, retCode != 0) — поднимает
-    _BybitReportError с деталями для пользователя и лога.
+    _BybitReportError с деталями (включая временное окно чанка) для пользователя и лога.
     """
+    chunk_info = f"[{current_start}–{current_end}]"
     if not isinstance(resp, dict):
         raise _BybitReportError(
-            f"retCode=—, retMsg=неожиданный тип ответа: {type(resp).__name__}"
+            f"{chunk_info} retCode=—, retMsg=неожиданный тип ответа: {type(resp).__name__}"
         )
     if "retCode" not in resp:
         raise _BybitReportError(
-            "нет ключа retCode: пустой/невалидный ответ от Bybit; возможно bybit_call swallowed exception"
+            f"{chunk_info} нет ключа retCode: пустой/невалидный ответ от Bybit; "
+            "возможна скрытая ошибка внутри bybit_call"
         )
     ret_code = resp["retCode"]
     if ret_code != 0:
         ret_msg = resp.get("retMsg", "—")
-        raise _BybitReportError(f"retCode={ret_code}, retMsg={ret_msg}")
+        raise _BybitReportError(f"{chunk_info} retCode={ret_code}, retMsg={ret_msg}")
     return resp.get("result", {}).get("list", [])
 
 
@@ -89,14 +91,32 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         while current_start < end_ts:
             current_end = min(current_start + _CHUNK_MS, end_ts)
-            resp = await bybit_call(
-                session.get_closed_pnl,
-                category="linear",
-                startTime=current_start,
-                endTime=current_end,
-                limit=100
-            )
-            chunk_trades = _validate_resp(resp, current_start, current_end)
+            chunk_trades: list = []
+            cursor: str = ""
+            pages = 0
+            while True:
+                pages += 1
+                if pages > 50:
+                    logging.warning(
+                        "Report: прервана пагинация (>50 стр.) для чанка %s–%s",
+                        current_start, current_end,
+                    )
+                    break
+                kw: dict = dict(
+                    category="linear",
+                    startTime=current_start,
+                    endTime=current_end,
+                    limit=100,
+                )
+                if cursor:
+                    kw["cursor"] = cursor
+                resp = await bybit_call(session.get_closed_pnl, **kw)
+                page_trades = _validate_resp(resp, current_start, current_end)
+                chunk_trades.extend(page_trades)
+                cursor = resp.get("result", {}).get("cursor", "")
+                if not cursor or not page_trades:
+                    break
+                await asyncio.sleep(0.1)
             all_trades.extend(chunk_trades)
             current_start = current_end + 1          # шаг на 1 мс — без пробелов и перекрытий
             await asyncio.sleep(0.1)
@@ -165,7 +185,7 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             writer.writerows(csv_data)
             output.seek(0)
             await update.message.reply_document(
-                document=io.BytesIO(output.getvalue().encode('utf-8')),
+                document=io.BytesIO(output.getvalue().encode('utf-8-sig')),
                 filename=f"Report_{month_name.replace(' ', '_')}.csv",
                 caption=header,
                 parse_mode='HTML'

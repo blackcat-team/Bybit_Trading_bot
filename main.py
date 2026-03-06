@@ -140,12 +140,43 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), parse_and_trade))
 
+    def _is_polling_error(exc: Exception) -> bool:
+        """Возвращает True для транспортных ошибок PTB-поллинга (шумные, неактивные)."""
+        try:
+            from telegram.error import NetworkError
+            if isinstance(exc, NetworkError):
+                return True
+        except ImportError:
+            pass
+        exc_type = type(exc).__name__
+        exc_module = getattr(type(exc), "__module__", "") or ""
+        return (
+            exc_type in ("ReadError", "ConnectError", "TimeoutException", "PoolTimeout")
+            and ("httpx" in exc_module or "httpcore" in exc_module)
+        )
+
     async def _ptb_error_handler(update, context):
         import html as _html
-        logging.error("Unhandled PTB exception: %s", context.error, exc_info=context.error)
+        exc = context.error
+        if _is_polling_error(exc):
+            logging.warning("PTB polling transport error: %s", exc)
+            try:
+                from core.notifier import send_alert
+                safe_msg = _html.escape(str(exc)[:200])
+                await send_alert(
+                    context.bot, ALLOWED_ID,
+                    level="WARNING", alert_class="TIMEOUT",
+                    msg=f"PTB polling network error:\n<code>{safe_msg}</code>",
+                    dedup_key="ptb_polling_neterr",
+                    cooldown_sec=1800,
+                )
+            except Exception:
+                pass
+            return
+        logging.error("Unhandled PTB exception: %s", exc, exc_info=exc)
         try:
             from core.notifier import send_alert
-            safe_msg = _html.escape(str(context.error)[:200])
+            safe_msg = _html.escape(str(exc)[:200])
             await send_alert(
                 context.bot, ALLOWED_ID,
                 level="ERROR", alert_class="PTB",
