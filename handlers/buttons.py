@@ -14,6 +14,7 @@ from core.config import ALLOWED_ID, REQUIRE_MARKET_CONFIRM, MARKET_PREVIEW_TTL_S
 from core.database import update_risk_for_symbol, log_source, pop_market_pending, _MARKET_PENDING
 from core.journal import append_event, ENTRY_PLACED
 from core.trading_core import session, place_tp_ladder
+from core.utils import safe_float
 from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_qty
 from handlers.orders import place_market_with_retry, close_position_market, bybit_call, set_leverage_safe
 from handlers.views_orders import view_orders, view_symbol_orders
@@ -56,7 +57,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, sym, side = data.split("|")
             pos_resp = await bybit_call(session.get_positions, category="linear", symbol=sym)
             pos = pos_resp['result']['list'][0]
-            entry = float(pos['avgPrice'])
+            entry = safe_float(pos.get('avgPrice'), field='avgPrice')
+            if entry <= 0:
+                await context.bot.send_message(user_id, f"❌ {sym}: нет данных о цене входа.")
+                return
             await bybit_call(session.set_trading_stop, category="linear", symbol=sym, stopLoss=str(entry), slTriggerBy="LastPrice")
             await context.bot.send_message(user_id, f"🛡 {sym} переведен в БУ!")
 
@@ -65,11 +69,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 pos_resp = await bybit_call(session.get_positions, category="linear", symbol=sym)
                 pos = pos_resp['result']['list'][0]
-                entry_price = float(pos['avgPrice'])
+                entry_price = safe_float(pos.get('avgPrice'), field='avgPrice')
 
                 info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=sym)
                 info = info_resp['result']['list'][0]
-                tick_size = float(info['priceFilter']['tickSize'])
+                tick_size = safe_float(info['priceFilter'].get('tickSize'), field='tickSize')
+
+                if entry_price <= 0 or tick_size <= 0:
+                    await query.answer(f"❌ Нет данных цены/тика для {sym}", show_alert=True)
+                    return
 
                 fee_buffer = 0.001  # 0.1%
 
@@ -322,9 +330,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pos_r = await bybit_call(
                             session.get_positions, category="linear", symbol=sym
                         )
-                        plist = [p for p in pos_r['result']['list'] if float(p['size']) > 0]
+                        plist = [p for p in pos_r['result']['list'] if safe_float(p.get('size')) > 0]
                         if plist:
-                            ep = float(plist[0].get('avgPrice', 0) or 0)
+                            ep = safe_float(plist[0].get('avgPrice'), field='avgPrice')
                             if ep > 0:
                                 entry_price = ep
                                 break

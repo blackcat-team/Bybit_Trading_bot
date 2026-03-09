@@ -10,6 +10,7 @@ from telegram.ext import ContextTypes
 from core.config import ALLOWED_ID
 from core.trading_core import session
 from core.database import get_risk_for_symbol
+from core.utils import safe_float
 from handlers.ui import format_position_card
 from handlers.orders import bybit_call
 
@@ -20,7 +21,7 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
         positions = pos_resp['result']['list']
-        active = [p for p in positions if float(p.get('size', 0)) > 0]
+        active = [p for p in positions if safe_float(p.get('size')) > 0]
 
         raw_orders = await bybit_call(session.get_open_orders, category="linear", settleCoin="USDT")
         all_orders = raw_orders.get('result', {}).get('list', [])
@@ -49,7 +50,7 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
         for p in active:
-            sym, pnl, side = p['symbol'], float(p['unrealisedPnl']), p['side']
+            sym, pnl, side = p['symbol'], safe_float(p.get('unrealisedPnl')), p['side']
             trade_risk = get_risk_for_symbol(sym)
             current_r = pnl / trade_risk if trade_risk else None
 

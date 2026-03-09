@@ -160,18 +160,6 @@ if __name__ == '__main__':
         exc = context.error
         if _is_polling_error(exc):
             logging.warning("PTB polling transport error: %s", exc)
-            try:
-                from core.notifier import send_alert
-                safe_msg = _html.escape(str(exc)[:200])
-                await send_alert(
-                    context.bot, ALLOWED_ID,
-                    level="WARNING", alert_class="TIMEOUT",
-                    msg=f"PTB polling network error:\n<code>{safe_msg}</code>",
-                    dedup_key="ptb_polling_neterr",
-                    cooldown_sec=1800,
-                )
-            except Exception:
-                pass
             return
         logging.error("Unhandled PTB exception: %s", exc, exc_info=exc)
         try:

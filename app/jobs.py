@@ -14,15 +14,16 @@ from telegram.ext import ContextTypes
 
 
 from core.config import ALLOWED_ID, ORDER_TIMEOUT_DAYS
-from core.database import is_trading_enabled, get_risk_for_symbol, RISK_MAPPING
+from core.database import is_trading_enabled, get_risk_for_symbol, RISK_MAPPING, get_source_at_time
 from core.trading_core import session
 from core.bybit_call import bybit_call
 from core.notifier import send_alert, classify_error, WARNING, FAIL_CLOSED, TIMEOUT
 from core.journal import (
     append_event, read_events, CLOSED,
-    compute_source_stats, check_and_quarantine_sources,
+    check_and_quarantine_sources,
     get_disabled_sources,
 )
+from core.utils import safe_float
 
 # Засекаем время старта
 START_TIME = time.time()
@@ -37,8 +38,8 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         _pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
         positions = _pos_resp['result']['list']
-        total_pnl = sum(float(p['unrealisedPnl']) for p in positions if float(p['size']) > 0)
-        active_count = len([p for p in positions if float(p['size']) > 0])
+        total_pnl = sum(safe_float(p.get('unrealisedPnl')) for p in positions if safe_float(p.get('size')) > 0)
+        active_count = len([p for p in positions if safe_float(p.get('size')) > 0])
         pnl_str = f" | 💰 Open PnL: {total_pnl:+.2f}$ ({active_count} deals)"
     except Exception:
         pnl_str = ""
@@ -59,15 +60,19 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         _pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
         positions = _pos_resp['result']['list']
-        active = [p for p in positions if float(p['size']) > 0]
+        active = [p for p in positions if safe_float(p.get('size'), field='size') > 0]
 
         for p in active:
             sym = p['symbol']
             side = p['side']
-            entry = float(p['avgPrice'])
-            current_price = float(p['markPrice'])
-            current_sl = float(p.get('stopLoss', 0))
-            qty = float(p['size'])
+            entry = safe_float(p.get('avgPrice'), field='avgPrice')
+            current_price = safe_float(p.get('markPrice'), field='markPrice')
+            current_sl = safe_float(p.get('stopLoss'), field='stopLoss')
+            qty = safe_float(p.get('size'), field='size')
+
+            # Без входа или текущей цены трейлить невозможно
+            if entry <= 0 or current_price <= 0 or qty <= 0:
+                continue
 
             # Без стопа трейлить нечего
             if current_sl == 0: continue
@@ -184,7 +189,7 @@ async def auto_cleanup_orders_job(context: ContextTypes.DEFAULT_TYPE):
 
         for o in orders:
             # Не трогаем TP/SL (они ReduceOnly) и рыночные
-            if float(o.get('price', 0)) == 0: continue
+            if safe_float(o.get('price')) == 0: continue
             if o.get('reduceOnly', False): continue
 
             created_time = int(o['createdTime'])
@@ -219,8 +224,9 @@ async def daily_balance_job(context: ContextTypes.DEFAULT_TYPE):
     """Каждое утро (в 9:00 UTC) присылает баланс."""
     try:
         wallet = await bybit_call(session.get_wallet_balance, accountType="UNIFIED", coin="USDT")
-        equity = float(wallet['result']['list'][0]['totalEquity'])
-        pnl = float(wallet['result']['list'][0]['totalPerpUPL'])
+        acct = wallet['result']['list'][0]
+        equity = safe_float(acct.get('totalEquity'), field='totalEquity')
+        pnl = safe_float(acct.get('totalPerpUPL'), field='totalPerpUPL')
 
         msg = f"🌅 <b>Утро:</b>\n💵 Баланс: {equity:.2f}$\n📊 PnL (нереализ.): {pnl:.2f}$"
         await context.bot.send_message(chat_id=ALLOWED_ID, text=msg, parse_mode='HTML')
@@ -249,7 +255,7 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
         # 1. Получаем все позиции
         _pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
         positions = _pos_resp['result']['list']
-        active_positions = [p for p in positions if float(p['size']) > 0]
+        active_positions = [p for p in positions if safe_float(p.get('size')) > 0]
 
         if not active_positions:
             return
@@ -260,18 +266,9 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
         for p in active_positions:
             sym = p['symbol']
             side = p['side']
-            entry_price = float(p['avgPrice'])
-
-            # --- Безопасное получение Stop Loss ---
-            sl_raw = p.get('stopLoss', '')
-            # Если строка пустая или None -> считаем 0.0
-            if sl_raw and sl_raw != "":
-                stop_loss = float(sl_raw)
-            else:
-                stop_loss = 0.0
-            # -------------------------------------------
-
-            pnl = float(p['unrealisedPnl'])
+            entry_price = safe_float(p.get('avgPrice'), field='avgPrice')
+            stop_loss = safe_float(p.get('stopLoss'), field='stopLoss')
+            pnl = safe_float(p.get('unrealisedPnl'), field='unrealisedPnl')
 
             # --- Получаем реальное время сделки ---
             start_dt = None
@@ -368,7 +365,7 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
             session.get_positions, category="linear", settleCoin="USDT"
         )
         open_syms = {
-            p["symbol"] for p in _pos_resp["result"]["list"] if float(p.get("size", 0)) > 0
+            p["symbol"] for p in _pos_resp["result"]["list"] if safe_float(p.get("size")) > 0
         }
 
         # Символы, которые мы отслеживаем, но позиции по ним уже нет
@@ -401,11 +398,10 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 t = trades[0]
-                pnl_usdt = float(t.get("closedPnl", 0))
+                pnl_usdt = safe_float(t.get("closedPnl"), field="closedPnl")
                 risk_usd = get_risk_for_symbol(sym) or 1.0
                 r_val = pnl_usdt / risk_usd if risk_usd > 0 else 0.0
 
-                from core.database import get_source_at_time
                 close_ts = int(t.get("updatedTime", time.time() * 1000))
                 src = get_source_at_time(sym, close_ts)
 
@@ -415,10 +411,10 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
                     "side": t.get("side", ""),
                     "source_tag": src,
                     "planned_risk_usdt": risk_usd,
-                    "qty": float(t.get("qty", 0)),
-                    "entry": float(t.get("avgEntryPrice", 0)),
+                    "qty": safe_float(t.get("qty"), field="qty"),
+                    "entry": safe_float(t.get("avgEntryPrice"), field="avgEntryPrice"),
                     "stop": 0.0,
-                    "exit": float(t.get("avgExitPrice", 0)),
+                    "exit": safe_float(t.get("avgExitPrice"), field="avgExitPrice"),
                     "pnl_usdt": pnl_usdt,
                     "R": round(r_val, 2),
                     "hold_time_sec": 0,
@@ -473,12 +469,40 @@ async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
 
     Запускается каждый понедельник в 09:00 UTC через механизм самоперепланирования
     (run_once + finally), чтобы избежать PTBUserWarning от run_daily(days=).
+
+    Источник данных — Bybit get_closed_pnl (как /report), а не локальный журнал.
     """
     try:
-        stats = await asyncio.to_thread(compute_source_stats, since_ts=time.time() - 7 * 86400)
-        disabled = get_disabled_sources()
+        now = datetime.now(timezone.utc)
+        end_ts = int(now.timestamp() * 1000)
+        start_ts = int((now - timedelta(days=7)).timestamp() * 1000)
 
-        if not stats:
+        # Собираем закрытые сделки за неделю (один 7-дневный чанк, с пагинацией)
+        all_trades: list = []
+        cursor: str = ""
+        pages = 0
+        while True:
+            pages += 1
+            if pages > 50:
+                logging.warning("Weekly report: прервана пагинация (>50 стр.)")
+                break
+            kw: dict = dict(
+                category="linear",
+                startTime=start_ts,
+                endTime=end_ts,
+                limit=100,
+            )
+            if cursor:
+                kw["cursor"] = cursor
+            resp = await bybit_call(session.get_closed_pnl, **kw)
+            page_trades = resp.get("result", {}).get("list", [])
+            all_trades.extend(page_trades)
+            cursor = resp.get("result", {}).get("cursor", "")
+            if not cursor or not page_trades:
+                break
+            await asyncio.sleep(0.1)
+
+        if not all_trades:
             await context.bot.send_message(
                 chat_id=ALLOWED_ID,
                 text="📊 <b>Weekly Source Report:</b>\nNo closed trades this week.",
@@ -486,14 +510,36 @@ async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Агрегация по источникам
+        from core.database import get_global_risk
+        current_risk = get_global_risk()
+        stats: dict = {}  # tag → {pnl, wins, losses}
+        for t in all_trades:
+            sym = t.get("symbol", "")
+            close_ts = int(t.get("updatedTime", 0))
+            pnl = safe_float(t.get("closedPnl"), field="closedPnl")
+            src = get_source_at_time(sym, close_ts) if close_ts else "Unknown"
+
+            entry = stats.setdefault(src, {"pnl": 0.0, "wins": 0, "losses": 0, "count": 0})
+            entry["pnl"] += pnl
+            entry["count"] += 1
+            if pnl > 0:
+                entry["wins"] += 1
+            elif pnl < 0:
+                entry["losses"] += 1
+
+        disabled = get_disabled_sources()
         lines = ["📊 <b>Weekly Source Report</b>"]
-        for tag, s in sorted(stats.items(), key=lambda x: x[1]["total_pnl"], reverse=True):
+        for tag, s in sorted(stats.items(), key=lambda x: x[1]["pnl"], reverse=True):
             status = "⛔ QUARANTINED" if tag in disabled else "✅"
+            total = s["wins"] + s["losses"]
+            wr = (s["wins"] / total * 100) if total > 0 else 0.0
+            r_val = s["pnl"] / current_risk if current_risk > 0 else 0.0
             lines.append(
                 f"\n{status} <b>{tag}</b>\n"
-                f"  PnL: {s['total_pnl']:+.2f}$ | "
-                f"WR: {s['winrate']:.0f}% ({s['wins']}W/{s['losses']}L) | "
-                f"AvgR: {s['avg_r']:+.2f} | Streak: {s['loss_streak']}L"
+                f"  PnL: {s['pnl']:+.2f}$ ({r_val:+.1f}R) | "
+                f"WR: {wr:.0f}% ({s['wins']}W/{s['losses']}L) | "
+                f"Trades: {s['count']}"
             )
 
         await context.bot.send_message(

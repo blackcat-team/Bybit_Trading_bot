@@ -14,6 +14,7 @@ from telegram.ext import ContextTypes
 from core.config import ALLOWED_ID
 from core.trading_core import session
 from core.database import get_global_risk, get_source_at_time
+from core.utils import safe_float
 from handlers.orders import bybit_call
 
 # Максимально допустимый диапазон одного запроса к Bybit (< 7 суток)
@@ -136,8 +137,8 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         for t in all_trades:
             symbol = t['symbol']
-            pnl = float(t['closedPnl'])
-            ts = int(t['updatedTime'])
+            pnl = safe_float(t.get('closedPnl'), field='closedPnl')
+            ts = int(t.get('updatedTime', 0))
             full_date = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M:%S")
             short_date = datetime.fromtimestamp(ts / 1000).strftime("%d.%m")
 

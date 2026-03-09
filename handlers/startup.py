@@ -13,6 +13,7 @@ from telegram.ext import ContextTypes
 from core.config import ALLOWED_ID, DATA_DIR
 from core.trading_core import session
 from core.bybit_call import bybit_call
+from core.utils import safe_float
 
 STARTUP_MARKER_FILE = DATA_DIR / "startup_last.txt"
 
@@ -43,7 +44,7 @@ async def on_startup_check(context: ContextTypes.DEFAULT_TYPE):
     try:
         pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
         positions = pos_resp['result']['list']
-        active_positions = [p for p in positions if float(p['size']) > 0]
+        active_positions = [p for p in positions if safe_float(p.get('size')) > 0]
 
         if not active_positions:
             logging.info("✅ No active positions found.")
@@ -67,11 +68,7 @@ async def on_startup_check(context: ContextTypes.DEFAULT_TYPE):
             sym = p['symbol']
             side = p['side']
 
-            sl_raw = p.get('stopLoss', '')
-            if sl_raw and sl_raw != "":
-                sl = float(sl_raw)
-            else:
-                sl = 0.0
+            sl = safe_float(p.get('stopLoss'), field='stopLoss')
 
             tp_orders = []
             if sym in orders_map:

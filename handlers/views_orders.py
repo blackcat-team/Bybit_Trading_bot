@@ -9,6 +9,7 @@ from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID
 from core.trading_core import session
+from core.utils import safe_float
 from handlers.orders import bybit_call
 from handlers.views_positions import check_positions
 from handlers.ui import format_orders_menu_html, h
@@ -70,7 +71,7 @@ def _has_open_position(positions: list, symbol: str) -> bool:
     Чистый хелпер — без I/O, безопасен для unit-тестов с фиктивными данными.
     """
     return any(
-        p.get('symbol') == symbol and float(p.get('size', 0) or 0) > 0
+        p.get('symbol') == symbol and safe_float(p.get('size')) > 0
         for p in positions
     )
 

@@ -15,6 +15,7 @@ from core.config import (
     DAILY_LOSS_LIMIT, USER_RISK_USD
 )
 from core.bybit_call import bybit_call
+from core.utils import safe_float
 
 # --- 1. Инициализация Сессии Bybit ---
 # Этот объект session мы будем импортировать в другие файлы
@@ -128,16 +129,19 @@ async def place_tp_ladder(symbol):
         # 1. Получаем живую позицию
         _pos_resp = await bybit_call(session.get_positions, category="linear", symbol=symbol)
         positions = _pos_resp['result']['list']
-        my_pos = next((p for p in positions if float(p['size']) > 0), None)
+        my_pos = next((p for p in positions if safe_float(p.get('size')) > 0), None)
 
         if not my_pos:
             return "❌ Позиция не найдена. Сначала войдите в сделку."
 
         # 2. Вытаскиваем реальные данные
-        total_qty = float(my_pos['size'])
-        entry_price = float(my_pos['avgPrice'])
-        stop_loss = float(my_pos.get('stopLoss', 0))
+        total_qty = safe_float(my_pos.get('size'), field='size')
+        entry_price = safe_float(my_pos.get('avgPrice'), field='avgPrice')
+        stop_loss = safe_float(my_pos.get('stopLoss'), field='stopLoss')
         side = my_pos['side']  # "Buy" or "Sell"
+
+        if total_qty <= 0 or entry_price <= 0:
+            return "❌ Не удалось выставить Auto-TPs: отсутствуют данные позиции/стопа."
 
         if stop_loss == 0:
             return "⚠️ В позиции НЕТ Стоп-лосса! Я не могу посчитать 1R."
@@ -162,9 +166,12 @@ async def place_tp_ladder(symbol):
         # 5. Инфо по инструменту
         _info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=symbol)
         info = _info_resp['result']['list'][0]
-        qty_step = float(info['lotSizeFilter']['qtyStep'])
-        min_order_qty = float(info['lotSizeFilter'].get('minOrderQty', qty_step))
-        price_tick = float(info['priceFilter']['tickSize'])
+        qty_step = safe_float(info['lotSizeFilter'].get('qtyStep'), field='qtyStep')
+        min_order_qty = safe_float(info['lotSizeFilter'].get('minOrderQty', qty_step), field='minOrderQty')
+        price_tick = safe_float(info['priceFilter'].get('tickSize'), field='tickSize')
+
+        if qty_step <= 0 or price_tick <= 0:
+            return "❌ Не удалось выставить Auto-TPs: отсутствуют данные позиции/стопа."
 
         # Округляем цены целей
         for k in targets:

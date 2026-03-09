@@ -7,18 +7,12 @@ import math
 import logging
 
 from core.config import MARGIN_BUFFER_USD, MARGIN_BUFFER_PCT
+from core.utils import safe_float
 
 
 def _safe_float(val, default: float = 0.0) -> float:
     """Безопасная конвертация значения из API (может быть '', None, число)."""
-    if val is None:
-        return default
-    if isinstance(val, str) and val.strip() == "":
-        return default
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return default
+    return safe_float(val, default)
 
 
 def get_available_usd(account_data: dict) -> tuple:
