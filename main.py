@@ -13,8 +13,8 @@ from colorama import init, Fore, Style
 from telegram.request import HTTPXRequest
 
 # Импорты из наших модулей
-from core.config import TELEGRAM_TOKEN, USER_RISK_USD, IS_DEMO, ALLOWED_ID
-from core.database import init_db
+from core.config import TELEGRAM_TOKEN, IS_DEMO, ALLOWED_ID
+from core.database import get_global_risk, init_db
 from core.trading_core import session
 from handlers import (
     start_trading, stop_trading, check_positions,
@@ -97,7 +97,7 @@ def print_startup_banner():
         print(f"💰 Balance: {equity:.2f} USDT")
         print(f"📊 Active Positions: {len(active_pos)}")
         print(f"📋 Open Orders: {len(orders)}")
-        print(f"{Fore.GREEN}{Style.BRIGHT}✅ Bot Ready. Risk: ${USER_RISK_USD}.{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{Style.BRIGHT}✅ Bot Ready. Risk: ${get_global_risk():g}.{Style.RESET_ALL}")
 
     except Exception as e:
         print(f"{Fore.RED}❌ Startup Info Error: {e}{Style.RESET_ALL}")
@@ -105,24 +105,41 @@ def print_startup_banner():
 
 # --- 3. Запуск ---
 if __name__ == '__main__':
-    # Сначала показываем баннер
-    print_startup_banner()
-
-    # Загружаем базу
+    # Загружаем базу до чтения persistent settings в баннере
     init_db()
 
+    # Затем показываем баннер
+    print_startup_banner()
+
     # --- 🔥 НАСТРОЙКА СЕТИ ---
-    # Делаем бота более терпимым к лагам телеграма (таймауты по 20 сек)
-    req = HTTPXRequest(
+    # Обычные Telegram Bot API requests
+    api_request = HTTPXRequest(
         connection_pool_size=8,
         read_timeout=20.0,
         write_timeout=20.0,
         connect_timeout=20.0,
-        pool_timeout=20.0
+        pool_timeout=20.0,
+        http_version="1.1"
     )
 
-    # Строим бота с новыми настройками сети
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).request(req).build()
+    # Отдельный transport для long polling getUpdates
+    polling_request = HTTPXRequest(
+        connection_pool_size=1,
+        read_timeout=45.0,
+        write_timeout=20.0,
+        connect_timeout=20.0,
+        pool_timeout=20.0,
+        http_version="1.1"
+    )
+
+    # Строим бота с отдельными настройками обычных запросов и getUpdates
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .request(api_request)
+        .get_updates_request(polling_request)
+        .build()
+    )
     # Подключаем нотификатор алертов, чтобы bybit_call мог отправлять владельцу алерты без контекста
     configure_alerts(app.bot, ALLOWED_ID)
     # ---------------------------------------------
@@ -140,25 +157,40 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), parse_and_trade))
 
-    def _is_polling_error(exc: Exception) -> bool:
-        """Возвращает True для транспортных ошибок PTB-поллинга (шумные, неактивные)."""
+    def _has_updater_polling_traceback(exc) -> bool:
+        """Проверяет происхождение traceback из getUpdates loop PTB 20.8."""
+        traceback = exc.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            module = frame.f_globals.get("__name__", "")
+            filename = frame.f_code.co_filename.replace("\\", "/")
+            if (
+                (module == "telegram.ext._updater" or filename.endswith("/telegram/ext/_updater.py"))
+                and frame.f_code.co_name == "polling_action_cb"
+            ):
+                return True
+            traceback = traceback.tb_next
+        return False
+
+    def _is_polling_error(update, context) -> bool:
+        """Возвращает True только для подтверждённых ошибок getUpdates polling."""
+        if (
+            update is not None
+            or getattr(context, "job", None) is not None
+            or getattr(context, "coroutine", None) is not None
+        ):
+            return False
+        exc = context.error
         try:
             from telegram.error import NetworkError
-            if isinstance(exc, NetworkError):
-                return True
         except ImportError:
-            pass
-        exc_type = type(exc).__name__
-        exc_module = getattr(type(exc), "__module__", "") or ""
-        return (
-            exc_type in ("ReadError", "ConnectError", "TimeoutException", "PoolTimeout")
-            and ("httpx" in exc_module or "httpcore" in exc_module)
-        )
+            return False
+        return isinstance(exc, NetworkError) and _has_updater_polling_traceback(exc)
 
     async def _ptb_error_handler(update, context):
         import html as _html
         exc = context.error
-        if _is_polling_error(exc):
+        if _is_polling_error(update, context):
             logging.warning("PTB polling transport error: %s", exc)
             return
         logging.error("Unhandled PTB exception: %s", exc, exc_info=exc)
@@ -173,7 +205,7 @@ if __name__ == '__main__':
                 cooldown_sec=300,
             )
         except Exception:
-            pass
+            logging.exception("Не удалось отправить PTB alert")
     app.add_error_handler(_ptb_error_handler)
 
     print(f"{Fore.GREEN}{Style.BRIGHT}🤖 Бот запущен.{Style.RESET_ALL}")
@@ -211,4 +243,4 @@ if __name__ == '__main__':
     # ----------------------------------------
 
     # Запуск бота
-    app.run_polling()
+    app.run_polling(timeout=30)
