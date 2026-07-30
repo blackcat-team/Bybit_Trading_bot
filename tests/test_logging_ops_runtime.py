@@ -1,5 +1,6 @@
 import logging
 import os
+from collections import Counter
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -206,17 +207,92 @@ def test_negative_coin_fallback_is_not_success_info(caplog):
     )
 
 
-def test_systemd_journal_identity_and_baseline_launch_paths():
+def test_systemd_unit_matches_production_deployment_contract():
     unit_path = Path(__file__).resolve().parents[1] / "deploy" / "bybit-bot.service"
-    lines = [
-        line.strip()
-        for line in unit_path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    sections = {}
+    current_section = None
 
-    assert "[Service]" in lines
-    assert lines.count("StandardOutput=journal") == 1
-    assert lines.count("StandardError=journal") == 1
-    assert lines.count("SyslogIdentifier=bybit-trading-bot") == 1
-    assert lines.count("ExecStart=/opt/bybit-bot/.venv/bin/python main.py") == 1
-    assert lines.count("EnvironmentFile=/opt/bybit-bot/.env") == 1
+    for raw_line in unit_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_section = line[1:-1]
+            assert current_section not in sections
+            sections[current_section] = []
+            continue
+
+        assert current_section is not None
+        key, separator, value = line.partition("=")
+        assert separator == "="
+        sections[current_section].append((key, value))
+
+    expected_directives = {
+        "Unit": {
+            "Description=Bybit Trading Telegram Bot",
+            "Wants=network-online.target",
+            "After=network-online.target",
+        },
+        "Service": {
+            "Type=simple",
+            "User=hermes",
+            "Group=hermes",
+            "WorkingDirectory=/home/hermes/Bybit_Trading_bot",
+            "ExecStart=/home/hermes/Bybit_Trading_bot/.venv/bin/python -u /home/hermes/Bybit_Trading_bot/main.py",
+            "Environment=PYTHONUNBUFFERED=1",
+            "Environment=PYTHONDONTWRITEBYTECODE=1",
+            "Restart=on-failure",
+            "RestartSec=10",
+            "TimeoutStopSec=30",
+            "KillSignal=SIGTERM",
+            "UMask=0077",
+            "NoNewPrivileges=true",
+            "PrivateTmp=true",
+            "StandardOutput=journal",
+            "StandardError=journal",
+            "SyslogIdentifier=bybit-trading-bot",
+        },
+        "Install": {"WantedBy=multi-user.target"},
+    }
+    assert set(sections) == set(expected_directives)
+
+    for section, directives in sections.items():
+        keys = [key for key, _ in directives]
+        repeated_keys = {
+            key for key, count in Counter(keys).items() if count > 1
+        }
+        allowed_repeated_keys = {"Environment"} if section == "Service" else set()
+        assert repeated_keys <= allowed_repeated_keys
+
+        normalized_directives = [
+            f"{key}={value}" for key, value in directives
+        ]
+        assert not [
+            directive
+            for directive, count in Counter(normalized_directives).items()
+            if count > 1
+        ]
+        assert set(normalized_directives) == expected_directives[section]
+
+    service = dict(sections["Service"])
+
+    assert service["Type"] == "simple"
+    assert service["User"] == "hermes"
+    assert service["Group"] == "hermes"
+    assert service["WorkingDirectory"] == "/home/hermes/Bybit_Trading_bot"
+    assert service["ExecStart"] == (
+        "/home/hermes/Bybit_Trading_bot/.venv/bin/python -u "
+        "/home/hermes/Bybit_Trading_bot/main.py"
+    )
+    assert service["StandardOutput"] == "journal"
+    assert service["StandardError"] == "journal"
+    assert service["SyslogIdentifier"] == "bybit-trading-bot"
+    assert service["Restart"] == "on-failure"
+    assert service["RestartSec"] == "10"
+    assert service["TimeoutStopSec"] == "30"
+    unit_text = unit_path.read_text(encoding="utf-8")
+    assert "/opt/bybit-bot" not in unit_text
+    assert "botuser" not in unit_text
+    assert "RestartMode" not in unit_text
+    assert "StartLimitIntervalSec" not in unit_text
+    assert "EnvironmentFile" not in unit_text
