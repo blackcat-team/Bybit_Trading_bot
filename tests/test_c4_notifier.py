@@ -148,6 +148,61 @@ class TestSendAlert:
         assert "Hello" in last["msg"]
 
     @pytest.mark.asyncio
+    async def test_last_alert_stores_only_sanitized_operator_text(self):
+        n = _fresh_notifier()
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        raw = (
+            "Краткая причина\n"
+            "Traceback (most recent call last):\n"
+            '  File "worker.py", line 10, in run\n'
+            "RuntimeError: api_secret=SUPERSECRET"
+        )
+
+        await n.send_alert(
+            bot, "123", "ERROR", n.WARNING, raw, "sanitized_last", cooldown_sec=0
+        )
+
+        saved = n.get_last_alert()["msg"]
+        assert saved == "Краткая причина"
+        assert "Traceback" not in saved
+        assert 'File "worker.py"' not in saved
+        assert "SUPERSECRET" not in saved
+
+    @pytest.mark.asyncio
+    async def test_safe_alert_text_is_preserved_and_html_escaped_for_send(self):
+        n = _fresh_notifier()
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+
+        await n.send_alert(
+            bot, "123", "WARNING", n.WARNING,
+            "Цена < лимита & требует проверки",
+            "safe_text", cooldown_sec=0,
+        )
+
+        assert n.get_last_alert()["msg"] == "Цена < лимита & требует проверки"
+        sent = bot.send_message.call_args.kwargs["text"]
+        assert "Цена &lt; лимита &amp; требует проверки" in sent
+
+    def test_sanitizer_masks_supported_secret_shapes(self):
+        n = _fresh_notifier()
+        samples = [
+            "api_key=SUPERSECRET",
+            "api_secret: SUPERSECRET",
+            "token=SUPERSECRET",
+            "Authorization: Bearer SUPERSECRET",
+            "Bearer SUPERSECRET",
+            "telegram_token=SUPERSECRET",
+            "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
+        ]
+        for raw in samples:
+            cleaned = n.sanitize_operator_text(raw)
+            assert "SUPERSECRET" not in cleaned
+            assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ" not in cleaned
+            assert "REDACTED" in cleaned
+
+    @pytest.mark.asyncio
     async def test_html_format_contains_class(self):
         """Alert text sent to Telegram must include the alert class."""
         n = _fresh_notifier()

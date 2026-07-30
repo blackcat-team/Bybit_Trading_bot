@@ -23,7 +23,12 @@ from core.database import (
 
 from handlers.preflight import clip_qty, validate_qty, get_available_usd
 from handlers.orders import set_leverage_safe, place_limit_order, bybit_call
-from handlers.ui import format_market_signal, format_limit_signal
+from handlers.ui import (
+    format_error_message,
+    format_limit_signal,
+    format_market_signal,
+    format_warning_message,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -39,9 +44,10 @@ def _market_callback(sym: str, side: str, stop_val, qty, lev,
     require_confirm=0: тап немедленно исполняет (режим совместимости).
     """
     if require_confirm:
-        return ("👁 PREVIEW TRADE",
+        return ("📋 Preview",
                 f"mkt_preview|{sym}|{side}|{stop_val}|{qty}|{lev}")
-    return ("⚡️ GO MARKET",
+    action = "Купить" if side == "LONG" else "Продать"
+    return (f"✅ {action} Market",
             f"buy_market|{sym}|{side}|{stop_val}|{qty}|{lev}")
 
 
@@ -155,7 +161,12 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         can_trade, pnl_today = await bybit_call(check_daily_limit)
         if not can_trade:
             await update.message.reply_text(
-                f"⛔️ <b>ЛИМИТ!</b>\nУбыток: {pnl_today:.2f}$.", parse_mode='HTML'
+                format_warning_message(
+                    [f"Дневной PnL достиг лимита: {pnl_today:.2f} USDT."],
+                    action="торговля заблокирована до сброса дневного лимита",
+                    blocked=True,
+                ),
+                parse_mode='HTML',
             )
             try:
                 await send_alert(
@@ -184,7 +195,11 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ── Source quarantine check ────────────────────────────────────────
         if not is_source_enabled(source_tag):
             await update.message.reply_text(
-                f"⛔ <b>Source quarantined:</b> {source_tag}. New signals from this source are blocked.",
+                format_warning_message(
+                    [f"Источник {source_tag} находится в карантине."],
+                    action="используйте разрешённый источник сигнала",
+                    blocked=True,
+                ),
                 parse_mode='HTML',
             )
             return
@@ -197,7 +212,11 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not ticker_list:
                 logging.warning(f"⚠️ Symbol {sym} not found on Bybit.")
                 await update.message.reply_text(
-                    f"❓ <b>Неизвестная монета:</b> Пара {sym} не найдена на Bybit.",
+                    format_error_message(
+                        "Инструмент не найден на Bybit.",
+                        context=sym,
+                        action="проверьте символ и отправьте новый сигнал",
+                    ),
                     parse_mode='HTML',
                 )
                 return
@@ -214,7 +233,10 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif entry_val is None:
             # is_market=False и entry_val=None → пользователь не указал цену и нет MARKET
             await update.message.reply_text(
-                "⚠️ <b>ОШИБКА:</b> Не указана цена входа! Добавьте 0 или MARKET.",
+                format_error_message(
+                    "Не указана цена входа.",
+                    action="добавьте цену, 0 или Market и отправьте сигнал заново",
+                ),
                 parse_mode='HTML',
             )
             return
@@ -228,7 +250,12 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 side == "SHORT" and stop_val <= entry_price
             ):
                 await update.message.reply_text(
-                    f"⚠️ <b>ОШИБКА:</b> SL ({stop_val}) противоречит {side}!",
+                    format_error_message(
+                        "SL противоречит направлению сигнала.",
+                        context=f"{sym} · {side}",
+                        detail=f"SL: {stop_val}",
+                        action="исправьте SL и отправьте новый сигнал",
+                    ),
                     parse_mode='HTML',
                 )
                 return
@@ -241,7 +268,13 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conflict_action, conflict_reason = await resolve_signal_conflict(sym, side)
         if conflict_action == "block":
             await update.message.reply_text(
-                f"⛔ <b>КОНФЛИКТ {sym}:</b> {conflict_reason}", parse_mode='HTML'
+                format_warning_message(
+                    [conflict_reason],
+                    context=f"{sym} · {side}",
+                    action="проверьте текущую позицию и открытые ордера",
+                    blocked=True,
+                ),
+                parse_mode='HTML',
             )
             try:
                 await send_alert(
@@ -254,7 +287,12 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         elif conflict_action == "ignore":
             await update.message.reply_text(
-                f"⚠️ <b>ИГНОР {sym}:</b> {conflict_reason}", parse_mode='HTML'
+                format_warning_message(
+                    [conflict_reason],
+                    context=f"{sym} · {side}",
+                    action="дождитесь изменения текущей позиции",
+                ),
+                parse_mode='HTML',
             )
             return
         # "allow" или "add" → продолжаем обычный поток
@@ -265,7 +303,15 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lev = 5 if diff_pct <= 8 else 3 if diff_pct <= 12 else 1
 
         if diff_pct > 15:
-            await update.message.reply_text(f"⛔️ Стоп {diff_pct:.1f}% слишком большой.")
+            await update.message.reply_text(
+                format_warning_message(
+                    [f"Расстояние до SL {diff_pct:.1f}% превышает допустимое."],
+                    context=f"{sym} · {side}",
+                    action="уменьшите расстояние до SL и отправьте сигнал заново",
+                    blocked=True,
+                ),
+                parse_mode='HTML',
+            )
             return
 
         pos_usd = current_risk / (diff_pct / 100)
@@ -305,17 +351,26 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if reason == "REJECT":
                 await update.message.reply_text(
-                    f"❌ <b>Недостаточно маржи</b> даже на мин. лот ({min_order_qty}).\n"
-                    f"Доступно: {available_usd:.1f}$",
+                    format_error_message(
+                        "Недостаточно маржи даже для минимального лота.",
+                        context=f"{sym} · {side}",
+                        detail=f"Мин. лот: {min_order_qty}; доступно: {available_usd:.1f} USDT",
+                        action="уменьшите риск или пополните доступную маржу",
+                    ),
                     parse_mode='HTML',
                 )
                 return
 
             if reason == "CLIPPED":
                 await update.message.reply_text(
-                    f"⚠️ <b>Корректировка объема!</b>\n"
-                    f"Доступно: {available_usd:.1f}$\n"
-                    f"✂️ Режем: {details['desired_qty']} ➔ {qty}",
+                    format_warning_message(
+                        [
+                            f"Объём уменьшен: {details['desired_qty']} → {qty}.",
+                            f"Доступная маржа: {available_usd:.1f} USDT.",
+                        ],
+                        context=f"{sym} · {side}",
+                        action="проверьте скорректированный объём",
+                    ),
                     parse_mode='HTML',
                 )
 
@@ -324,7 +379,11 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Preflight critical error for {sym}: {e}")
             await update.message.reply_text(
-                "❌ <b>Ошибка проверки баланса.</b> Повторите сигнал.",
+                format_error_message(
+                    "Не удалось проверить доступную маржу.",
+                    context=f"{sym} · {side}",
+                    action="повторите отправку сигнала позже",
+                ),
                 parse_mode='HTML',
             )
             return
@@ -343,8 +402,12 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not heat_allowed:
             action_word = "В очереди" if heat_reason.startswith("queued") else "Отклонено"
             await update.message.reply_html(
-                f"⛔ <b>{action_word} (Heat limit):</b> {sym}\n"
-                f"<i>Увеличьте MAX_TOTAL_HEAT_USDT или дождитесь закрытия позиций.</i>"
+                format_warning_message(
+                    [f"{action_word}: превышен лимит Heat."],
+                    context=f"{sym} · {side}",
+                    action="дождитесь снижения Heat или проверьте лимит риска",
+                    blocked=True,
+                )
             )
             return
 
@@ -352,7 +415,8 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Сохраняем риск+источник в памяти; на диск записываем только после успешного GO MARKET.
             set_market_pending(sym, current_risk, source_tag)
             msg = format_market_signal(
-                sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag
+                sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
+                risk_usd=current_risk,
             )
             btn_label, cb_data = _market_callback(
                 sym, side, stop_val, qty, effective_lev, REQUIRE_MARKET_CONFIRM
@@ -361,9 +425,10 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
         else:
             msg = format_limit_signal(
-                sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag
+                sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
+                risk_usd=current_risk,
             )
-            kb = [[InlineKeyboardButton("🎯 SET AUTO-TPs", callback_data=f"set_tps|{sym}")]]
+            kb = [[InlineKeyboardButton("🎯 Настроить TP", callback_data=f"set_tps|{sym}")]]
             await bybit_call(place_limit_order, sym, side, qty, entry_price, stop_val)
             # Записываем риск+источник на диск только после успешного размещения лимитного ордера.
             await asyncio.to_thread(update_risk_for_symbol, sym, current_risk)
@@ -381,4 +446,10 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Trade Error: {e}")
-        await update.message.reply_text(f"🔥 Ошибка: {e}")
+        await update.message.reply_text(
+            format_error_message(
+                "Не удалось обработать торговый сигнал.",
+                action="проверьте сигнал и повторите попытку",
+            ),
+            parse_mode='HTML',
+        )

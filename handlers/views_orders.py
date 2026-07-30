@@ -12,7 +12,13 @@ from core.trading_core import session
 from core.utils import safe_float
 from handlers.orders import bybit_call
 from handlers.views_positions import check_positions
-from handlers.ui import format_orders_menu_html, h
+from handlers.ui import (
+    format_error_message,
+    format_header,
+    format_orders_list_html,
+    format_orders_menu_html,
+    h,
+)
 
 
 async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -27,14 +33,17 @@ async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_orders = [o for o in orders if not o.get('reduceOnly')]
 
         if not active_orders:
-            text = "📭 <b>Нет активных ордеров на вход.</b>"
+            text = (
+                f"{format_header('📋', 'ORDERS')}\n\n"
+                f"ℹ️ Активных ордеров на вход нет."
+            )
             if update.callback_query:
                 await msg_obj.edit_text(text, parse_mode='HTML')
             else:
                 await msg_obj.reply_html(text)
             return
 
-        msg_text = f"📋 <b>Ордера на вход ({len(active_orders)}):</b>\n\n"
+        msg_text = format_orders_list_html(active_orders)
         keyboard = []
 
         for o in active_orders:
@@ -44,15 +53,12 @@ async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             qty  = o['qty']
             oid  = o['orderId']
 
-            icon = "🟢" if side == "Buy" else "🔴"
-            msg_text += f"{icon} <b>{h(sym)}</b> {h(side)} @ {h(price)}\n"
-
             btn_text = f"❌ {sym} {price}"
             cb_data = f"cancel_o|{sym}|{oid}|list"
             keyboard.append([InlineKeyboardButton(btn_text, callback_data=cb_data)])
 
         keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data="refresh_orders")])
-        keyboard.append([InlineKeyboardButton("🗑 CANCEL ALL", callback_data="cancel_all_orders")])
+        keyboard.append([InlineKeyboardButton("⛔ Отменить все", callback_data="cancel_all_orders")])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -63,6 +69,14 @@ async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Orders error: {e}")
+        error_msg = format_error_message(
+            "Не удалось получить открытые ордера.",
+            action="проверьте открытые ордера вручную на Bybit",
+        )
+        if update.callback_query:
+            await msg_obj.edit_text(error_msg, parse_mode='HTML')
+        else:
+            await msg_obj.reply_html(error_msg)
 
 
 def _has_open_position(positions: list, symbol: str) -> bool:
@@ -106,10 +120,10 @@ async def view_symbol_orders(update: Update, context: ContextTypes.DEFAULT_TYPE,
             price = o['price']
             oid   = o['orderId']
             cb_data = f"cancel_o|{symbol}|{oid}|sym"
-            keyboard.append([InlineKeyboardButton(f"❌ Cancel {price}", callback_data=cb_data)])
+            keyboard.append([InlineKeyboardButton(f"❌ Отменить {price}", callback_data=cb_data)])
 
         if has_position:
-            keyboard.append([InlineKeyboardButton(f"❌ Close Market {symbol}", callback_data=f"close_confirm|{symbol}")])
+            keyboard.append([InlineKeyboardButton(f"⛔ Закрыть Market {symbol}", callback_data=f"close_confirm|{symbol}")])
         keyboard.append([InlineKeyboardButton("🔙 Назад к позициям", callback_data="back_to_pos")])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -117,3 +131,11 @@ async def view_symbol_orders(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     except Exception as e:
         logging.error(f"Symbol orders error: {e}")
+        await msg_obj.edit_text(
+            format_error_message(
+                "Не удалось получить ордера по инструменту.",
+                context=symbol,
+                action="проверьте ордера вручную на Bybit",
+            ),
+            parse_mode='HTML',
+        )

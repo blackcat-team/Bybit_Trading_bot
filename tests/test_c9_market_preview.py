@@ -25,6 +25,15 @@ for _mod in [
     sys.modules.setdefault(_mod, MagicMock())
 
 import os
+
+# Process-only stubs must exist before the first production import. ``dotenv`` is
+# mocked above, so core.config cannot read a workspace .env in this test process.
+os.environ.setdefault("TELEGRAM_TOKEN", "test-telegram-token")
+os.environ.setdefault("BYBIT_API_KEY", "test-bybit-key")
+os.environ.setdefault("BYBIT_API_SECRET", "test-bybit-secret")
+os.environ.setdefault("ALLOWED_TELEGRAM_ID", "123")
+os.environ.setdefault("IS_DEMO", "True")
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest  # noqa: E402
@@ -65,7 +74,7 @@ class TestFormatMarketPreview:
 
     def test_contains_side_and_lev(self):
         out = self._preview()
-        assert "LONG" in out
+        assert "Long" in out
         assert "x5" in out
 
     def test_contains_entry_price(self):
@@ -79,25 +88,23 @@ class TestFormatMarketPreview:
 
     def test_contains_risk_and_notional(self):
         out = self._preview()
-        assert "50.00$" in out
-        assert "500.0$" in out
+        assert "50.00 USDT" in out
+        assert "500.00 USDT" in out
 
     def test_contains_source(self):
         assert "#Manual" in self._preview()
 
     def test_contains_heat_values(self):
         out = self._preview(heat_after=150.0, max_heat=500.0)
-        assert "150.0$" in out
-        assert "500.0$" in out
+        assert "150.0 / 500.0 USDT" in out
 
     def test_heat_disabled_when_max_zero(self):
         out = self._preview(heat_after=0.0, max_heat=0)
-        assert "disabled" in out
+        assert "отключён" in out
 
     def test_contains_confirm_instructions(self):
         out = self._preview()
-        assert "CONFIRM" in out
-        assert "CANCEL" in out
+        assert "подтвердите или отмените вход" in out
 
 
 # ── Tests: _market_callback helper ────────────────────────────────────────────
@@ -115,7 +122,7 @@ class TestMarketCallback:
 
     def test_confirm_off_label(self):
         label, _ = self._cb(require_confirm=0)
-        assert "GO MARKET" in label
+        assert "Купить Market" in label
 
     def test_confirm_off_callback_data(self):
         _, cb = self._cb(require_confirm=0)
@@ -124,7 +131,7 @@ class TestMarketCallback:
 
     def test_confirm_on_label(self):
         label, _ = self._cb(require_confirm=1)
-        assert "PREVIEW" in label
+        assert "Preview" in label
 
     def test_confirm_on_callback_data(self):
         _, cb = self._cb(require_confirm=1)
@@ -139,6 +146,7 @@ class TestMarketCallback:
         assert len(parts) == 6
         assert parts[1] == "ETHUSDT"
         assert parts[2] == "SHORT"
+        assert cb == "mkt_preview|ETHUSDT|SHORT|3100|1.0|3"
 
     def test_confirm_off_encodes_all_parts(self):
         _, cb = self._cb(sym="SOLUSDT", side="LONG", stop_val=120,
@@ -147,6 +155,7 @@ class TestMarketCallback:
         # buy_market|sym|side|stop|qty|lev
         assert len(parts) == 6
         assert parts[1] == "SOLUSDT"
+        assert cb == "buy_market|SOLUSDT|LONG|120|10.0|5"
 
 
 # ── Tests: _preview_is_fresh ──────────────────────────────────────────────────

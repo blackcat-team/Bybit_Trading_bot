@@ -138,13 +138,13 @@ class TestFormatLimitSignal:
         assert "HYPEUSDT" in self._make()
 
     def test_contains_limit_label(self):
-        assert "LIMIT" in self._make()
+        assert "Limit" in self._make()
 
     def test_long_icon_present(self):
-        assert "🟢" in self._make(side="LONG")
+        assert "Long" in self._make(side="LONG")
 
     def test_short_icon_present(self):
-        assert "🔴" in self._make(side="SHORT")
+        assert "Short" in self._make(side="SHORT")
 
     def test_trimmed_entry_price(self):
         # 29.95 → "29.95" (не "29.950000")
@@ -163,20 +163,20 @@ class TestFormatLimitSignal:
         assert "0.81000000" not in msg
 
     def test_notional_two_decimals(self):
-        # 24.2595 → "24.26$"
+        # 24.2595 → "24.26 USDT"
         msg = self._make(pos_value_usd=24.2595)
-        assert "24.26$" in msg
+        assert "24.26 USDT" in msg
 
     def test_sl_pct_negative(self):
-        # entry=29.95, sl=27.5: -abs(27.5-29.95)/29.95*100 ≈ -8.18%
+        # entry=29.95, sl=27.5: abs(27.5-29.95)/29.95*100 ≈ 8.18%
         msg = self._make()
-        assert "-8.18%" in msg
+        assert "8.18%" in msg
 
     def test_source_tag(self):
         assert "#BinanceKillers" in self._make()
 
     def test_separator_present(self):
-        assert "➖" in self._make()
+        assert "<code>" in self._make()
 
 
 # ── format_market_signal ──────────────────────────────────────────────────────
@@ -193,13 +193,13 @@ class TestFormatMarketSignal:
         return format_market_signal(**{**self._DEFAULTS, **kw})
 
     def test_contains_market_label(self):
-        assert "MARKET" in self._make()
+        assert "Market" in self._make()
 
     def test_approx_symbol_is_unicode(self):
-        # В строке Entry должен использоваться символ ≈, а не ~
+        # В строке входа должен использоваться символ ≈, а не ~
         msg = self._make()
         assert "≈" in msg
-        entry_line = next(l for l in msg.splitlines() if "Entry:" in l)
+        entry_line = next(l for l in msg.splitlines() if "Вход:" in l)
         assert "≈" in entry_line
         assert "~" not in entry_line
 
@@ -215,10 +215,10 @@ class TestFormatMarketSignal:
 
     def test_notional_two_decimals(self):
         msg = self._make(pos_value_usd=68.17612)
-        assert "68.18$" in msg
+        assert "68.18 USDT" in msg
 
     def test_short_icon(self):
-        assert "🔴" in self._make(side="SHORT")
+        assert "Short" in self._make(side="SHORT")
 
 
 # ── format_position_card ──────────────────────────────────────────────────────
@@ -227,21 +227,21 @@ class TestFormatPositionCard:
 
     def test_long_side_label(self):
         msg = format_position_card("BTCUSDT", "Buy", 12.34, 0.25)
-        assert "LONG" in msg
-        assert "🟢" in msg
+        assert "Long" in msg
+        assert "POSITIONS" in msg
 
     def test_short_side_label(self):
         msg = format_position_card("ETHUSDT", "Sell", -3.0, -0.1)
-        assert "SHORT" in msg
-        assert "🔴" in msg
+        assert "Short" in msg
+        assert "POSITIONS" in msg
 
     def test_pnl_signed_two_decimals(self):
         msg = format_position_card("XRPUSDT", "Buy", 11.62, 0.5)
-        assert "+11.62$" in msg
+        assert "+11.62 USDT" in msg
 
     def test_pnl_negative_signed(self):
         msg = format_position_card("XRPUSDT", "Sell", -3.0, -0.1)
-        assert "-3.00$" in msg
+        assert "-3.00 USDT" in msg
 
     def test_r_value_shown(self):
         msg = format_position_card("SOLUSDT", "Buy", 10.0, 0.5)
@@ -249,8 +249,7 @@ class TestFormatPositionCard:
 
     def test_r_none_shows_dash(self):
         msg = format_position_card("SOLUSDT", "Buy", 10.0, None)
-        assert "—" in msg
-        assert "R" not in msg.split("PnL:")[1]
+        assert "R:" not in msg
 
     def test_separator_present(self):
-        assert "➖" in format_position_card("X", "Buy", 0.0, None)
+        assert "<code>" in format_position_card("X", "Buy", 0.0, None)

@@ -118,21 +118,31 @@ class TestBuildStatusMsg:
         assert "OFF" in self._make(trading_on=False)
 
     def test_pnl_positive(self):
-        assert "+42.00$" in self._make(daily_pnl=42.0)
+        assert "+42.00 USDT" in self._make(daily_pnl=42.0)
 
     def test_pnl_negative(self):
-        assert "-5.50$" in self._make(daily_pnl=-5.5)
+        assert "-5.50 USDT" in self._make(daily_pnl=-5.5)
 
     def test_pnl_none_shows_na(self):
         assert "N/A" in self._make(daily_pnl=None)
 
     def test_risk_shown(self):
-        assert "75$" in self._make(current_risk=75.0)
+        assert "75.00 USDT" in self._make(current_risk=75.0)
+
+    def test_unified_status_header_and_mode(self):
+        msg = self._make(trading_on=True)
+        assert "BYBIT BOT | STATUS" in msg
+        assert "Trading: ON" in msg
+
+    def test_positions_and_orders_counts_shown(self):
+        msg = self._make(pos_count=2, entry_orders=3)
+        assert "Позиции:" in msg and "2" in msg
+        assert "Ордера:" in msg and "3" in msg
 
     # ── heat display ──────────────────────────────────────────────────────
 
     def test_heat_disabled_when_max_zero(self):
-        assert "disabled" in self._make(heat_usd=None, max_heat=0.0)
+        assert "отключён" in self._make(heat_usd=None, max_heat=0.0)
 
     def test_heat_values_shown(self):
         msg = self._make(heat_usd=30.5, max_heat=200.0)
@@ -150,7 +160,7 @@ class TestBuildStatusMsg:
         assert "src2" in msg
 
     def test_quarantined_none_when_empty(self):
-        assert "None" in self._make(quarantined=[])
+        assert "нет" in self._make(quarantined=[])
 
     # ── alert section ─────────────────────────────────────────────────────
 
@@ -198,6 +208,23 @@ class TestBuildStatusMsg:
             alert_msg="z" * 600,
         )
         assert "…" in msg
+
+    def test_alert_is_sanitized_again_before_status_render(self):
+        msg = self._make(
+            alert_ts=1700000000.0,
+            alert_level="ERROR",
+            alert_class="WARNING",
+            alert_msg=(
+                "Безопасная причина\n"
+                "Traceback (most recent call last):\n"
+                '  File "worker.py", line 5, in run\n'
+                "RuntimeError: api_secret=SUPERSECRET"
+            ),
+        )
+        assert "Безопасная причина" in msg
+        assert "Traceback" not in msg
+        assert 'File &quot;worker.py&quot;' not in msg
+        assert "SUPERSECRET" not in msg
 
     def test_quarantined_source_with_special_chars_escaped(self):
         msg = self._make(quarantined=["src<1>", "src&2"])

@@ -19,7 +19,18 @@ from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_
 from handlers.orders import place_market_with_retry, close_position_market, bybit_call, set_leverage_safe
 from handlers.views_orders import view_orders, view_symbol_orders
 from handlers.views_positions import check_positions
-from handlers.ui import h
+from handlers.ui import (
+    format_action,
+    format_error_message,
+    format_header,
+    format_market_preview,
+    format_order_accepted,
+    format_order_rejected,
+    format_value_block,
+    format_warning_list,
+    format_warning_message,
+    h,
+)
 
 
 # Хранилище меток времени превью: sym → эпоха нажатия "PREVIEW TRADE".
@@ -59,10 +70,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pos = pos_resp['result']['list'][0]
             entry = safe_float(pos.get('avgPrice'), field='avgPrice')
             if entry <= 0:
-                await context.bot.send_message(user_id, f"❌ {sym}: нет данных о цене входа.")
+                await context.bot.send_message(
+                    user_id,
+                    format_error_message(
+                        "Нет данных о цене входа.",
+                        context=sym,
+                        action="проверьте позицию вручную на Bybit",
+                    ),
+                    parse_mode='HTML',
+                )
                 return
             await bybit_call(session.set_trading_stop, category="linear", symbol=sym, stopLoss=str(entry), slTriggerBy="LastPrice")
-            await context.bot.send_message(user_id, f"🛡 {sym} переведен в БУ!")
+            await context.bot.send_message(
+                user_id,
+                f"{format_header('✅', 'POSITION UPDATED')}\n"
+                f"Position: {h(sym)}\n\n"
+                f"🛡 <b>Защита</b>\n"
+                f"{format_value_block([('SL', entry), ('Статус', 'безубыток')])}",
+                parse_mode='HTML',
+            )
 
         elif data.startswith("exit_be|"):
             _, sym, side = data.split("|")
@@ -100,11 +126,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 await query.answer(f"🏁 TP установлен на {target_str}", show_alert=True)
                 await context.bot.send_message(user_id,
-                                               f"🏁 <b>EXIT BE:</b> Для {sym} установлен Тейк выхода в 0 (с учетом комиссий): {target_str}",
+                                               f"{format_header('✅', 'POSITION UPDATED')}\n"
+                                               f"Position: {h(sym)}\n\n"
+                                               f"🛡 <b>Защита</b>\n"
+                                               f"{format_value_block([('TP', target_str), ('Режим', 'безубыток с комиссией')])}",
                                                parse_mode='HTML')
 
             except Exception as e:
-                await query.answer(f"Ошибка: {e}", show_alert=True)
+                await query.answer("❌ Не удалось установить TP. Проверьте позицию.", show_alert=True)
 
         elif data.startswith("show_orders|"):
             _, sym = data.split("|")
@@ -130,7 +159,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data == "cancel_all_orders":
             await bybit_call(session.cancel_all_orders, category="linear", settleCoin="USDT")
-            await query.edit_message_text("🗑 Все лимитные ордера отменены.")
+            await query.edit_message_text(
+                f"{format_header('✅', 'ORDERS CANCELLED')}\n\n"
+                f"Все лимитные ордера отменены.\n\n"
+                f"{format_action('проверьте открытые ордера через /orders')}",
+                parse_mode='HTML',
+            )
 
         elif data == "refresh_orders":
             await view_orders(update, context)
@@ -176,16 +210,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             pos_value_usd = qty * entry_price if entry_price > 0 else 0.0
 
-            from handlers.ui import format_market_preview
             preview_msg = format_market_preview(
                 sym, side, lev, entry_price, sl_float, qty, pos_value_usd,
                 risk_usd, source_tag, heat_after, max_heat,
+                ttl_sec=MARKET_PREVIEW_TTL_SEC,
             )
 
             confirm_cb = f"buy_market|{sym}|{side}|{sl}|{qty_str}|{lev_str}"
             kb = [[
-                InlineKeyboardButton("✅ ПОДТВЕРДИТЬ", callback_data=confirm_cb),
-                InlineKeyboardButton("❌ ОТМЕНИТЬ", callback_data=f"mkt_cancel|{sym}"),
+                InlineKeyboardButton("✅ Подтвердить", callback_data=confirm_cb),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"mkt_cancel|{sym}"),
             ]]
             _PREVIEW_TS[sym] = time.time()
             await query.edit_message_text(
@@ -198,7 +232,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, sym = data.split("|")
             _PREVIEW_TS.pop(sym, None)
             await query.edit_message_text(
-                f"❌ Отменено. <b>{h(sym)}</b> не торгуется.", parse_mode='HTML'
+                f"{format_header('ℹ️', 'CANCELLED')}\n"
+                f"{h(sym)} · Market\n\n"
+                f"Вход отменён. Ордер не отправлялся.\n\n"
+                f"{format_action('отправьте новый сигнал')}",
+                parse_mode='HTML',
             )
 
         elif data.startswith("buy_market|"):
@@ -208,7 +246,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # TTL-защита: активна только в режиме preview-confirm.
             if REQUIRE_MARKET_CONFIRM and not _preview_is_fresh(sym, MARKET_PREVIEW_TTL_SEC):
                 await query.edit_message_text(
-                    f"⏰ <b>Превью устарело.</b> Отправьте сигнал заново для {sym}.",
+                    format_warning_message(
+                        ["Срок подтверждения preview истёк."],
+                        context=f"{sym} · {side}",
+                        action="отправьте сигнал заново",
+                        blocked=True,
+                    ),
                     parse_mode='HTML',
                 )
                 return
@@ -262,16 +305,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if reason == "REJECT":
                     await query.edit_message_text(
-                        f"❌ <b>Недостаточно маржи</b> для Market {sym}.\n"
-                        f"Доступно: {available_usd:.1f}$"
+                        format_order_rejected(
+                            sym, side, "110007 insufficient margin",
+                            action="уменьшите риск или пополните доступную маржу",
+                        ),
+                        parse_mode='HTML',
                     )
                     return
 
                 if final_qty < qty_from_cb:
                     await context.bot.send_message(
                         user_id,
-                        f"⚠️ <b>Market корректировка:</b> {qty_from_cb} ➔ {final_qty}",
-                        parse_mode='HTML'
+                        format_warning_message(
+                            [f"Объём Market уменьшен: {qty_from_cb} → {final_qty}."],
+                            context=f"{sym} · {side}",
+                            action="проверьте скорректированный объём",
+                        ),
+                        parse_mode='HTML',
                     )
             except Exception as pf_err:
                 logging.warning(f"Market preflight error for {sym}: {pf_err}")
@@ -279,8 +329,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # Нет данных лот-фильтра — безопасная валидация qty невозможна; блокируем ордер.
                     logging.warning(f"Market order for {sym} blocked: no lot-filter data after preflight error")
                     await query.edit_message_text(
-                        f"❌ <b>Недостаточно маржи</b> для Market {sym}.\n"
-                        f"Повторите попытку."
+                        format_order_rejected(
+                            sym, side, "preflight unavailable",
+                            action="повторите отправку сигнала позже",
+                        ),
+                        parse_mode='HTML',
                     )
                     return
                 try:
@@ -290,8 +343,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as val_err:
                     logging.warning(f"validate_qty error for {sym}: {val_err} — blocking market order")
                     await query.edit_message_text(
-                        f"❌ <b>Недостаточно маржи</b> для Market {sym}.\n"
-                        f"Повторите попытку."
+                        format_order_rejected(
+                            sym, side, "invalid qty",
+                            action="проверьте объём и отправьте новый сигнал",
+                        ),
+                        parse_mode='HTML',
                     )
                     return
                 if not is_valid:
@@ -299,15 +355,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"Market fallback qty {qty_from_cb} invalid ({val_reason}) — blocking {sym}"
                     )
                     await query.edit_message_text(
-                        f"❌ <b>Недостаточно маржи</b> для Market {sym}.\n"
-                        f"Повторите попытку."
+                        format_order_rejected(
+                            sym, side, val_reason,
+                            action="проверьте объём и отправьте новый сигнал",
+                        ),
+                        parse_mode='HTML',
                     )
                     return
                 final_qty = fallback_qty
                 logging.info(f"Market preflight fallback: cb_qty={qty_from_cb} → validated={final_qty} for {sym}")
 
             # --- PLACE ORDER + 110007 micro-retry ---
-            success, msg_text, _ = await bybit_call(
+            success, msg_text, placed_qty = await bybit_call(
                 place_market_with_retry,
                 sym, order_side, final_qty, sl, qty_step, min_order_qty
             )
@@ -352,19 +411,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception as je:
                     logging.debug("journal ENTRY_PLACED failed: %s", je)
-                await query.edit_message_text(msg_text)
+                shown_qty = placed_qty if placed_qty not in (None, 0, 0.0) else final_qty
+                accepted_msg = format_order_accepted(
+                    sym,
+                    side,
+                    shown_qty,
+                    order_type="Market",
+                    price=entry_price if entry_price > 0 else None,
+                    stop=float(sl),
+                    leverage=lev,
+                    risk_usd=risk_val,
+                    retried=shown_qty != final_qty,
+                )
+                await query.edit_message_text(accepted_msg, parse_mode='HTML')
             else:
-                await query.edit_message_text(msg_text)
+                await query.edit_message_text(
+                    format_order_rejected(sym, side, msg_text),
+                    parse_mode='HTML',
+                )
 
         elif data.startswith("close_confirm|"):
             _, sym = data.split("|")
             kb = [[
-                InlineKeyboardButton("✅ ПОДТВЕРДИТЬ ЗАКРЫТИЕ", callback_data=f"close_mkt_confirm|{sym}"),
+                InlineKeyboardButton("✅ Подтвердить закрытие", callback_data=f"close_mkt_confirm|{sym}"),
                 InlineKeyboardButton("↩ К ордерам", callback_data=f"show_orders|{sym}"),
             ]]
             await query.edit_message_text(
-                f"⚠️ Закрыть <b>{h(sym)}</b> по РЫНКУ?\n"
-                f"Вся позиция будет закрыта немедленно.",
+                f"{format_header('⚠️', 'CONFIRM')}\n"
+                f"Position: {h(sym)} · Market\n\n"
+                f"{format_warning_list(['Вся позиция будет закрыта немедленно.'])}\n\n"
+                f"{format_action('подтвердите закрытие или вернитесь к ордерам')}",
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(kb),
             )
@@ -375,12 +451,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 success, msg_text, _ = await bybit_call(close_position_market, sym)
                 if success:
                     await query.answer(f"✅ {sym} закрыт!", show_alert=True)
-                    await query.edit_message_text(msg_text)
+                    await query.edit_message_text(
+                        f"{format_header('✅', 'POSITION CLOSED')}\n"
+                        f"Position: {h(sym)}\n\n"
+                        f"Позиция закрыта по Market.",
+                        parse_mode='HTML',
+                    )
                 else:
                     await query.answer(msg_text, show_alert=True)
                     await check_positions(update, context)
             except Exception as e:
-                await query.answer(f"❌ Ошибка закрытия: {e}", show_alert=True)
+                await query.answer("❌ Не удалось закрыть позицию. Проверьте Bybit.", show_alert=True)
 
         elif data.startswith("emergency_close|"):
             _, sym = data.split("|")
@@ -388,12 +469,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 success, msg_text, _ = await bybit_call(close_position_market, sym)
                 if success:
                     await query.answer(f"✅ {sym} закрыт аварийно!", show_alert=True)
-                    await query.edit_message_text(msg_text)
+                    await query.edit_message_text(
+                        f"{format_header('✅', 'POSITION CLOSED')}\n"
+                        f"Position: {h(sym)}\n\n"
+                        f"Позиция закрыта аварийно по Market.",
+                        parse_mode='HTML',
+                    )
                 else:
                     await query.answer(msg_text, show_alert=True)
                     await check_positions(update, context)
             except Exception as e:
-                await query.answer(f"❌ Ошибка закрытия: {e}", show_alert=True)
+                await query.answer("❌ Не удалось закрыть позицию. Проверьте Bybit.", show_alert=True)
 
     except Exception as e:
-        await context.bot.send_message(user_id, f"❌ Ошибка кнопки: {e}")
+        logging.error("Button handler error: %s", e)
+        await context.bot.send_message(
+            user_id,
+            format_error_message(
+                "Не удалось выполнить действие кнопки.",
+                action="обновите сообщение и повторите попытку",
+            ),
+            parse_mode='HTML',
+        )

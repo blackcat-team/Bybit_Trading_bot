@@ -5,12 +5,11 @@
 import asyncio
 import logging
 from datetime import datetime
-from html import escape
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from core.config import ALLOWED_ID
+from core.config import ALLOWED_ID, IS_DEMO
 from core.database import (
     add_comment,
     is_trading_enabled, set_trading_enabled,
@@ -19,20 +18,45 @@ from core.database import (
 )
 
 from core.bybit_call import bybit_call
+from core.notifier import sanitize_operator_text
+from handlers.ui import (
+    format_action,
+    format_error_message,
+    format_header,
+    format_start_message,
+    format_stop_message,
+    format_value_block,
+    h,
+)
+
+
+def _network_label() -> str:
+    return "Demo" if IS_DEMO else "Mainnet"
+
+
+def _build_start_msg(risk_usd: float, network: str) -> str:
+    return format_start_message(risk_usd, network)
+
+
+def _build_stop_msg() -> str:
+    return format_stop_message()
 
 
 async def start_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start — включает приём сигналов."""
     if str(update.effective_user.id) != ALLOWED_ID: return
     await asyncio.to_thread(set_trading_enabled, True)
-    await update.message.reply_text("✅ <b>STARTED</b>. Бот принимает сигналы.", parse_mode='HTML')
+    await update.message.reply_text(
+        _build_start_msg(get_global_risk(), _network_label()),
+        parse_mode='HTML',
+    )
 
 
 async def stop_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /stop — приостанавливает приём сигналов."""
     if str(update.effective_user.id) != ALLOWED_ID: return
     await asyncio.to_thread(set_trading_enabled, False)
-    await update.message.reply_text("🛑 <b>STOPPED</b>. Бот игнорирует сигналы.", parse_mode='HTML')
+    await update.message.reply_text(_build_stop_msg(), parse_mode='HTML')
 
 
 async def set_risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -45,22 +69,42 @@ async def set_risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             current = get_global_risk()
             await msg.reply_text(
-                f"💰 Текущий риск: <b>{int(current)}$</b>\nЧтобы изменить: <code>/risk 50</code>",
+                f"{format_header('📊', 'STATUS')}\n\n"
+                f"🛡 <b>Риск</b>\n"
+                f"{format_value_block([('На сделку', f'{current:.2f} USDT')])}\n\n"
+                f"{format_action('для изменения используйте /risk 50')}",
                 parse_mode='HTML'
             )
             return
 
         new_risk = int(context.args[0])
         if new_risk <= 0:
-            await msg.reply_text("❌ Риск должен быть положительным числом!")
+            await msg.reply_text(
+                format_error_message(
+                    "Риск должен быть положительным числом.",
+                    action="укажите значение, например /risk 50",
+                ),
+                parse_mode='HTML',
+            )
             return
 
         await asyncio.to_thread(set_global_risk, new_risk)
-        await msg.reply_text(f"✅ Риск изменен на <b>{new_risk}$</b>", parse_mode='HTML')
+        await msg.reply_text(
+            f"{format_header('✅', 'RISK UPDATED')}\n\n"
+            f"🛡 <b>Риск</b>\n"
+            f"{format_value_block([('На сделку', f'{new_risk:.2f} USDT')])}",
+            parse_mode='HTML',
+        )
         logging.info(f"Risk changed to {new_risk}$ by user")
 
     except ValueError:
-        await msg.reply_text("❌ Введите целое число. Пример: /risk 50")
+        await msg.reply_text(
+            format_error_message(
+                "Риск должен быть целым числом.",
+                action="укажите значение, например /risk 50",
+            ),
+            parse_mode='HTML',
+        )
     except Exception as e:
         logging.error(f"Error in set_risk_command: {e}")
 
@@ -70,15 +114,31 @@ async def add_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ALLOWED_ID: return
     try:
         if len(context.args) < 2:
-            await update.message.reply_text("📝 Формат: <code>/note BTC Текст заметки</code>", parse_mode='HTML')
+            await update.message.reply_text(
+                f"{format_header('⚠️', 'WARNING')}\n\n"
+                f"⚠️ <b>Предупреждения</b>\n"
+                f"• Не указан символ или текст заметки.\n\n"
+                f"{format_action('используйте /note BTC Текст заметки')}",
+                parse_mode='HTML',
+            )
             return
 
         sym = context.args[0].upper()
         text = " ".join(context.args[1:])
         await asyncio.to_thread(add_comment, sym, text)
-        await update.message.reply_text(f"✅ Заметка для {sym} сохранена.")
+        await update.message.reply_text(
+            f"{format_header('✅', 'NOTE SAVED')}\n\n"
+            f"Заметка для {h(sym)} сохранена.",
+            parse_mode='HTML',
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка заметки: {e}")
+        await update.message.reply_text(
+            format_error_message(
+                "Не удалось сохранить заметку.",
+                action="проверьте формат и повторите попытку",
+            ),
+            parse_mode='HTML',
+        )
 
 
 # ── /status helpers ───────────────────────────────────────────────────────────
@@ -113,55 +173,62 @@ def _build_status_msg(
     Чистая функция — без I/O и await.
     Все динамические строки экранируются через html.escape() перед встраиванием.
     """
-    status_icon = "✅ ON" if trading_on else "🛑 OFF"
+    trading_label = "ON" if trading_on else "OFF"
 
     if daily_pnl is not None:
-        pnl_icon = "📈" if daily_pnl >= 0 else "📉"
-        pnl_str = escape(f"{daily_pnl:+.2f}$")
+        pnl_str = f"{daily_pnl:+.2f} USDT"
     else:
-        pnl_icon = "📊"
         pnl_str = "N/A"
 
-    risk_str = escape(f"{int(current_risk)}$")
+    risk_str = f"{current_risk:.2f} USDT"
 
     if max_heat <= 0:
-        heat_line = "disabled"
+        heat_line = "отключён"
     elif heat_usd is not None:
-        heat_line = escape(f"{heat_usd:.1f}$ / {max_heat:.1f}$")
+        heat_line = f"{heat_usd:.1f} / {max_heat:.1f} USDT"
     else:
         heat_line = "N/A"
 
-    pos_str = escape(str(pos_count)) if pos_count is not None else "N/A"
-    orders_str = escape(str(entry_orders)) if entry_orders is not None else "N/A"
+    pos_str = str(pos_count) if pos_count is not None else "N/A"
+    orders_str = str(entry_orders) if entry_orders is not None else "N/A"
 
-    quar_str = escape(", ".join(quarantined)) if quarantined else "None"
+    quar_str = ", ".join(quarantined) if quarantined else "нет"
 
     if alert_ts is not None:
         ts_str = datetime.fromtimestamp(alert_ts).strftime("%H:%M:%S")
         alert_header = (
-            f"[{escape(alert_level)}/{escape(alert_class)}] {escape(ts_str)}"
+            f"[{alert_level}/{alert_class}] {ts_str}"
         )
-        alert_body = escape(_truncate(alert_msg, 400))
+        alert_body = _truncate(sanitize_operator_text(alert_msg, limit=400), 400)
     else:
         alert_header = "—"
-        alert_body = "none"
+        alert_body = "нет"
 
+    account = format_value_block([
+        ("PnL дня", pnl_str),
+        ("Риск", risk_str),
+        ("Heat", heat_line),
+    ])
+    activity = format_value_block([
+        ("Позиции", pos_str),
+        ("Ордера", orders_str),
+        ("Market pending", mkt_pending),
+    ])
+    sources = format_value_block([
+        ("Источники", sources_seen),
+        ("Карантин", quar_str),
+    ])
+    alert = format_value_block([
+        ("Статус", alert_header),
+        ("Сообщение", alert_body),
+    ])
     return (
-        f"🤖 <b>BOT STATUS</b> 📊\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"⚙️ <b>Engine:</b> {status_icon}\n"
-        f"{pnl_icon} <b>Daily PnL:</b> {pnl_str}\n"
-        f"🎯 <b>Base Risk:</b> {risk_str}\n"
-        f"🔥 <b>Live Heat:</b> {heat_line}\n\n"
-        f"📈 <b>MARKET DATA</b>\n"
-        f"├ 💼 Open Positions: {pos_str}\n"
-        f"├ 📝 Limit Orders: {orders_str}\n"
-        f"└ ⏳ Pending Mkt: {mkt_pending}\n\n"
-        f"📡 <b>SIGNALS &amp; SOURCES</b>\n"
-        f"├ 👀 Seen active: {sources_seen}\n"
-        f"└ 🛡 Quarantined: {quar_str}\n\n"
-        f"⚠️ <b>LAST ALERT</b> [{alert_header}]\n"
-        f"<code>{alert_body}</code>"
+        f"{format_header('📊', 'STATUS')}\n"
+        f"Trading: {trading_label} · {_network_label()}\n\n"
+        f"💰 <b>Счёт</b>\n{account}\n\n"
+        f"📊 <b>Активность</b>\n{activity}\n\n"
+        f"📡 <b>Источники</b>\n{sources}\n\n"
+        f"⚠️ <b>Последний alert</b>\n{alert}"
     )
 
 

@@ -16,6 +16,14 @@ from core.trading_core import session
 from core.database import get_global_risk, get_source_at_time
 from core.utils import safe_float
 from handlers.orders import bybit_call
+from handlers.ui import (
+    format_action,
+    format_bybit_error_detail,
+    format_error_message,
+    format_header,
+    format_value_block,
+    h,
+)
 
 # Максимально допустимый диапазон одного запроса к Bybit (< 7 суток)
 _CHUNK_MS = 7 * 24 * 60 * 60 * 1000 - 1
@@ -68,7 +76,13 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             month_str, year_str = context.args[0].split('.')
             target_date = datetime(int(year_str), int(month_str), 1, tzinfo=timezone.utc)
         except (ValueError, TypeError):
-            await update.message.reply_text("⚠️ Формат: <code>/report 01.2026</code>", parse_mode='HTML')
+            await update.message.reply_text(
+                f"{format_header('⚠️', 'WARNING')}\n\n"
+                f"⚠️ <b>Предупреждения</b>\n"
+                f"• Неверный формат месяца.\n\n"
+                f"{format_action('используйте /report 01.2026')}",
+                parse_mode='HTML',
+            )
             return
     else:
         target_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -82,7 +96,11 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     end_ts = min(end_ts, now_ms)
 
     month_name = target_date.strftime("%B %Y")
-    status_msg = await update.message.reply_text(f"⏳ Сбор данных за {month_name} (по 7 дней)...")
+    status_msg = await update.message.reply_text(
+        f"{format_header('⏳', 'REPORT')}\n\n"
+        f"Собираю данные за {h(month_name)}.",
+        parse_mode='HTML',
+    )
 
     status_deleted = False
     current_start = start_ts
@@ -123,7 +141,11 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.1)
 
         if not all_trades:
-            await status_msg.edit_text(f"📭 Нет закрытых сделок за {month_name}.")
+            await status_msg.edit_text(
+                f"{format_header('📊', 'REPORT')}\n\n"
+                f"ℹ️ За {h(month_name)} закрытых сделок нет.",
+                parse_mode='HTML',
+            )
             return
 
         total_pnl = 0
@@ -158,7 +180,10 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             })
 
             icon = "🟢" if pnl >= 0 else "🔴"
-            line = f"{icon} {short_date} {symbol}: {pnl:.1f}$ ({r_val:+.1f}R) {src}"
+            line = (
+                f"{icon} {h(short_date)} · {h(symbol)} · "
+                f"{pnl:+.1f} USDT · {r_val:+.1f}R · {h(src)}"
+            )
             report_lines.append(line)
 
         total_trades = wins + losses
@@ -166,13 +191,19 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_r = total_pnl / current_risk_usd if current_risk_usd > 0 else 0
 
         cmd_example = f"/report {target_date.strftime('%m.%Y')}"
+        summary_block = format_value_block([
+            ("PnL", f"{total_pnl:+.2f} USDT"),
+            ("R", f"{total_r:+.2f}R"),
+            ("Winrate", f"{winrate:.1f}% ({wins}W / {losses}L)"),
+            ("Сделки", total_trades),
+        ])
 
         header = (
-            f"📊 <b>Отчет за {month_name}</b>\n"
-            f"💰 PnL: <b>{total_pnl:.2f}$</b> ({total_r:+.2f}R)\n"
-            f"📈 Winrate: {winrate:.1f}% ({wins}W / {losses}L)\n"
-            f"🔢 Всего сделок: {total_trades}\n\n"
-            f"📅 Выбрать месяц: <code>{cmd_example}</code>"
+            f"{format_header('📊', 'REPORT')}\n"
+            f"Период: {h(month_name)}\n\n"
+            f"📊 <b>Итоги</b>\n"
+            f"{summary_block}\n\n"
+            f"📅 Другой месяц: <code>{h(cmd_example)}</code>"
         )
 
         status_deleted = True
@@ -193,18 +224,26 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             short_list = "\n".join(report_lines[:15])
-            await update.message.reply_text(f"{header}\n\n📝 <b>Последние 15:</b>\n{short_list}", parse_mode='HTML')
+            await update.message.reply_text(
+                f"{header}\n\n📋 <b>Последние 15</b>\n{short_list}",
+                parse_mode='HTML',
+            )
 
     except Exception as e:
         logging.exception(
             "Report error for %s (chunk %s–%s): %s",
             month_name, current_start, current_end, e,
         )
-        err_text = f"❌ Ошибка отчета (Bybit API): {e}"
+        err_text = format_error_message(
+            "Не удалось сформировать отчёт Bybit.",
+            context=month_name,
+            detail=format_bybit_error_detail(e),
+            action="повторите запрос отчёта позже",
+        )
         if not status_deleted:
             try:
-                await status_msg.edit_text(err_text)
+                await status_msg.edit_text(err_text, parse_mode='HTML')
                 return
             except Exception:
                 pass
-        await update.message.reply_text(err_text)
+        await update.message.reply_text(err_text, parse_mode='HTML')

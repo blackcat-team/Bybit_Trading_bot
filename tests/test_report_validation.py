@@ -34,7 +34,11 @@ for _mod in ["core.trading_core", "core.bybit_call", "core.database", "handlers.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from handlers.reporting import _validate_resp, _BybitReportError
+from handlers.reporting import (
+    _validate_resp,
+    _BybitReportError,
+    format_bybit_error_detail,
+)
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -65,6 +69,14 @@ class TestValidateResp:
         resp = {"retCode": 10001, "retMsg": "params error"}
         with pytest.raises(_BybitReportError, match="params error"):
             _validate_resp(resp, 0, 1_000)
+
+    def test_report_error_formatter_preserves_safe_retcode_and_retmsg(self):
+        exc = _BybitReportError(
+            "[0–1000] retCode=33004, retMsg=API key expired"
+        )
+        detail = format_bybit_error_detail(exc)
+        assert "33004" in detail
+        assert "API key expired" in detail
 
     def test_not_dict_none_raises(self):
         """resp=None → _BybitReportError."""

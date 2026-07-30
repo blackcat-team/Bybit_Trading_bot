@@ -97,32 +97,32 @@ class TestLimitSignalHtml:
 
     # --- smoke ---
     def test_contains_limit(self):
-        assert "LIMIT" in self._make()
+        assert "Limit" in self._make()
 
     def test_contains_entry_label(self):
-        assert "Entry" in self._make()
+        assert "Цена" in self._make()
 
     def test_contains_stop_label(self):
-        assert "Stop Loss" in self._make()
+        assert "SL" in self._make()
 
     def test_contains_sep(self):
-        assert "➖" in self._make()
+        assert "<code>" in self._make()
 
     def test_no_tilde(self):
         assert "~" not in self._make()
 
     def test_notional_approx(self):
         msg = self._make(pos_value_usd=24.2595)
-        assert "≈24.26$" in msg
+        assert "24.26 USDT" in msg
 
     def test_sl_pct_negative(self):
-        assert "-8.18%" in self._make()
+        assert "8.18%" in self._make()
 
     def test_long_icon(self):
-        assert "🟢" in self._make(side="LONG")
+        assert "Long" in self._make(side="LONG")
 
     def test_short_icon(self):
-        assert "🔴" in self._make(side="SHORT")
+        assert "Short" in self._make(side="SHORT")
 
 
 # ── format_market_signal ──────────────────────────────────────────────────────
@@ -153,11 +153,11 @@ class TestMarketSignalHtml:
         assert _balanced(self._make(), "i")
 
     def test_contains_market(self):
-        assert "MARKET" in self._make()
+        assert "Market" in self._make()
 
     def test_approx_in_entry_line(self):
         msg = self._make()
-        entry_line = next(l for l in msg.splitlines() if "Entry" in l)
+        entry_line = next(l for l in msg.splitlines() if "Вход" in l)
         assert "≈" in entry_line
         assert "~" not in entry_line
 
@@ -165,7 +165,7 @@ class TestMarketSignalHtml:
         assert "~" not in self._make()
 
     def test_short_icon(self):
-        assert "🔴" in self._make(side="SHORT")
+        assert "Short" in self._make(side="SHORT")
 
 
 # ── format_market_preview ─────────────────────────────────────────────────────
@@ -205,38 +205,38 @@ class TestMarketPreviewHtml:
         assert "15.0" in msg and "200.0" in msg
 
     def test_heat_disabled(self):
-        assert "disabled" in self._make(heat_after=0, max_heat=0)
+        assert "отключён" in self._make(heat_after=0, max_heat=0)
 
     def test_confirm_instruction(self):
-        assert "CONFIRM" in self._make()
+        assert "подтвердите или отмените вход" in self._make()
 
     def test_no_tilde(self):
         assert "~" not in self._make()
 
     def test_risk_label(self):
-        assert "Risk" in self._make()
+        assert "Риск" in self._make()
 
     def test_side_long_icon(self):
-        assert "🟢" in self._make(side="LONG")
+        assert "Long" in self._make(side="LONG")
 
     def test_side_short_icon(self):
-        assert "🔴" in self._make(side="SHORT")
+        assert "Short" in self._make(side="SHORT")
 
 
 # ── format_position_card ──────────────────────────────────────────────────────
 
 class TestPositionCardHtml:
     def test_long_label(self):
-        assert "LONG" in format_position_card("BTCUSDT", "Buy", 12.34, 0.25)
+        assert "Long" in format_position_card("BTCUSDT", "Buy", 12.34, 0.25)
 
     def test_short_label(self):
-        assert "SHORT" in format_position_card("ETHUSDT", "Sell", -3.0, -0.1)
+        assert "Short" in format_position_card("ETHUSDT", "Sell", -3.0, -0.1)
 
     def test_long_icon(self):
-        assert "🟢" in format_position_card("X", "Buy", 0.0, None)
+        assert "POSITIONS" in format_position_card("X", "Buy", 0.0, None)
 
     def test_short_icon(self):
-        assert "🔴" in format_position_card("X", "Sell", 0.0, None)
+        assert "POSITIONS" in format_position_card("X", "Sell", 0.0, None)
 
     def test_sym_escaped(self):
         msg = format_position_card(_EVIL, "Buy", 10.0, 0.5)
@@ -244,23 +244,23 @@ class TestPositionCardHtml:
         assert "<script>" not in msg
 
     def test_pnl_positive_signed(self):
-        assert "+11.62$" in format_position_card("X", "Buy", 11.62, 0.5)
+        assert "+11.62 USDT" in format_position_card("X", "Buy", 11.62, 0.5)
 
     def test_pnl_negative_signed(self):
-        assert "-3.00$" in format_position_card("X", "Sell", -3.0, -0.1)
+        assert "-3.00 USDT" in format_position_card("X", "Sell", -3.0, -0.1)
 
     def test_r_value(self):
         assert "+0.50R" in format_position_card("X", "Buy", 10.0, 0.5)
 
     def test_r_none_shows_dash(self):
         msg = format_position_card("X", "Buy", 10.0, None)
-        assert "—" in msg
+        assert "R:" not in msg
 
     def test_balanced_b(self):
         assert _balanced(format_position_card("BTCUSDT", "Buy", 10.0, 0.5), "b")
 
     def test_sep_present(self):
-        assert "➖" in format_position_card("X", "Buy", 0.0, None)
+        assert "<code>" in format_position_card("X", "Buy", 0.0, None)
 
 
 # ── format_orders_menu_html ───────────────────────────────────────────────────
@@ -284,7 +284,7 @@ class TestOrdersMenuHtml:
         orders = [{"side": "<Sell>", "price": "1.0", "qty": "1", "reduceOnly": False}]
         msg = format_orders_menu_html("X", orders)
         assert "<Sell>" not in msg
-        assert "&lt;Sell&gt;" in msg
+        assert "Short" in msg
 
     def test_price_escaped(self):
         orders = [{"side": "Sell", "price": "<1.0>", "qty": "1", "reduceOnly": False}]
@@ -317,8 +317,8 @@ class TestOrdersMenuHtml:
 
     def test_order_count_shown(self):
         msg = format_orders_menu_html("CROUSDT", _SAMPLE_ORDERS)
-        assert "(2)" in msg
+        assert "2 орд." in msg
 
     def test_zero_orders_count(self):
         msg = format_orders_menu_html("X", [])
-        assert "(0)" in msg
+        assert "0 орд." in msg

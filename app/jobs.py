@@ -24,6 +24,13 @@ from core.journal import (
     get_disabled_sources,
 )
 from core.utils import safe_float
+from handlers.ui import (
+    format_action,
+    format_header,
+    format_value_block,
+    format_warning_list,
+    h,
+)
 
 # Засекаем время старта
 START_TIME = time.time()
@@ -155,7 +162,13 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
                     logging.info(f"♻️ {action_tag}: {sym} SL moved to {new_sl}")
                     await context.bot.send_message(
                         chat_id=ALLOWED_ID,
-                        text=f"♻️ <b>{action_tag}:</b> {sym} (PnL {current_r:.1f}R)\nСтоп подтянут: {new_sl}",
+                        text=(
+                            f"{format_header('✅', 'POSITION UPDATED')}\n"
+                            f"Position: {h(sym)}\n\n"
+                            f"🛡 <b>Защита</b>\n"
+                            f"{format_value_block([('Режим', action_tag), ('PnL', f'{current_r:.1f}R'), ('SL', new_sl)])}\n\n"
+                            f"{format_action('контролируйте позицию через /status')}"
+                        ),
                         parse_mode='HTML'
                     )
                 except Exception as e:
@@ -201,7 +214,12 @@ async def auto_cleanup_orders_job(context: ContextTypes.DEFAULT_TYPE):
                     logging.info(f"🗑 Cleanup: {o['symbol']}")
                     await context.bot.send_message(
                         chat_id=ALLOWED_ID,
-                        text=f"🗑 <b>CLEANUP:</b> Ордер {o['symbol']} удален (таймаут).",
+                        text=(
+                            f"{format_header('ℹ️', 'ORDER CANCELLED')}\n"
+                            f"{h(o['symbol'])} · Limit\n\n"
+                            f"Ордер отменён по существующему таймауту.\n\n"
+                            f"{format_action('проверьте открытые ордера через /orders')}"
+                        ),
                         parse_mode='HTML'
                     )
                 except Exception as e:
@@ -228,7 +246,12 @@ async def daily_balance_job(context: ContextTypes.DEFAULT_TYPE):
         equity = safe_float(acct.get('totalEquity'), field='totalEquity')
         pnl = safe_float(acct.get('totalPerpUPL'), field='totalPerpUPL')
 
-        msg = f"🌅 <b>Утро:</b>\n💵 Баланс: {equity:.2f}$\n📊 PnL (нереализ.): {pnl:.2f}$"
+        msg = (
+            f"{format_header('📊', 'DAILY REPORT')}\n"
+            f"Bybit · USDT\n\n"
+            f"💰 <b>Счёт</b>\n"
+            f"{format_value_block([('Баланс', f'{equity:.2f} USDT'), ('PnL', f'{pnl:+.2f} USDT')])}"
+        )
         await context.bot.send_message(chat_id=ALLOWED_ID, text=msg, parse_mode='HTML')
         logging.info("Morning report sent")
     except Exception as e:
@@ -305,10 +328,10 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
             # 🔴 ПРАВИЛО 7 ДНЕЙ (Абсолютный лимит)
             if days_open >= 7:
                 alerts.append(
-                    f"❌ <b>7-DAY LIMIT:</b> {sym}\n"
-                    f"Живет: {days_open} дн.\n"
-                    f"PnL: {pnl:.2f}$\n"
-                    f"👉 <b>ЗАКРЫВАЙ НЕМЕДЛЕННО!</b>"
+                    f"{format_header('⚠️', 'WARNING')}\n"
+                    f"Position: {h(sym)} · {'Long' if side == 'Buy' else 'Short'}\n\n"
+                    f"{format_warning_list([f'Позиция открыта {days_open} дн.', f'PnL: {pnl:+.2f} USDT.', 'Достигнут 7-дневный лимит.'])}\n\n"
+                    f"{format_action('закройте позицию вручную')}"
                 )
                 continue
 
@@ -325,11 +348,10 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
 
                 if not is_be and not is_profit_1r:
                     alerts.append(
-                        f"⚠️ <b>5-DAY STAGNATION:</b> {sym}\n"
-                        f"Живет: {days_open} дн.\n"
-                        f"PnL: {pnl:.2f}$ (< 1R)\n"
-                        f"Стоп не в БУ.\n"
-                        f"👉 <b>Пора закрывать вручную.</b>"
+                        f"{format_header('⚠️', 'WARNING')}\n"
+                        f"Position: {h(sym)} · {'Long' if side == 'Buy' else 'Short'}\n\n"
+                        f"{format_warning_list([f'Позиция открыта {days_open} дн.', f'PnL: {pnl:+.2f} USDT (< 1R).', 'SL не перенесён в БУ.'])}\n\n"
+                        f"{format_action('проверьте позицию и рассмотрите ручное закрытие')}"
                     )
 
         # Отправка
@@ -505,7 +527,10 @@ async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
         if not all_trades:
             await context.bot.send_message(
                 chat_id=ALLOWED_ID,
-                text="📊 <b>Weekly Source Report:</b>\nNo closed trades this week.",
+                text=(
+                    f"{format_header('📊', 'WEEKLY REPORT')}\n\n"
+                    f"ℹ️ За неделю нет закрытых сделок."
+                ),
                 parse_mode='HTML',
             )
             return
@@ -529,17 +554,20 @@ async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
                 entry["losses"] += 1
 
         disabled = get_disabled_sources()
-        lines = ["📊 <b>Weekly Source Report</b>"]
+        lines = [format_header("📊", "WEEKLY REPORT"), "", "📡 <b>Источники</b>"]
         for tag, s in sorted(stats.items(), key=lambda x: x[1]["pnl"], reverse=True):
             status = "⛔ QUARANTINED" if tag in disabled else "✅"
             total = s["wins"] + s["losses"]
             wr = (s["wins"] / total * 100) if total > 0 else 0.0
             r_val = s["pnl"] / current_risk if current_risk > 0 else 0.0
+            source_block = format_value_block([
+                ("PnL", f"{s['pnl']:+.2f} USDT ({r_val:+.1f}R)"),
+                ("Winrate", f"{wr:.0f}% ({s['wins']}W/{s['losses']}L)"),
+                ("Сделки", s["count"]),
+            ])
             lines.append(
-                f"\n{status} <b>{tag}</b>\n"
-                f"  PnL: {s['pnl']:+.2f}$ ({r_val:+.1f}R) | "
-                f"WR: {wr:.0f}% ({s['wins']}W/{s['losses']}L) | "
-                f"Trades: {s['count']}"
+                f"\n{status} <b>{h(tag)}</b>\n"
+                f"{source_block}"
             )
 
         await context.bot.send_message(

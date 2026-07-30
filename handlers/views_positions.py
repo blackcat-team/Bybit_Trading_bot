@@ -11,7 +11,7 @@ from core.config import ALLOWED_ID
 from core.trading_core import session
 from core.database import get_risk_for_symbol
 from core.utils import safe_float
-from handlers.ui import format_position_card
+from handlers.ui import format_error_message, format_header, format_position_card
 from handlers.orders import bybit_call
 
 
@@ -33,14 +33,17 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 orders_count[s] = orders_count.get(s, 0) + 1
 
         if not active:
-            msg = "📭 Нет активных позиций."
+            msg = (
+                f"{format_header('📊', 'POSITIONS')}\n\n"
+                f"ℹ️ Активных позиций нет."
+            )
             if update.callback_query:
                 try:
-                    await update.callback_query.message.edit_text(msg)
+                    await update.callback_query.message.edit_text(msg, parse_mode="HTML")
                 except Exception:
-                    await update.callback_query.message.reply_text(msg)
+                    await update.callback_query.message.reply_text(msg, parse_mode="HTML")
             else:
-                await update.message.reply_text(msg)
+                await update.message.reply_text(msg, parse_mode="HTML")
             return
 
         if update.callback_query and update.callback_query.data == "back_to_pos":
@@ -56,14 +59,23 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             cnt = orders_count.get(sym, 0)
 
-            msg = format_position_card(sym, side, pnl, current_r)
+            msg = format_position_card(
+                sym,
+                side,
+                pnl,
+                current_r,
+                entry=safe_float(p.get('avgPrice'), field='avgPrice'),
+                qty=safe_float(p.get('size'), field='size'),
+                leverage=p.get('leverage'),
+                stop=safe_float(p.get('stopLoss'), field='stopLoss') or None,
+            )
 
             row1 = [
                 InlineKeyboardButton("🛡 SL в БУ", callback_data=f"to_be|{sym}|{side}"),
                 InlineKeyboardButton("🏁 TP в БУ", callback_data=f"exit_be|{sym}|{side}")
             ]
             row2 = [
-                InlineKeyboardButton("🎯 Auto-TPs", callback_data=f"set_tps|{sym}"),
+                InlineKeyboardButton("🎯 Настроить TP", callback_data=f"set_tps|{sym}"),
                 InlineKeyboardButton(f"📋 Ордера ({cnt})", callback_data=f"show_orders|{sym}")
             ]
 
@@ -76,7 +88,11 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Pos error: {e}")
+        error_msg = format_error_message(
+            "Не удалось получить список позиций.",
+            action="проверьте позиции вручную на Bybit",
+        )
         if update.callback_query:
-            await update.callback_query.message.reply_text(f"❌ Ошибка: {e}")
+            await update.callback_query.message.reply_text(error_msg, parse_mode='HTML')
         else:
-            await update.message.reply_text(f"❌ Ошибка: {e}")
+            await update.message.reply_text(error_msg, parse_mode='HTML')

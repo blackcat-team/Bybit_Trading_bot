@@ -14,6 +14,13 @@ from core.config import ALLOWED_ID, DATA_DIR
 from core.trading_core import session
 from core.bybit_call import bybit_call
 from core.utils import safe_float
+from handlers.ui import (
+    format_action,
+    format_header,
+    format_value_block,
+    format_warning_list,
+    h,
+)
 
 STARTUP_MARKER_FILE = DATA_DIR / "startup_last.txt"
 
@@ -50,7 +57,11 @@ async def on_startup_check(context: ContextTypes.DEFAULT_TYPE):
             logging.info("✅ No active positions found.")
             await context.bot.send_message(
                 chat_id=ALLOWED_ID,
-                text="🤖 <b>RESTART:</b> 0 active positions.",
+                text=(
+                    f"{format_header('ℹ️', 'RECOVERY')}\n\n"
+                    f"📊 <b>Статус</b>\n"
+                    f"{format_value_block([('Позиции', 0), ('Проблемы', 0)])}"
+                ),
                 parse_mode='HTML',
             )
             return
@@ -85,24 +96,38 @@ async def on_startup_check(context: ContextTypes.DEFAULT_TYPE):
                 problem_desc = []
                 keyboard = []
                 if not has_sl:
-                    problem_desc.append("🔴 <b>NO SL</b>")
-                    keyboard.append(InlineKeyboardButton("💀 CLOSE", callback_data=f"emergency_close|{sym}"))
+                    problem_desc.append("отсутствует SL")
+                    keyboard.append(InlineKeyboardButton("⛔ Закрыть", callback_data=f"emergency_close|{sym}"))
                 if not has_tp:
-                    problem_desc.append("🟠 <b>NO TP</b>")
-                    keyboard.append(InlineKeyboardButton("🎯 Set TPs", callback_data=f"set_tps|{sym}"))
+                    problem_desc.append("отсутствует TP")
+                    keyboard.append(InlineKeyboardButton("🎯 Настроить TP", callback_data=f"set_tps|{sym}"))
                 issues.append({"sym": sym, "desc": ", ".join(problem_desc), "kb": keyboard})
 
         if not issues:
             await context.bot.send_message(chat_id=ALLOWED_ID,
-                                           text=f"🤖 <b>RESTART:</b> {len(active_positions)} позиций активны. Ошибок нет.",
+                                           text=(
+                                               f"{format_header('✅', 'RECOVERY')}\n\n"
+                                               f"📊 <b>Статус</b>\n"
+                                               f"{format_value_block([('Позиции', len(active_positions)), ('Проблемы', 0)])}"
+                                           ),
                                            parse_mode='HTML')
             return
 
-        summary_msg = f"🚑 <b>RECOVERY REPORT</b>\nОбнаружено проблем: {len(issues)}\n"
+        summary_msg = (
+            f"{format_header('⚠️', 'RECOVERY')}\n\n"
+            f"📊 <b>Статус</b>\n"
+            f"{format_value_block([('Позиции', len(active_positions)), ('Проблемы', len(issues))])}\n\n"
+            f"{format_action('проверьте предупреждения по позициям')}"
+        )
         await context.bot.send_message(chat_id=ALLOWED_ID, text=summary_msg, parse_mode='HTML')
 
         for issue in issues:
-            msg = f"⚠️ <b>{issue['sym']}</b>: {issue['desc']}"
+            msg = (
+                f"{format_header('⚠️', 'WARNING')}\n"
+                f"Position: {h(issue['sym'])}\n\n"
+                f"{format_warning_list(issue['desc'].split(', '))}\n\n"
+                f"{format_action('восстановите защиту или закройте позицию вручную')}"
+            )
             await context.bot.send_message(chat_id=ALLOWED_ID, text=msg,
                                            reply_markup=InlineKeyboardMarkup([issue['kb']]), parse_mode='HTML')
 

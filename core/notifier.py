@@ -20,6 +20,7 @@
 
 import html
 import logging
+import re
 import time
 
 # ---------------------------------------------------------------------------
@@ -59,6 +60,57 @@ _ICONS = {
     INFO:                "ℹ️",
     TIMEOUT:             "⏱",
 }
+
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b("
+    r"api[_ -]?(?:key|secret)|"
+    r"telegram[_ -]?(?:token|bot[_ -]?token)|"
+    r"bot[_ -]?token|access[_ -]?token|token|"
+    r"authorization|signature"
+    r")\b(\s*[:=]\s*)"
+    r"(?:bearer\s+)?[\"']?[^\s,;\"']+"
+)
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_TELEGRAM_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
+_TRACEBACK_RE = re.compile(
+    r"(?i)\btraceback(?: \(most recent call last\))?\s*:?\s*"
+)
+_STACK_FRAME_RE = re.compile(
+    r"(?i)^\s*(?:file\s+[\"'].+?[\"'],\s*line\s+\d+|at\s+\S+|\^+)\s*$"
+)
+
+
+def sanitize_operator_text(value, limit: int = 240) -> str:
+    """Возвращает короткий operator-safe текст без traceback и секретов."""
+    text = html.unescape(re.sub(r"</?(?:b|i|code|pre)>", "", str(value), flags=re.IGNORECASE))
+    trace_match = _TRACEBACK_RE.search(text)
+    if trace_match:
+        prefix = text[:trace_match.start()].strip()
+        if prefix:
+            text = prefix
+        else:
+            tail_lines = [
+                line.strip()
+                for line in text[trace_match.end():].splitlines()
+                if line.strip() and not _STACK_FRAME_RE.match(line)
+            ]
+            text = tail_lines[-1] if tail_lines else ""
+
+    clean_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not _STACK_FRAME_RE.match(line)
+    ]
+    text = " ".join(clean_lines)
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\1\2[REDACTED]", text)
+    text = _BEARER_RE.sub("Bearer [REDACTED]", text)
+    text = _TELEGRAM_TOKEN_RE.sub("[REDACTED]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        text = "Техническая ошибка без безопасных деталей."
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -124,15 +176,13 @@ async def alert_bybit_error(exc: Exception, fn_name: str) -> None:
         return
     cls = classify_error(exc)
     dedup_key = f"bybit_err_{cls}_{fn_name}"
-    safe_msg = html.escape(str(exc)[:120])
-    safe_fn = html.escape(fn_name)
     level = "WARNING" if cls == TIMEOUT else "ERROR"
     await send_alert(
         _alert_bot,
         _alert_owner_id,
         level=level,
         alert_class=cls,
-        msg=f"Bybit error in <code>{safe_fn}</code>:\n<code>{safe_msg}</code>",
+        msg=f"Bybit error in {fn_name}: {str(exc)[:240]}",
         dedup_key=dedup_key,
     )
 
@@ -177,8 +227,25 @@ async def send_alert(
 
     _dedup[dedup_key] = time.time()
 
-    icon = _ICONS.get(alert_class, "🔔")
-    text = f"{icon} <b>[{level}/{alert_class}]</b>\n{msg}"
+    is_error = level.upper() == "ERROR"
+    icon = "❌" if is_error else "⚠️"
+    status = "ERROR" if is_error else "WARNING"
+    operator_msg = sanitize_operator_text(msg)
+    safe_msg = html.escape(operator_msg)
+    safe_class = html.escape(str(alert_class))
+    section = "❌ <b>Ошибка</b>" if is_error else "⚠️ <b>Предупреждения</b>"
+    action = (
+        "проверьте технические детали и состояние Bybit"
+        if is_error else "проверьте состояние бота"
+    )
+    text = (
+        f"{icon} <b>BYBIT BOT | {status}</b>\n\n"
+        f"{section}\n"
+        f"• {safe_msg}\n\n"
+        f"📋 <b>Детали</b>\n"
+        f"<code>Класс: {safe_class}</code>\n\n"
+        f"▶️ <b>Действие:</b> {action}"
+    )
 
     try:
         await bot.send_message(chat_id=owner_id, text=text, parse_mode="HTML")
@@ -187,7 +254,7 @@ async def send_alert(
                 "class": alert_class,
                 "level": level,
                 "ts": _dedup[dedup_key],
-                "msg": msg[:120],
+                "msg": operator_msg,
             }
         )
         return True
