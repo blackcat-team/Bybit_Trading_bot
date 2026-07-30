@@ -12,7 +12,7 @@ for mod in ["pybit", "pybit.unified_trading", "telegram", "telegram.ext", "teleg
 
 # dotenv и colorama должны быть «настоящими» для загрузки конфига
 _dotenv_mock = MagicMock()
-_dotenv_mock.load_dotenv = lambda: None
+_dotenv_mock.load_dotenv = lambda **_: None
 sys.modules.setdefault("dotenv", _dotenv_mock)
 sys.modules.setdefault("colorama", MagicMock())
 

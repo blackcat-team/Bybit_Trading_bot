@@ -80,7 +80,7 @@ def _caught(error):
 
 
 async def _updater_network_error():
-    """Raise through PTB 20.8 polling_action_cb without a network request."""
+    """Raise through PTB polling_action_cb without a network request."""
 
     class Bot:
         async def get_updates(self, **kwargs):
@@ -101,10 +101,6 @@ async def _updater_network_error():
     await updater._start_polling(
         poll_interval=0.001,
         timeout=30,
-        read_timeout=None,
-        write_timeout=None,
-        connect_timeout=None,
-        pool_timeout=None,
         bootstrap_retries=0,
         drop_pending_updates=None,
         allowed_updates=None,
