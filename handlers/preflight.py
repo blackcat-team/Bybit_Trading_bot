@@ -15,6 +15,19 @@ def _safe_float(val, default: float = 0.0) -> float:
     return safe_float(val, default)
 
 
+def _finite_fallback_value(val, *, empty_default: float | None = 0.0) -> float | None:
+    """Parse a fallback component without accepting malformed or non-finite data."""
+    if val is None:
+        return None
+    if isinstance(val, str) and not val.strip():
+        return empty_default
+    try:
+        parsed = float(val)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 def get_available_usd(account_data: dict) -> tuple:
     """
     Извлекает доступный баланс из ответа get_wallet_balance.
@@ -42,19 +55,46 @@ def get_available_usd(account_data: dict) -> tuple:
             break
 
     if usdt_coin:
-        wb = _safe_float(usdt_coin.get('walletBalance'))
-        pos_im = _safe_float(usdt_coin.get('totalPositionIM'))
-        ord_im = _safe_float(usdt_coin.get('totalOrderIM'))
-        locked = _safe_float(usdt_coin.get('locked'))
-        bonus = _safe_float(usdt_coin.get('bonus'))
+        wb = _finite_fallback_value(usdt_coin.get('walletBalance'))
+        pos_im = _finite_fallback_value(usdt_coin.get('totalPositionIM'))
+        ord_im = _finite_fallback_value(usdt_coin.get('totalOrderIM'))
+        locked = _finite_fallback_value(usdt_coin.get('locked'))
+        bonus = _finite_fallback_value(usdt_coin.get('bonus'))
+
+        components = {
+            "walletBalance": wb,
+            "totalPositionIM": pos_im,
+            "totalOrderIM": ord_im,
+            "locked": locked,
+            "bonus": bonus,
+        }
+        invalid = [name for name, value in components.items() if value is None]
+        if invalid:
+            logging.warning(
+                "Balance coin fallback unavailable: invalid or non-finite %s",
+                ", ".join(invalid),
+            )
+            return 0.0, "fail_closed"
 
         # Если ключевые поля имеют данные (хотя бы walletBalance)
         if wb > 0:
-            available = max(0.0, wb - pos_im - ord_im - locked - bonus)
-            logging.warning(
-                f"⚠️ totalAvailableBalance empty → coin fallback: "
-                f"wb={wb:.1f} - posIM={pos_im:.1f} - ordIM={ord_im:.1f} "
-                f"- locked={locked:.1f} - bonus={bonus:.1f} = {available:.1f}"
+            raw_available = wb - pos_im - ord_im - locked - bonus
+            available = max(0.0, raw_available)
+            if raw_available < 0:
+                logging.warning(
+                    "Balance coin fallback produced a negative result: available=%.2f USDT",
+                    raw_available,
+                )
+                return available, "coin_fallback"
+            logging.info(
+                "Balance fallback used: available=%.2f USDT wallet=%.2f "
+                "positionIM=%.2f orderIM=%.2f locked=%.2f bonus=%.2f",
+                available,
+                wb,
+                pos_im,
+                ord_im,
+                locked,
+                bonus,
             )
             return available, "coin_fallback"
 

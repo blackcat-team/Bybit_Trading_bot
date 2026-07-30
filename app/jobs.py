@@ -9,6 +9,7 @@
 import asyncio
 import time
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from telegram.ext import ContextTypes
 
@@ -17,7 +18,14 @@ from core.config import ALLOWED_ID, ORDER_TIMEOUT_DAYS
 from core.database import is_trading_enabled, get_risk_for_symbol, RISK_MAPPING, get_source_at_time
 from core.trading_core import session
 from core.bybit_call import bybit_call
-from core.notifier import send_alert, classify_error, WARNING, FAIL_CLOSED, TIMEOUT
+from core.notifier import (
+    send_alert,
+    alert_bybit_error,
+    classify_error,
+    WARNING,
+    FAIL_CLOSED,
+    TIMEOUT,
+)
 from core.journal import (
     append_event, read_events, CLOSED,
     check_and_quarantine_sources,
@@ -34,6 +42,51 @@ from handlers.ui import (
 
 # Засекаем время старта
 START_TIME = time.time()
+
+
+def _bybit_error_code(exc: Exception) -> int | None:
+    """Return an explicit Bybit code, with a narrow legacy ErrCode fallback."""
+    for attr in ("status_code", "retCode", "ret_code"):
+        raw_code = getattr(exc, attr, None)
+        try:
+            if raw_code is not None:
+                return int(raw_code)
+        except (TypeError, ValueError):
+            continue
+
+    match = re.search(r"(?i)\bErrCode\s*:\s*(34040)\b", str(exc))
+    return int(match.group(1)) if match else None
+
+
+async def _set_auto_be_stop(symbol: str, target_sl: float) -> tuple[bool, bool]:
+    """Set an Auto-BE SL and distinguish a real update from Bybit's benign no-op."""
+    try:
+        await bybit_call(
+            session.set_trading_stop,
+            category="linear",
+            symbol=symbol,
+            stopLoss=str(target_sl),
+            slTriggerBy="LastPrice",
+            _alert_errors=False,
+        )
+    except Exception as exc:
+        if _bybit_error_code(exc) == 34040:
+            logging.info(
+                "Auto-BE: %s SL already set to %s — no change required (Bybit 34040)",
+                symbol,
+                target_sl,
+            )
+            return True, False
+
+        # Preserve the normal bybit_call operator-alert contract for every
+        # exception that is not the explicitly benign 34040 response.
+        try:
+            await alert_bybit_error(exc, "set_trading_stop")
+        except Exception:
+            pass
+        raise
+
+    return True, True
 
 
 # --- 1. Heartbeat (Проверка пульса) ---
@@ -152,13 +205,9 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
                 new_sl = round(round(new_sl / tick) * tick, 6)
 
                 try:
-                    await bybit_call(
-                        session.set_trading_stop,
-                        category="linear",
-                        symbol=sym,
-                        stopLoss=str(new_sl),
-                        slTriggerBy="LastPrice",
-                    )
+                    _, changed = await _set_auto_be_stop(sym, new_sl)
+                    if not changed:
+                        continue
                     logging.info(f"♻️ {action_tag}: {sym} SL moved to {new_sl}")
                     await context.bot.send_message(
                         chat_id=ALLOWED_ID,

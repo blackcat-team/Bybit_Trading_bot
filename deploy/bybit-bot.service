@@ -53,7 +53,7 @@ AmbientCapabilities=
 # --- Logging ---
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=bybit-bot
+SyslogIdentifier=bybit-trading-bot
 
 [Install]
 WantedBy=multi-user.target

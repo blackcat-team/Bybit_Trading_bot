@@ -22,7 +22,7 @@ _SLOW_CALL_THRESHOLD = 0.5  # секунды
 _SLOW_CALL_WARN = os.getenv("BYBIT_SLOW_CALL_WARN", "").lower() in ("1", "true")
 
 
-async def bybit_call(fn, *args, **kwargs):
+async def bybit_call(fn, *args, _alert_errors=True, **kwargs):
     """Запускает синхронный вызов Bybit SDK в пуле потоков, не блокируя event loop.
 
     Вызовы медленнее _SLOW_CALL_THRESHOLD секунд логируются на уровне DEBUG.
@@ -37,11 +37,12 @@ async def bybit_call(fn, *args, **kwargs):
     try:
         result = await asyncio.to_thread(fn, *args, **kwargs)
     except Exception as exc:
-        try:
-            from core.notifier import alert_bybit_error
-            await alert_bybit_error(exc, name)
-        except Exception:
-            pass  # ошибка алертинга не должна подавлять реальное исключение
+        if _alert_errors:
+            try:
+                from core.notifier import alert_bybit_error
+                await alert_bybit_error(exc, name)
+            except Exception:
+                pass  # ошибка алертинга не должна подавлять реальное исключение
         raise
 
     elapsed = time.monotonic() - t0
