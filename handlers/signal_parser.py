@@ -150,7 +150,12 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     pos_value_usd = 0.0
-    msg_obj = update.message
+    # Фильтр MessageHandler отбирает update.effective_message (обычное сообщение,
+    # отредактированное, channel_post или edited_channel_post). Обращаемся к тому
+    # же объекту, а не к update.message, который может быть None для этих типов.
+    msg_obj = update.effective_message
+    if msg_obj is None:
+        return
     raw = msg_obj.text or msg_obj.caption
     if not raw:
         return
@@ -160,7 +165,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         can_trade, pnl_today = await bybit_call(check_daily_limit)
         if not can_trade:
-            await update.message.reply_text(
+            await msg_obj.reply_text(
                 format_warning_message(
                     [f"Дневной PnL достиг лимита: {pnl_today:.2f} USDT."],
                     action="торговля заблокирована до сброса дневного лимита",
@@ -194,7 +199,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── Source quarantine check ────────────────────────────────────────
         if not is_source_enabled(source_tag):
-            await update.message.reply_text(
+            await msg_obj.reply_text(
                 format_warning_message(
                     [f"Источник {source_tag} находится в карантине."],
                     action="используйте разрешённый источник сигнала",
@@ -211,7 +216,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if not ticker_list:
                 logging.warning(f"⚠️ Symbol {sym} not found on Bybit.")
-                await update.message.reply_text(
+                await msg_obj.reply_text(
                     format_error_message(
                         "Инструмент не найден на Bybit.",
                         context=sym,
@@ -232,7 +237,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             entry_price = market_price
         elif entry_val is None:
             # is_market=False и entry_val=None → пользователь не указал цену и нет MARKET
-            await update.message.reply_text(
+            await msg_obj.reply_text(
                 format_error_message(
                     "Не указана цена входа.",
                     action="добавьте цену, 0 или Market и отправьте сигнал заново",
@@ -249,7 +254,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if (side == "LONG" and stop_val >= entry_price) or (
                 side == "SHORT" and stop_val <= entry_price
             ):
-                await update.message.reply_text(
+                await msg_obj.reply_text(
                     format_error_message(
                         "SL противоречит направлению сигнала.",
                         context=f"{sym} · {side}",
@@ -267,7 +272,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Противоположное направление: fail-closed + алерт владельцу.
         conflict_action, conflict_reason = await resolve_signal_conflict(sym, side)
         if conflict_action == "block":
-            await update.message.reply_text(
+            await msg_obj.reply_text(
                 format_warning_message(
                     [conflict_reason],
                     context=f"{sym} · {side}",
@@ -286,7 +291,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
         elif conflict_action == "ignore":
-            await update.message.reply_text(
+            await msg_obj.reply_text(
                 format_warning_message(
                     [conflict_reason],
                     context=f"{sym} · {side}",
@@ -303,7 +308,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lev = 5 if diff_pct <= 8 else 3 if diff_pct <= 12 else 1
 
         if diff_pct > 15:
-            await update.message.reply_text(
+            await msg_obj.reply_text(
                 format_warning_message(
                     [f"Расстояние до SL {diff_pct:.1f}% превышает допустимое."],
                     context=f"{sym} · {side}",
@@ -350,7 +355,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             if reason == "REJECT":
-                await update.message.reply_text(
+                await msg_obj.reply_text(
                     format_error_message(
                         "Недостаточно маржи даже для минимального лота.",
                         context=f"{sym} · {side}",
@@ -362,7 +367,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             if reason == "CLIPPED":
-                await update.message.reply_text(
+                await msg_obj.reply_text(
                     format_warning_message(
                         [
                             f"Объём уменьшен: {details['desired_qty']} → {qty}.",
@@ -378,7 +383,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logging.error(f"Preflight critical error for {sym}: {e}")
-            await update.message.reply_text(
+            await msg_obj.reply_text(
                 format_error_message(
                     "Не удалось проверить доступную маржу.",
                     context=f"{sym} · {side}",
@@ -401,7 +406,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if not heat_allowed:
             action_word = "В очереди" if heat_reason.startswith("queued") else "Отклонено"
-            await update.message.reply_html(
+            await msg_obj.reply_html(
                 format_warning_message(
                     [f"{action_word}: превышен лимит Heat."],
                     context=f"{sym} · {side}",
@@ -422,7 +427,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sym, side, stop_val, qty, effective_lev, REQUIRE_MARKET_CONFIRM
             )
             kb = [[InlineKeyboardButton(btn_label, callback_data=cb_data)]]
-            await update.message.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
+            await msg_obj.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
         else:
             msg = format_limit_signal(
                 sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
@@ -442,11 +447,11 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "order_type": "limit",
                 },
             )
-            await update.message.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
+            await msg_obj.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
 
     except Exception as e:
         logging.error(f"Trade Error: {e}")
-        await update.message.reply_text(
+        await msg_obj.reply_text(
             format_error_message(
                 "Не удалось обработать торговый сигнал.",
                 action="проверьте сигнал и повторите попытку",
