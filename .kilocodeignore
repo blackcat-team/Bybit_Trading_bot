@@ -1,0 +1,35 @@
+# Environment and credentials
+.env
+.env/
+.env.*
+!.env.example
+
+# Keys and certificates
+*.key
+*.pem
+*.p12
+*.pfx
+credentials/
+secrets/
+
+# Production snapshots and runtime state
+.prod-snapshot/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# Virtual environments and caches
+.venv/
+venv/
+pycache/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+
+# Other agent-local state
+.codex/
+.serena/
+.idea/
