@@ -266,8 +266,10 @@ class TestPositionCardHtml:
 # ── format_orders_menu_html ───────────────────────────────────────────────────
 
 _SAMPLE_ORDERS = [
-    {"side": "Sell", "price": "0.0835", "qty": "1333", "reduceOnly": True,  "orderId": "a1"},
-    {"side": "Buy",  "price": "0.07",   "qty": "500",  "reduceOnly": False, "orderId": "a2"},
+    {"side": "Sell", "price": "0.0835", "qty": "1333", "reduceOnly": True,
+     "orderType": "Limit", "orderId": "a1"},
+    {"side": "Buy",  "price": "0.07",   "qty": "500",  "reduceOnly": False,
+     "orderType": "Limit", "orderId": "a2"},
 ]
 
 
@@ -280,17 +282,20 @@ class TestOrdersMenuHtml:
         msg = format_orders_menu_html(_EVIL, [])
         assert "&lt;" in msg and "&amp;" in msg
 
-    def test_order_side_escaped(self):
+    def test_order_side_not_injected(self):
+        # Невалидный side больше не приводится механически к Short: показывается
+        # нейтральная метка, сырое значение в сообщение не попадает.
         orders = [{"side": "<Sell>", "price": "1.0", "qty": "1", "reduceOnly": False}]
         msg = format_orders_menu_html("X", orders)
         assert "<Sell>" not in msg
-        assert "Short" in msg
+        assert "неизвестно" in msg
 
-    def test_price_escaped(self):
+    def test_non_numeric_price_not_injected(self):
+        # Неразбираемая цена не выдаётся за настоящую и не попадает в HTML сырой.
         orders = [{"side": "Sell", "price": "<1.0>", "qty": "1", "reduceOnly": False}]
         msg = format_orders_menu_html("X", orders)
         assert "<1.0>" not in msg
-        assert "&lt;1.0&gt;" in msg
+        assert "недоступна" in msg
 
     def test_code_blocks_present(self):
         msg = format_orders_menu_html("X", _SAMPLE_ORDERS)
@@ -307,13 +312,13 @@ class TestOrdersMenuHtml:
         assert "<code>" not in msg
         assert "X" in msg
 
-    def test_takeprofitexit_label(self):
+    def test_closing_limit_label(self):
         msg = format_orders_menu_html("X", _SAMPLE_ORDERS)
-        assert "TakeProfit/Exit" in msg
+        assert "ЛИМИТ НА ЗАКРЫТИЕ" in msg
 
     def test_entry_limit_label(self):
         msg = format_orders_menu_html("X", _SAMPLE_ORDERS)
-        assert "Entry Limit" in msg
+        assert "LIMIT ENTRY" in msg
 
     def test_order_count_shown(self):
         msg = format_orders_menu_html("CROUSDT", _SAMPLE_ORDERS)

@@ -13,11 +13,14 @@ from core.utils import safe_float
 from handlers.orders import bybit_call
 from handlers.views_positions import check_positions
 from handlers.ui import (
+    build_cancel_callback,
+    format_cancel_button_text,
     format_error_message,
     format_header,
     format_orders_list_html,
     format_orders_menu_html,
     h,
+    is_closing_order,
 )
 
 
@@ -30,7 +33,9 @@ async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         orders_resp = await bybit_call(session.get_open_orders, category="linear", settleCoin="USDT")
         orders = orders_resp['result']['list']
-        active_orders = [o for o in orders if not o.get('reduceOnly')]
+        # Единый контракт closing: одного truthy reduceOnly недостаточно —
+        # закрывающий ордер может иметь reduceOnly=False и closeOnTrigger=True.
+        active_orders = [o for o in orders if not is_closing_order(o)]
 
         if not active_orders:
             text = (
@@ -47,14 +52,16 @@ async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = []
 
         for o in active_orders:
-            sym  = o['symbol']
-            side = o['side']
-            price = o['price']
-            qty  = o['qty']
-            oid  = o['orderId']
+            sym = o['symbol']
 
-            btn_text = f"❌ {sym} {price}"
-            cb_data = f"cancel_o|{sym}|{oid}|list"
+            # Для условного stop-entry цена берётся из triggerPrice, а не price="0".
+            cb_data = build_cancel_callback(sym, o.get('orderId'), "list")
+            if cb_data is None:
+                # Карточка ордера уже показана; кнопку не создаём, чтобы не
+                # обрезать orderId и не нарушить лимит callback_data.
+                logging.warning("view_orders: cancel button skipped for %s (callback too long)", sym)
+                continue
+            btn_text = f"{format_cancel_button_text(o)} {sym}"
             keyboard.append([InlineKeyboardButton(btn_text, callback_data=cb_data)])
 
         keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data="refresh_orders")])
@@ -104,23 +111,30 @@ async def view_symbol_orders(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return
 
         # Fail-closed: скрываем кнопку «Закрыть по рынку», если проверка позиции не удалась или size=0.
+        # Тот же ответ переиспользуется для правдивого показа стороны закрываемой
+        # позиции — дополнительных запросов к Bybit не выполняется.
         has_position = False
+        positions = []
         try:
             pos_resp = await bybit_call(session.get_positions, category="linear", symbol=symbol)
-            has_position = _has_open_position(pos_resp['result']['list'], symbol)
+            positions = pos_resp['result']['list']
+            has_position = _has_open_position(positions, symbol)
         except Exception as pos_err:
             logging.warning("view_symbol_orders: position check failed for %s: %s", symbol, pos_err)
 
         orders.sort(key=lambda x: x.get('reduceOnly', False))
 
-        msg_text = format_orders_menu_html(symbol, orders)
+        msg_text = format_orders_menu_html(symbol, orders, positions)
 
         keyboard = []
         for o in orders:
-            price = o['price']
-            oid   = o['orderId']
-            cb_data = f"cancel_o|{symbol}|{oid}|sym"
-            keyboard.append([InlineKeyboardButton(f"❌ Отменить {price}", callback_data=cb_data)])
+            cb_data = build_cancel_callback(symbol, o.get('orderId'), "sym")
+            if cb_data is None:
+                logging.warning(
+                    "view_symbol_orders: cancel button skipped for %s (callback too long)", symbol
+                )
+                continue
+            keyboard.append([InlineKeyboardButton(format_cancel_button_text(o), callback_data=cb_data)])
 
         if has_position:
             keyboard.append([InlineKeyboardButton(f"⛔ Закрыть Market {symbol}", callback_data=f"close_confirm|{symbol}")])

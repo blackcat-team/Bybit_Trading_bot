@@ -7,10 +7,12 @@
 """
 
 import html as _html
+import math
 import re
 from collections.abc import Mapping
 
 from core.notifier import sanitize_operator_text
+from core.utils import safe_float
 
 
 TELEGRAM_TEXT_LIMIT = 4096
@@ -392,31 +394,332 @@ def format_position_card(sym, side, pnl, current_r, *, entry=None, qty=None,
 
 
 def format_orders_list_html(orders: list) -> str:
+    """Компактный список ордеров. Условный stop-entry показывает свой триггер.
+
+    Formatter не полагается на инвариант вызывающей стороны: закрывающий ордер
+    определяется здесь самостоятельно и никогда не выдаётся за вход. Buy у
+    закрывающего ордера не превращается в Long.
+    """
     lines = [format_header("📋", "ORDERS"), f"Активных ордеров: {len(orders)}"]
     for order in orders:
-        direction = _direction(order.get("side", ""))
-        block = format_value_block([
-            ("Тип", order.get("orderType") or "Limit"),
-            ("Цена", order.get("price") or "Market"),
-            ("Объём", order.get("qty")),
-        ])
-        lines.extend(["", f"📌 {h(order.get('symbol', '—'))} · {direction}", block])
+        emoji, label = classify_order(order)
+        if is_closing_order(order):
+            # Не выдаём закрывающий ордер за вход даже при прямом вызове.
+            rows = describe_order_direction(order, resolve_position_side(order))
+        else:
+            rows = describe_order_direction(order)
+            rows.insert(0, ("Тип", label))
+        rows.extend(format_conditional_price_rows(order))
+        rows.append(("Объём", order.get("qty")))
+        block = format_value_block(rows)
+        header = f"{emoji} {h(order.get('symbol', '—'))} · {h(label)}"
+        lines.extend(["", header, block])
     return "\n".join(lines)
 
 
-def format_orders_menu_html(symbol: str, orders: list) -> str:
+# ── Правдивое отображение условных ордеров (SL/TP) ───────────────────────────
+#
+# Bybit V5 для условных Market-ордеров возвращает price="0", а фактическая
+# цена срабатывания лежит в triggerPrice. Тип (SL или TP) определяется полем
+# stopOrderType, а side у reduce-only ордера означает закрытие позиции, а не
+# открытие новой. Хелперы ниже опираются только на фактические поля ответа и
+# при недостатке данных возвращают нейтральную метку вместо догадки.
+
+# Метки stopOrderType, которые Bybit возвращает для защиты позиции.
+_SL_TYPES = {"stoploss", "partialstoploss"}
+_TP_TYPES = {"takeprofit", "partialtakeprofit"}
+_TRAILING_TYPES = {"trailingstop"}
+
+
+def _price_or_none(raw) -> str | None:
+    """Возвращает исходную строку цены, если это конечное ненулевое число.
+
+    Не использует truthy-проверку: строковый ``"0"`` истинен в Python, поэтому
+    значение разбирается численно. Возвращает None для None, ``""``,
+    ``"0"``, ``"0.00"``, nan/inf и любого неразбираемого значения.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if text == "":
+        return None
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value == 0:
+        return None
+    # Отдаём строку биржи как есть — без переформатирования и потери точности.
+    return text
+
+
+def _is_true(raw) -> bool:
+    """Приводит булево поле Bybit (bool или строка ``"true"``/``"false"``) к bool."""
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() == "true"
+
+
+def _stop_order_type(order: Mapping) -> str:
+    return str(order.get("stopOrderType") or "").strip().lower()
+
+
+def _is_conditional(order: Mapping) -> bool:
+    """True, если ордер условный: есть triggerPrice, stopOrderType или orderFilter."""
+    if _price_or_none(order.get("triggerPrice")) is not None:
+        return True
+    if _stop_order_type(order):
+        return True
+    return str(order.get("orderFilter") or "").strip().lower() == "stoporder"
+
+
+def is_closing_order(order: Mapping) -> bool:
+    """True, если ордер сокращает/закрывает позицию, а не открывает новую.
+
+    Единый контракт для formatter и view: closing определяется по фактическим
+    метаданным — ``reduceOnly``, ``closeOnTrigger`` или защитный
+    ``stopOrderType``. Одного truthy ``reduceOnly`` недостаточно: Bybit может
+    вернуть ``reduceOnly=False`` при ``closeOnTrigger=True``.
+    """
+    if _is_true(order.get("reduceOnly")) or _is_true(order.get("closeOnTrigger")):
+        return True
+    return _stop_order_type(order) in (_SL_TYPES | _TP_TYPES | _TRAILING_TYPES)
+
+
+# Внутренний псевдоним сохранён для читаемости вызовов ниже.
+_is_closing = is_closing_order
+
+
+def _order_type(order: Mapping) -> str:
+    """Нормализованный ``orderType``: ``"limit"``, ``"market"`` или ``""``."""
+    value = str(order.get("orderType") or "").strip().lower()
+    return value if value in {"limit", "market"} else ""
+
+
+def classify_order(order: Mapping) -> tuple[str, str]:
+    """Возвращает ``(emoji, label)`` по фактическим метаданным Bybit.
+
+    SL/TP определяются только по ``stopOrderType``. Неизвестный тип никогда не
+    превращается в Limit, Market или TP — он получает нейтральную метку.
+    """
+    stop_type = _stop_order_type(order)
+    if stop_type in _SL_TYPES:
+        return "🛡", "STOP LOSS"
+    if stop_type in _TP_TYPES:
+        return "🎯", "TAKE PROFIT"
+    if stop_type in _TRAILING_TYPES:
+        return "📉", "TRAILING STOP"
+
+    if _is_conditional(order):
+        return "⚠️", "УСЛОВНЫЙ ОРДЕР"
+
+    order_type = _order_type(order)
+    if is_closing_order(order):
+        if order_type == "limit":
+            return "↩️", "ЛИМИТ НА ЗАКРЫТИЕ"
+        if order_type == "market":
+            return "↩️", "ЗАКРЫТИЕ ПО РЫНКУ"
+        # orderType отсутствует/неизвестен — не утверждаем способ исполнения.
+        return "↩️", "ЗАКРЫВАЮЩИЙ ОРДЕР"
+    if order_type == "market":
+        return "📌", "MARKET ENTRY"
+    if order_type == "limit":
+        return "📌", "LIMIT ENTRY"
+    return "📌", "ENTRY ORDER"
+
+
+def _position_side_detail(order: Mapping, positions=None, symbol=None):
+    """Возвращает ``(сторона | None, конфликт: bool)`` для закрываемой позиции.
+
+    Отличает «доказательств нет» (``(None, False)``) от «доказательства
+    противоречат друг другу» (``(None, True)``). Во втором случае вызывающая
+    сторона не имеет права возвращаться к инверсии ``order.side`` — иначе
+    отвергнутая сторона будет показана как достоверная.
+    """
+    target = symbol if symbol is not None else order.get("symbol")
+    active = [
+        p for p in (positions or [])
+        if p.get("symbol") == target and safe_float(p.get("size")) > 0
+    ]
+
+    order_idx = order.get("positionIdx")
+    from_positions = None
+
+    if order_idx is not None and str(order_idx).strip() != "":
+        matched = [p for p in active if str(p.get("positionIdx")) == str(order_idx)]
+        if len(matched) == 1:
+            from_positions = matched[0].get("side")
+    elif len(active) == 1:
+        # Одна однозначная активная позиция — использовать можно.
+        from_positions = active[0].get("side")
+    # len(active) > 1 без positionIdx: случайную сторону не выбираем.
+
+    from_positions = str(from_positions or "").strip().capitalize()
+    if from_positions not in {"Buy", "Sell"}:
+        from_positions = None
+
+    side = str(order.get("side") or "").strip().capitalize()
+    from_semantics = {"Buy": "Sell", "Sell": "Buy"}.get(side) if is_closing_order(order) else None
+
+    if from_positions and from_semantics and from_positions != from_semantics:
+        # Конфликт метаданных — не утверждаем сторону.
+        return None, True
+    return (from_positions or from_semantics), False
+
+
+def resolve_position_side(order: Mapping, positions=None, symbol=None):
+    """Определяет сторону закрываемой позиции без случайного выбора.
+
+    Порядок доказательств:
+
+    1. ``positionIdx`` ордера — сопоставляется с позицией того же symbol и
+       того же ``positionIdx`` (hedge-режим однозначен).
+    2. Без ``positionIdx`` — используется единственная активная позиция; при
+       двух активных сторонах сторона считается неизвестной.
+    3. Reduce-only семантика: Buy может уменьшать только Short, Sell — только
+       Long. Работает и без списка позиций.
+
+    При конфликте между позицией и reduce-only семантикой возвращается None,
+    чтобы не показать уверенную ложную сторону.
+    """
+    return _position_side_detail(order, positions, symbol)[0]
+
+
+def describe_order_direction(order: Mapping, position_side=None,
+                             *, side_conflict: bool = False) -> list[tuple[str, str]]:
+    """Строит правдивые строки «Позиция»/«Действие» либо «Направление».
+
+    Для закрывающего ордера ``side`` не переводится механически в Long/Short:
+    Buy у закрывающего ордера уменьшает Short. *position_side* — уже
+    доказанная сторона позиции (см. :func:`resolve_position_side`); при её
+    отсутствии применяется reduce-only семантика. Если сторону доказать
+    нельзя — возвращается нейтральная метка.
+
+    *side_conflict* — resolver отверг сторону из-за противоречия между
+    position metadata и closing-инверсией. Тогда fallback из ``order.side``
+    запрещён: он вернул бы именно ту сторону, которую resolver отверг.
+    """
+    side = str(order.get("side") or "").strip().capitalize()
+
+    if not is_closing_order(order):
+        if side in {"Buy", "Sell"}:
+            return [("Направление", "Long" if side == "Buy" else "Short")]
+        return [("Направление", "неизвестно")]
+
+    resolved = str(position_side or "").strip().capitalize()
+    if resolved not in {"Buy", "Sell"}:
+        resolved = "" if side_conflict else {"Buy": "Sell", "Sell": "Buy"}.get(side, "")
+
+    if resolved == "Buy":
+        position = "Long"
+    elif resolved == "Sell":
+        position = "Short"
+    else:
+        position = "сторона неизвестна"
+
+    action = f"{side} (закрытие)" if side in {"Buy", "Sell"} else "закрытие, сторона неизвестна"
+    return [("Позиция", position), ("Действие", action)]
+
+
+def format_conditional_price_rows(order: Mapping) -> list[tuple[str, str]]:
+    """Строит строки цены: триггер и способ исполнения отдельно друг от друга.
+
+    Способ исполнения берётся ТОЛЬКО из ``orderType``. Отсутствие или
+    невалидность ``price`` не является доказательством Market-исполнения.
+    """
+    order_type = _order_type(order)
+
+    if not _is_conditional(order):
+        limit_price = _price_or_none(order.get("price"))
+        if limit_price is not None:
+            return [("Цена", limit_price)]
+        if order_type == "market":
+            return [("Цена", "Market")]
+        return [("Цена", "недоступна")]
+
+    trigger = _price_or_none(order.get("triggerPrice"))
+    rows = [("Триггер", trigger if trigger is not None else "недоступен")]
+
+    if order_type == "market":
+        rows.append(("Исполнение", "Market"))
+    elif order_type == "limit":
+        exec_price = _price_or_none(order.get("price"))
+        rows.append(("Исполнение", "Limit"))
+        rows.append(("Цена исполнения", exec_price if exec_price is not None else "недоступна"))
+    else:
+        rows.append(("Исполнение", "тип неизвестен"))
+    return rows
+
+
+def format_cancel_button_text(order: Mapping) -> str:
+    """Текст кнопки отмены: понятный тип + фактическая цена (не обязательно price)."""
+    _, label = classify_order(order)
+    short = {
+        "STOP LOSS": "SL",
+        "TAKE PROFIT": "TP",
+        "TRAILING STOP": "TS",
+        "УСЛОВНЫЙ ОРДЕР": "услов.",
+        "ЛИМИТ НА ЗАКРЫТИЕ": "закрытие",
+        "ЗАКРЫТИЕ ПО РЫНКУ": "закрытие",
+        "ЗАКРЫВАЮЩИЙ ОРДЕР": "закрытие",
+        "MARKET ENTRY": "вход",
+        "LIMIT ENTRY": "вход",
+        "ENTRY ORDER": "вход",
+    }.get(label, label)
+
+    if _is_conditional(order):
+        price = _price_or_none(order.get("triggerPrice"))
+    else:
+        price = _price_or_none(order.get("price"))
+
+    return f"❌ Отменить {short} {price}" if price is not None else f"❌ Отменить {short}"
+
+
+# Telegram ограничивает callback_data 64 байтами (UTF-8).
+TELEGRAM_CALLBACK_LIMIT = 64
+
+# Компактный префикс отмены; режимы: "l" — общий список, "s" — карточка символа.
+CANCEL_CALLBACK_PREFIX = "co"
+_CANCEL_MODES = {"list": "l", "sym": "s"}
+
+
+def build_cancel_callback(symbol, order_id, mode: str = "list") -> str | None:
+    """Строит компактный ``co|symbol|orderId|l`` callback либо None.
+
+    Возвращает None, если ``orderId`` отсутствует или результат превышает
+    лимит Telegram. Symbol и orderId никогда не обрезаются и не хешируются —
+    отмена должна остаться точной; кнопка просто не создаётся.
+    """
+    oid = str(order_id or "").strip()
+    sym = str(symbol or "").strip()
+    if not oid or not sym:
+        return None
+    short_mode = _CANCEL_MODES.get(mode, mode)
+    data = f"{CANCEL_CALLBACK_PREFIX}|{sym}|{oid}|{short_mode}"
+    if len(data.encode("utf-8")) > TELEGRAM_CALLBACK_LIMIT:
+        return None
+    return data
+
+
+def format_orders_menu_html(symbol: str, orders: list, positions=None) -> str:
+    """Карточки всех ордеров инструмента с правдивыми ценой, типом и стороной.
+
+    *positions* — необязательный список позиций Bybit, который вызывающий уже
+    получил. Он используется только для доказательства стороны закрываемой
+    позиции; новых сетевых вызовов не выполняется.
+    """
     lines = [
         format_header("📋", "ORDERS"),
         f"{h(symbol)} · {len(orders)} орд.",
     ]
     for order in orders:
-        direction = _direction(order.get("side", ""))
-        kind = "TakeProfit/Exit" if order.get("reduceOnly", False) else "Entry Limit"
-        block = format_value_block([
-            ("Сторона", direction),
-            ("Тип", kind),
-            ("Цена", order.get("price", "—")),
-            ("Объём", order.get("qty", "—")),
-        ])
-        lines.extend(["", f"📌 {h(symbol)} · {direction}", block])
+        emoji, label = classify_order(order)
+        # Сторона доказывается для каждого ордера отдельно (hedge-safe).
+        position_side, side_conflict = _position_side_detail(order, positions, symbol)
+        rows = describe_order_direction(order, position_side, side_conflict=side_conflict)
+        rows.extend(format_conditional_price_rows(order))
+        qty = order.get("qty")
+        rows.append(("Объём", qty if qty not in (None, "") else "недоступен"))
+        block = format_value_block(rows)
+        lines.extend(["", f"{emoji} {h(symbol)} · {h(label)}", block])
     return "\n".join(lines)

@@ -142,10 +142,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "back_to_pos":
             await check_positions(update, context)
 
-        elif data.startswith("cancel_o|"):
+        elif data.startswith("cancel_o|") or data.startswith("co|"):
+            # Принимаются оба формата: компактный "co|sym|oid|l" и устаревший
+            # "cancel_o|sym|oid|list" — уже отправленные кнопки должны работать.
             parts = data.split("|")
             sym, oid = parts[1], parts[2]
-            mode = parts[3] if len(parts) > 3 else "list"
+            raw_mode = parts[3] if len(parts) > 3 else "list"
+            mode = "sym" if raw_mode in ("sym", "s") else "list"
 
             try:
                 await bybit_call(session.cancel_order, category="linear", symbol=sym, orderId=oid)
