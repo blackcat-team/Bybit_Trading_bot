@@ -12,6 +12,23 @@ This is the canonical entry point for every coding or review agent in this repos
 
 If a required document is missing, report `NOT READY`.
 
+## Workspace boundary
+
+- Treat the current working directory supplied by the agent client as the
+  repository root.
+- Work only inside the current repository unless the user explicitly approves
+  another path.
+- Do not run `cd` to an absolute path during normal repository work.
+- Do not infer or reuse workspace paths from previous sessions or other
+  repositories.
+- Run Git commands and tests from the current repository root.
+- Before making changes, verify repository identity using:
+  `git status --short --branch`
+- When permission matching matters, prefer separate shell commands instead of
+  combining unrelated operations with `&&`, `;`, or pipelines.
+- If the observed repository path or Git identity conflicts with the task,
+  stop without modifying files and report the mismatch.
+
 ## Authority and scope
 
 - System and platform instructions take precedence. The explicit current task defines the authorized scope and concrete goal; it cannot silently weaken project policies.

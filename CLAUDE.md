@@ -1,3 +1,7 @@
 # Claude Code adapter
 
-Before any work, read [AGENTS.md](AGENTS.md) and follow its required document order. `AGENTS.md` is the sole repository AI contract; this file adds no separate rules or commands.
+@AGENTS.md
+
+`AGENTS.md` is the sole repository AI contract.
+This adapter imports it for Claude Code and defines no additional
+repository rules, commands, or workflow requirements.
