@@ -223,3 +223,87 @@ class TestMarketFallbackSafety:
         query.edit_message_text.assert_called_once()
         msg = query.edit_message_text.call_args[0][0]
         assert "❌" in msg
+
+
+# Readback позиции после размещения: одна успешная строка прерывает опрос.
+_POS_READBACK = {"result": {"list": [{"size": "0.01", "avgPrice": "50000"}]}}
+
+
+class TestMarketEntryCarriesOrderIdentifier:
+    """Точный identifier из ответа размещения попадает в ENTRY_PLACED."""
+
+    @staticmethod
+    async def _entry_event(place_result, *, journal_ok=True):
+        """Прогоняет market-путь и возвращает (event, journal_mock, calls)."""
+        from handlers.buttons import button_handler
+
+        query = _make_query("buy_market|BTCUSDT|LONG|40000|0.01|5")
+        ctx = _make_ctx()
+        update = _make_update(query)
+
+        responses = [
+            {},               # set_leverage
+            _TICKER_OK,
+            _WALLET_OK,
+            _INSTRUMENTS_OK,
+            place_result,     # place_market_with_retry
+            _POS_READBACK,    # readback avgPrice
+        ]
+        calls = []
+        seq = _seq_bybit(responses)
+
+        async def tracking_bybit(fn, *args, **kwargs):
+            calls.append(getattr(fn, "__name__", getattr(fn, "_mock_name", "mock")))
+            return await seq(fn, *args, **kwargs)
+
+        journal = MagicMock(return_value=journal_ok)
+        with patch("handlers.buttons.ALLOWED_ID", _UID), \
+             patch("handlers.buttons.REQUIRE_MARKET_CONFIRM", 0), \
+             patch("handlers.buttons.bybit_call", tracking_bybit), \
+             patch("handlers.buttons.append_event", new=journal), \
+             patch("handlers.buttons.clip_qty", side_effect=RuntimeError("clip failed")):
+            await button_handler(update, ctx)
+
+        assert journal.call_count == 1, "ENTRY_PLACED пишется ровно один раз"
+        return journal.call_args.args[0], journal, calls
+
+    @pytest.mark.asyncio
+    async def test_order_id_from_placement_response_is_recorded(self):
+        """result.orderId уже выполненного размещения → canonical order_id."""
+        place_result = (
+            True, "⚡️ Исполнен Маркет по BTCUSDT", 0.01,
+            {"retCode": 0, "result": {"orderId": " MOID-5 ", "orderLinkId": "MLINK-5"}},
+        )
+        event, _, calls = await self._entry_event(place_result)
+
+        assert event["order_id"] == "MOID-5", "Идентификатор обрезан и записан"
+        assert event["order_link_id"] == "MLINK-5"
+        # Прежний контракт события сохранён
+        assert event["event"] == "ENTRY_PLACED"
+        assert event["symbol"] == "BTCUSDT" and event["order_type"] == "market"
+        for field in ("side", "source_tag", "planned_risk_usdt", "qty", "entry", "stop"):
+            assert field in event, f"Потеряно прежнее поле {field}"
+        # Обнаружение позиции не заменяет exact order correlation
+        assert calls.count("place_market_with_retry") == 1, "Ретраи размещения не менялись"
+
+    @pytest.mark.asyncio
+    async def test_missing_identifier_is_not_invented(self):
+        """Трёхэлементный (legacy) возврат: id не выдумывается, событие прежнее."""
+        event, _, _ = await self._entry_event(_PLACE_OK)
+
+        assert "order_id" not in event and "order_link_id" not in event
+        assert event["symbol"] == "BTCUSDT", "Symbol не подменяет identifier"
+        assert event["order_type"] == "market", "Прежний контракт события сохранён"
+
+    @pytest.mark.asyncio
+    async def test_failed_journal_write_does_not_replace_order(self):
+        """append_event=False: ордер не переразмещается и не отменяется."""
+        place_result = (
+            True, "⚡️ Исполнен Маркет по BTCUSDT", 0.01,
+            {"retCode": 0, "result": {"orderId": "MOID-5"}},
+        )
+        _, _, calls = await self._entry_event(place_result, journal_ok=False)
+
+        assert calls.count("place_market_with_retry") == 1, "Повторное размещение недопустимо"
+        assert not any("cancel" in name for name in calls), \
+            "Автоотмена принятого ордера недопустима"

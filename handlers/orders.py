@@ -35,13 +35,20 @@ def set_leverage_safe(sym: str, lev: int) -> int:
 
 
 def place_limit_order(sym: str, side: str, qty: float, price: float, stop_loss: float):
-    """Размещает лимитный ордер."""
+    """
+    Размещает лимитный ордер.
+
+    Возвращает raw-ответ Bybit: из него берётся точный orderId/orderLinkId для
+    корреляции исполнения при сверке. Дополнительный read ради идентификатора
+    не нужен — он уже есть в ответе на размещение.
+    """
     order_side = "Buy" if side == "LONG" else "Sell"
-    session.place_order(
+    resp = session.place_order(
         category="linear", symbol=sym, side=order_side,
         orderType="Limit", qty=str(qty), price=str(price), stopLoss=str(stop_loss),
     )
     logging.info(f"Limit order placed: {sym} | {side} | Entry: {price} | SL: {stop_loss}")
+    return resp
 
 
 def place_market_with_retry(
@@ -51,35 +58,47 @@ def place_market_with_retry(
     """
     Размещает маркет-ордер. При 110007 уменьшает qty на 1 шаг и ретраит.
 
-    Returns: (success: bool, message: str, final_qty: float)
+    Returns: (success: bool, message: str, final_qty: float, response: dict | None)
+
+    Четвёртый элемент — raw-ответ Bybit на фактически принятое размещение;
+    из него берётся точный orderId/orderLinkId. Изменение backward-compatible:
+    вызывающий код читает элементы по индексу, поэтому прежние трёхэлементные
+    возвраты (в том числе в тестовых заглушках) остаются рабочими.
     """
     try:
-        session.place_order(
+        resp = session.place_order(
             category="linear", symbol=sym, side=order_side,
             orderType="Market", qty=str(qty), stopLoss=sl,
         )
         logging.info(f"⚡ Market order: {sym} | {order_side} | qty={qty}")
-        return True, f"⚡️ Исполнен Маркет по {sym}", qty
+        return True, f"⚡️ Исполнен Маркет по {sym}", qty, resp
     except Exception as ord_err:
         if "110007" in str(ord_err) and qty_step > 0:
             retry_qty = floor_qty(qty - qty_step, qty_step)
             if retry_qty >= min_order_qty and retry_qty > 0:
                 logging.warning(f"⚠️ 110007 retry: {qty} -> {retry_qty}")
                 try:
-                    session.place_order(
+                    retry_resp = session.place_order(
                         category="linear", symbol=sym, side=order_side,
                         orderType="Market", qty=str(retry_qty), stopLoss=sl,
                     )
                     logging.info(f"⚡ Market order (retry): {sym} | {order_side} | qty={retry_qty}")
-                    return True, f"⚡️ Исполнен Маркет по {sym} (retry: {retry_qty})", retry_qty
+                    return (
+                        True, f"⚡️ Исполнен Маркет по {sym} (retry: {retry_qty})",
+                        retry_qty, retry_resp,
+                    )
                 except Exception as retry_err:
                     logging.error(f"Market retry failed: {retry_err}")
-                    return False, f"❌ Market {sym}: {retry_err}", 0.0
+                    return False, f"❌ Market {sym}: {retry_err}", 0.0, None
             else:
-                return False, f"❌ <b>Market {sym}:</b> недостаточно средств даже после retry", 0.0
+                return (
+                    False,
+                    f"❌ <b>Market {sym}:</b> недостаточно средств даже после retry",
+                    0.0, None,
+                )
         else:
             logging.error(f"Market order error: {ord_err}")
-            return False, f"❌ Market {sym}: {ord_err}", 0.0
+            return False, f"❌ Market {sym}: {ord_err}", 0.0, None
 
 
 def close_position_market(sym: str) -> tuple:

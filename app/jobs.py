@@ -11,11 +11,12 @@ import time
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from telegram.ext import ContextTypes
 
 
 from core.config import ALLOWED_ID, ORDER_TIMEOUT_DAYS
-from core.database import is_trading_enabled, get_risk_for_symbol, RISK_MAPPING, get_source_at_time
+from core.database import is_trading_enabled, get_risk_for_symbol, get_source_at_time
 from core.trading_core import session
 from core.bybit_call import bybit_call
 from core.notifier import (
@@ -27,7 +28,11 @@ from core.notifier import (
     TIMEOUT,
 )
 from core.journal import (
-    append_event, read_events, CLOSED,
+    append_event, RECONCILED, POSITION_CONFIRMED,
+    POSITION_NOT_FOUND_ON_EXCHANGE,
+    PENDING, CONFIRMED,
+    get_position_lifecycles,
+    normalize_symbol,
     check_and_quarantine_sources,
     get_disabled_sources,
 )
@@ -35,6 +40,7 @@ from core.utils import safe_float
 from handlers.ui import (
     format_action,
     format_header,
+    format_position_reconciled,
     format_value_block,
     format_warning_list,
     h,
@@ -42,6 +48,133 @@ from handlers.ui import (
 
 # Засекаем время старта
 START_TIME = time.time()
+
+
+class _SnapshotUnknown(Exception):
+    """Снимок позиций недостоверен: ошибка API, malformed payload или отсутствие result/list.
+
+    UNKNOWN != closed. Поднимается вместо возврата пустого списка, чтобы
+    недостоверный ответ никогда не был истолкован как «позиций нет».
+    """
+
+
+def _require_ok_ret_code(resp: dict, what: str) -> None:
+    """Строгая проверка retCode успешного ответа Bybit.
+
+    Успехом считается ТОЛЬКО:
+      - ``type(retCode) is int`` и значение 0 (bool исключён: type(True) is bool);
+      - либо строка, которая после strip в точности равна "0".
+
+    Отклоняются как UNKNOWN: отсутствующий retCode, bool, float (включая 0.0
+    и 0.5), Decimal/Fraction и прочие числовые типы, "0.0", пустая строка,
+    нечисловая строка и любое ненулевое значение. ``int()`` не используется
+    намеренно: int(0.5) == 0 молча превратил бы ошибку в успех.
+    """
+    if "retCode" not in resp:
+        raise _SnapshotUnknown(f"{what}: в ответе отсутствует retCode")
+
+    raw_code = resp["retCode"]
+    if type(raw_code) is int:
+        if raw_code != 0:
+            raise _SnapshotUnknown(
+                f"{what}: retCode={raw_code}, retMsg={resp.get('retMsg', '')}"
+            )
+        return
+    if isinstance(raw_code, str) and raw_code.strip() == "0":
+        return
+    raise _SnapshotUnknown(f"{what}: недопустимый retCode={raw_code!r}")
+
+
+def _require_result_rows(resp, what: str) -> list:
+    """Строго извлекает result.list из успешного ответа Bybit."""
+    if not isinstance(resp, dict):
+        raise _SnapshotUnknown(
+            f"{what}: неожиданный тип ответа {type(resp).__name__}"
+        )
+
+    _require_ok_ret_code(resp, what)
+
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        raise _SnapshotUnknown(f"{what}: отсутствует корректный result")
+    if "list" not in result:
+        raise _SnapshotUnknown(f"{what}: в result отсутствует ключ list")
+
+    rows = result["list"]
+    if not isinstance(rows, list):
+        raise _SnapshotUnknown(f"{what}: result.list не список: {type(rows).__name__}")
+    return rows
+
+
+def _parse_decimal_qty(raw, what: str, *, allow_zero: bool = True) -> Decimal:
+    """Строго разбирает количество (size / cumExecQty) через Decimal.
+
+    bool отклоняется (True не должен становиться 1.0), как и NaN, Infinity,
+    пустая строка, нечисловое значение и отрицательное количество. Truthy-
+    проверки и безусловный float-fallback не используются.
+    """
+    if isinstance(raw, bool):
+        raise _SnapshotUnknown(f"{what}: количество является bool: {raw!r}")
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            raise _SnapshotUnknown(f"{what}: пустое количество")
+        source = text
+    elif isinstance(raw, (int, float, Decimal)):
+        source = raw
+    else:
+        raise _SnapshotUnknown(
+            f"{what}: нечисловое количество {raw!r} ({type(raw).__name__})"
+        )
+
+    try:
+        value = Decimal(source)
+    except (InvalidOperation, TypeError, ValueError):
+        raise _SnapshotUnknown(f"{what}: нечисловое количество {raw!r}") from None
+
+    if not value.is_finite():
+        raise _SnapshotUnknown(f"{what}: неконечное количество {raw!r}")
+    if value < 0:
+        raise _SnapshotUnknown(f"{what}: отрицательное количество {raw!r}")
+    if value == 0 and not allow_zero:
+        raise _SnapshotUnknown(f"{what}: нулевое количество")
+    return value
+
+
+def parse_positions_snapshot(resp) -> set:
+    """Проверяет ответ get_positions и возвращает множество открытых символов.
+
+    SUCCESS требует ЯВНОГО подтверждения по всем пунктам:
+      - payload является dict;
+      - retCode проходит строгий контракт _require_ok_ret_code
+        (default retCode=0 не применяется, int(0.5) не принимается);
+      - result является dict;
+      - ключ list присутствует и является list;
+      - каждая строка — dict с непустым символом и корректным size
+        (bool, отрицательное, NaN, Infinity и нечисловое → UNKNOWN).
+
+    Пустой список при выполненных условиях — достоверное «позиций нет»;
+    size == 0 означает отсутствие позиции по символу.
+
+    Любая malformed строка делает весь снимок UNKNOWN, чтобы не создать ни
+    false confirmation, ни false reconciliation.
+    """
+    rows = _require_result_rows(resp, "get_positions")
+
+    open_syms: set = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise _SnapshotUnknown(
+                f"get_positions: строка позиции не dict: {type(row).__name__}"
+            )
+        symbol = normalize_symbol(row.get("symbol"))
+        if not symbol:
+            raise _SnapshotUnknown("get_positions: в строке позиции отсутствует символ")
+        size = _parse_decimal_qty(row.get("size"), f"get_positions size {symbol}")
+        if size > 0:
+            open_syms.add(symbol)
+    return open_syms
 
 
 def _bybit_error_code(exc: Exception) -> int | None:
@@ -422,77 +555,53 @@ async def time_management_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Обнаруживает позиции, закрытые с момента последней проверки.
+    Сверяет lifecycle bot-tracked позиций с authoritative-снимком Bybit.
 
-    Алгоритм:
-    - Берёт символы из RISK_MAPPING (по которым были входы)
-    - Получает текущие открытые позиции с Bybit
-    - Для каждого отслеживаемого символа без открытой позиции:
-        запрашивает последний закрытый PnL через get_closed_pnl и пишет событие CLOSED
-    - Запускает проверку автокарантина по обновлённой статистике
+    ENTRY_PLACED доказывает лишь принятие ордера, но не появление позиции,
+    поэтому сверка работает по состояниям lifecycle:
+
+    - Снимок проверяется строго (parse_positions_snapshot). Недостоверный
+      снимок → UNKNOWN: выход без записей, уведомлений и очистки состояния.
+    - PENDING + символ присутствует с size > 0 → подтверждение возможно, но
+      только после доказанного исполнения СВОЕГО ордера (_confirm_position):
+      присутствие символа может объясняться более старой ручной позицией.
+      При доказанном cumExecQty > 0 пишется один POSITION_CONFIRMED,
+      без уведомления.
+    - PENDING + символ отсутствует → ничего: незаполненный или отменённый
+      Limit закрытым не считается.
+    - CONFIRMED + символ присутствует → без изменений.
+    - CONFIRMED + символ отсутствует → RECONCILED, затем одно truthful
+      уведомление (только после успешной durable-записи).
+    - TERMINAL → повторно не обрабатывается.
+
+    Ручные позиции без событий журнала боту не присваиваются и не трогаются.
     """
     try:
-        _pos_resp = await bybit_call(
-            session.get_positions, category="linear", settleCoin="USDT"
-        )
-        open_syms = {
-            p["symbol"] for p in _pos_resp["result"]["list"] if safe_float(p.get("size")) > 0
-        }
-
-        # Символы, которые мы отслеживаем, но позиции по ним уже нет
-        tracked_syms = set(RISK_MAPPING.keys())
-        closed_candidates = tracked_syms - open_syms
-
-        if not closed_candidates:
+        try:
+            _pos_resp = await bybit_call(
+                session.get_positions, category="linear", settleCoin="USDT"
+            )
+            open_syms = parse_positions_snapshot(_pos_resp)
+        except _SnapshotUnknown as unknown:
+            # UNKNOWN != closed: состояние не сверяем и ничего не очищаем.
+            logging.warning(
+                "Reconcile: снимок позиций недостоверен (UNKNOWN), сверка пропущена: %s",
+                unknown,
+            )
             return
 
-        # Читаем журнал, чтобы не писать дублирующиеся события CLOSED
-        _closed_evs = await asyncio.to_thread(read_events, event_type=CLOSED)
-        already_closed = {
-            ev["symbol"] for ev in _closed_evs
-            if ev.get("ts", 0) > time.time() - 7 * 86400  # последние 7 дней
-        }
+        lifecycles = await asyncio.to_thread(get_position_lifecycles)
 
-        for sym in closed_candidates:
-            if sym in already_closed:
-                continue
-            try:
-                now_ms = int(time.time() * 1000)
-                start_ms = now_ms - 7 * 24 * 60 * 60 * 1000  # последние 7 дней
-                pnl_resp = await bybit_call(
-                    session.get_closed_pnl,
-                    category="linear", symbol=sym,
-                    startTime=start_ms, limit=1,
-                )
-                trades = pnl_resp.get("result", {}).get("list", [])
-                if not trades:
-                    continue
+        for sym in sorted(lifecycles):
+            info = lifecycles[sym]
+            state = info.get("state")
+            present = sym in open_syms
 
-                t = trades[0]
-                pnl_usdt = safe_float(t.get("closedPnl"), field="closedPnl")
-                risk_usd = get_risk_for_symbol(sym) or 1.0
-                r_val = pnl_usdt / risk_usd if risk_usd > 0 else 0.0
-
-                close_ts = int(t.get("updatedTime", time.time() * 1000))
-                src = get_source_at_time(sym, close_ts)
-
-                await asyncio.to_thread(append_event, {
-                    "event": CLOSED,
-                    "symbol": sym,
-                    "side": t.get("side", ""),
-                    "source_tag": src,
-                    "planned_risk_usdt": risk_usd,
-                    "qty": safe_float(t.get("qty"), field="qty"),
-                    "entry": safe_float(t.get("avgEntryPrice"), field="avgEntryPrice"),
-                    "stop": 0.0,
-                    "exit": safe_float(t.get("avgExitPrice"), field="avgExitPrice"),
-                    "pnl_usdt": pnl_usdt,
-                    "R": round(r_val, 2),
-                    "hold_time_sec": 0,
-                })
-                logging.info("Reconcile: CLOSED event written for %s (PnL %.2f$)", sym, pnl_usdt)
-            except Exception as sym_err:
-                logging.debug("reconcile: %s: %s", sym, sym_err)
+            if state == PENDING and present:
+                await _confirm_position(sym, info)
+            elif state == CONFIRMED and not present:
+                await _reconcile_missing_position(context, sym, info)
+            # PENDING без позиции, CONFIRMED с позицией и TERMINAL — без действий.
 
         # Проверка условий автокарантина
         try:
@@ -517,6 +626,195 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
                 )
         except Exception:
             pass
+
+
+def _lifecycle_order_ids(info: dict) -> tuple[str, str]:
+    """Возвращает (orderId, orderLinkId) текущего ENTRY_PLACED, если они есть.
+
+    Отсутствующие идентификаторы дают пустые строки: их наличие обязательно
+    для подтверждения, а придумывать их нельзя.
+    """
+    def _clean(raw) -> str:
+        return raw.strip() if isinstance(raw, str) else ""
+
+    return _clean(info.get("order_id")), _clean(info.get("order_link_id"))
+
+
+async def _fetch_fill_evidence(sym: str, order_id: str, order_link_id: str) -> Decimal:
+    """Возвращает доказанный исполненный объём именно этого ордера.
+
+    Read-only запрос get_order_history по точному orderId/orderLinkId.
+    Ответ проходит тот же строгий контракт, что и снимок позиций. Доказательством
+    считается только строка с точным совпадением идентификатора и cumExecQty > 0.
+
+    Поднимает _SnapshotUnknown при timeout/exception, malformed ответе,
+    невалидном retCode, отсутствии ордера, несовпадении идентификатора и
+    отсутствующем либо нулевом исполненном объёме. Совпадения только по symbol
+    или side доказательством не являются.
+    """
+    kwargs = {"category": "linear", "symbol": sym, "limit": 50}
+    if order_id:
+        kwargs["orderId"] = order_id
+    else:
+        kwargs["orderLinkId"] = order_link_id
+
+    try:
+        resp = await bybit_call(session.get_order_history, **kwargs)
+    except Exception as exc:
+        raise _SnapshotUnknown(
+            f"get_order_history недоступен для {sym}: {exc}"
+        ) from None
+
+    rows = _require_result_rows(resp, "get_order_history")
+
+    for row in rows:
+        if not isinstance(row, dict):
+            raise _SnapshotUnknown(
+                f"get_order_history: строка не dict: {type(row).__name__}"
+            )
+        row_id = row.get("orderId")
+        row_link = row.get("orderLinkId")
+        row_id = row_id.strip() if isinstance(row_id, str) else ""
+        row_link = row_link.strip() if isinstance(row_link, str) else ""
+
+        exact = (order_id and row_id == order_id) or (
+            order_link_id and row_link == order_link_id
+        )
+        if not exact:
+            continue
+        if "cumExecQty" not in row:
+            raise _SnapshotUnknown(
+                f"get_order_history: у ордера {order_id or order_link_id} нет cumExecQty"
+            )
+        return _parse_decimal_qty(
+            row.get("cumExecQty"),
+            f"get_order_history cumExecQty {sym}",
+            allow_zero=True,
+        )
+
+    raise _SnapshotUnknown(
+        f"get_order_history: ордер {order_id or order_link_id} по {sym} не найден"
+    )
+
+
+async def _confirm_position(sym: str, info: dict) -> None:
+    """Подтверждает lifecycle только при доказанном исполнении своего ордера.
+
+    Присутствие символа в снимке само по себе НЕ подтверждает PENDING: на том
+    же символе может существовать более старая ручная (unowned) позиция.
+    Требуется точный durable order identifier из ENTRY_PLACED и отдельный
+    authoritative read, подтверждающий cumExecQty > 0 именно этого ордера.
+
+    Без идентификатора, при UNKNOWN order evidence, несовпадении идентификатора
+    или нулевом исполненном объёме lifecycle остаётся PENDING: safe false
+    negative предпочтительнее ложного ownership. POSITION_CONFIRMED пишется
+    только отсюда, никогда placement-хендлерами, и не содержит PnL, цены
+    выхода или причины закрытия.
+    """
+    order_id, order_link_id = _lifecycle_order_ids(info)
+    if not order_id and not order_link_id:
+        # Старые ENTRY_PLACED без точного идентификатора остаются PENDING.
+        logging.debug(
+            "Reconcile: %s остаётся PENDING — в ENTRY_PLACED нет orderId/orderLinkId",
+            sym,
+        )
+        return
+
+    try:
+        exec_qty = await _fetch_fill_evidence(sym, order_id, order_link_id)
+    except _SnapshotUnknown as unknown:
+        # Проблема order evidence не превращается в close/reconciliation.
+        logging.warning(
+            "Reconcile: подтверждение %s отложено (UNKNOWN order evidence): %s",
+            sym, unknown,
+        )
+        return
+
+    if exec_qty <= 0:
+        logging.info(
+            "Reconcile: %s остаётся PENDING — исполненный объём ордера %s равен 0",
+            sym, order_id or order_link_id,
+        )
+        return
+
+    event = {
+        "event": POSITION_CONFIRMED,
+        "symbol": sym,
+        "side": info.get("side", ""),
+        "source_tag": info.get("source_tag", ""),
+        "entry_event_ts": info.get("entry_event_ts", 0.0),
+        "cum_exec_qty": str(exec_qty),
+    }
+    if order_id:
+        event["order_id"] = order_id
+    if order_link_id:
+        event["order_link_id"] = order_link_id
+
+    written = await asyncio.to_thread(append_event, event)
+    if not written:
+        # Без durable-записи символ остаётся PENDING: сверка не начнётся,
+        # подтверждение будет повторено на следующем цикле.
+        logging.error(
+            "Reconcile: не удалось записать POSITION_CONFIRMED для %s", sym
+        )
+        return
+    logging.info(
+        "Reconcile: POSITION_CONFIRMED для %s (ордер %s, исполнено %s)",
+        sym, order_id or order_link_id, exec_qty,
+    )
+
+
+async def _reconcile_missing_position(
+    context: ContextTypes.DEFAULT_TYPE, sym: str, info: dict
+) -> None:
+    """Переводит одну подтверждённую позицию в терминальное состояние.
+
+    Всегда пишется RECONCILED. CLOSED отсюда не пишется, а get_closed_pnl не
+    вызывается: корреляция только по символу способна вернуть старую, ручную
+    или постороннюю сделку, чего для доказательства PnL и цены выхода
+    недостаточно. Причина, PnL и цена выхода остаются неподтверждёнными.
+
+    Durable-запись выполняется до уведомления: сбой Telegram не возвращает
+    позицию в active state и не вызывает повторную сверку.
+    """
+    tracked_side = info.get("side", "")
+    event = {
+        "event": RECONCILED,
+        "symbol": sym,
+        "side": tracked_side,
+        "source_tag": info.get("source_tag", ""),
+        "planned_risk_usdt": info.get("planned_risk_usdt", 0.0),
+        "reason": POSITION_NOT_FOUND_ON_EXCHANGE,
+        "entry_event_ts": info.get("entry_event_ts", 0.0),
+    }
+
+    written = await asyncio.to_thread(append_event, event)
+    if not written:
+        # Без durable-записи уведомление не отправляем: lifecycle остаётся
+        # CONFIRMED, следующий цикл повторит попытку записи.
+        logging.error(
+            "Reconcile: не удалось записать RECONCILED для %s — уведомление отложено",
+            sym,
+        )
+        return
+
+    logging.info(
+        "Reconcile: RECONCILED для %s (side=%s, причина=%s; PnL и цена выхода не подтверждены)",
+        sym, tracked_side or "неизвестна", POSITION_NOT_FOUND_ON_EXCHANGE,
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=ALLOWED_ID,
+            text=format_position_reconciled(sym, side=tracked_side),
+            parse_mode='HTML',
+        )
+    except Exception as notify_err:
+        # Позиция остаётся сверенной: durable-состояние уже терминальное.
+        # Уведомление доставляется at-most-once (см. residual risks).
+        logging.warning(
+            "Reconcile: уведомление для %s не отправлено: %s", sym, notify_err
+        )
 
 
 

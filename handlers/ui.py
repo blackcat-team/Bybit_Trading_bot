@@ -393,6 +393,33 @@ def format_position_card(sym, side, pnl, current_r, *, entry=None, qty=None,
     )
 
 
+def format_position_reconciled(sym, *, side=None, detected_at=None):
+    """Карточка сверки: подтверждённая позиция отсутствует в снимке Bybit.
+
+    Показывает только фактически известные данные: символ, ранее известное
+    направление и время обнаружения. Причина закрытия (вручную / TP / SL /
+    ликвидация), PnL и цена выхода не утверждаются никогда: корреляция
+    закрытой сделки только по символу их не доказывает.
+    """
+    direction = _direction(side) if side else None
+    known = format_value_block([
+        ("Инструмент", sym),
+        ("Направление", direction),
+        ("Обнаружено", detected_at),
+    ])
+    return _join_sections(
+        format_header("♻️", "POSITION RECONCILED"),
+        f"{h(sym)} больше не найдена на Bybit.",
+        f"📊 <b>Известные данные</b>\n{known}",
+        f"🛡 <b>Состояние</b>\n{format_value_block([('Локальное управление', 'остановлено')])}",
+        format_warning_list([
+            "Причина закрытия не подтверждена.",
+            "PnL и цена выхода не подтверждены.",
+        ]),
+        format_action("проверьте историю сделок на Bybit"),
+    )
+
+
 def format_orders_list_html(orders: list) -> str:
     """Компактный список ордеров. Условный stop-entry показывает свой триггер.
 

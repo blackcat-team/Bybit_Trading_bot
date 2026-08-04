@@ -12,7 +12,7 @@ from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID, REQUIRE_MARKET_CONFIRM, MARKET_PREVIEW_TTL_SEC
 from core.database import update_risk_for_symbol, log_source, pop_market_pending, _MARKET_PENDING
-from core.journal import append_event, ENTRY_PLACED
+from core.journal import append_event, extract_order_ids, ENTRY_PLACED
 from core.trading_core import session, place_tp_ladder
 from core.utils import safe_float
 from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_qty
@@ -369,10 +369,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.info(f"Market preflight fallback: cb_qty={qty_from_cb} → validated={final_qty} for {sym}")
 
             # --- PLACE ORDER + 110007 micro-retry ---
-            success, msg_text, placed_qty = await bybit_call(
+            place_result = await bybit_call(
                 place_market_with_retry,
                 sym, order_side, final_qty, sl, qty_step, min_order_qty
             )
+            success, msg_text, placed_qty = place_result[0], place_result[1], place_result[2]
+            # Четвёртый элемент — raw-ответ Bybit с точным orderId. Чтение по
+            # индексу сохраняет совместимость с прежним трёхэлементным возвратом.
+            place_resp = place_result[3] if len(place_result) > 3 else None
             if success:
                 # Записываем риск+источник на диск только после подтверждения ордера.
                 risk_val, src_val = None, None
@@ -402,18 +406,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass  # оставляем fresh_price как fallback
                 # Записываем ENTRY_PLACED в журнал для маркет-ордера
                 try:
-                    await asyncio.to_thread(
-                        append_event,
-                        {
-                            "event": ENTRY_PLACED, "symbol": sym,
-                            "side": side, "source_tag": src_val or "unknown",
-                            "planned_risk_usdt": risk_val or 0.0,
-                            "qty": final_qty, "entry": entry_price, "stop": float(sl),
-                            "order_type": "market",
-                        },
-                    )
+                    entry_event = {
+                        "event": ENTRY_PLACED, "symbol": sym,
+                        "side": side, "source_tag": src_val or "unknown",
+                        "planned_risk_usdt": risk_val or 0.0,
+                        "qty": final_qty, "entry": entry_price, "stop": float(sl),
+                        "order_type": "market",
+                    }
+                    # Точный идентификатор — из ответа на уже выполненное
+                    # размещение. Обнаружение позиции выше его не заменяет.
+                    order_ids = extract_order_ids(place_resp)
+                    entry_event.update(order_ids)
+                    if not order_ids:
+                        logging.warning(
+                            "Market %s: в ответе размещения нет orderId/orderLinkId — "
+                            "сверка исполнения недоступна, lifecycle останется PENDING",
+                            sym,
+                        )
+                    journal_ok = await asyncio.to_thread(append_event, entry_event)
+                    if not journal_ok:
+                        # Ордер уже исполнен: не переразмещаем и не отменяем его.
+                        logging.error(
+                            "Market %s принят Bybit (ордер %s), но ENTRY_PLACED не "
+                            "записан — lifecycle tracking для этого ордера отсутствует",
+                            sym,
+                            order_ids.get("order_id")
+                            or order_ids.get("order_link_id")
+                            or "идентификатор недоступен",
+                        )
                 except Exception as je:
-                    logging.debug("journal ENTRY_PLACED failed: %s", je)
+                    logging.error(
+                        "journal ENTRY_PLACED failed для %s: %s — lifecycle tracking "
+                        "для принятого ордера отсутствует", sym, je,
+                    )
                 shown_qty = placed_qty if placed_qty not in (None, 0, 0.0) else final_qty
                 accepted_msg = format_order_accepted(
                     sym,

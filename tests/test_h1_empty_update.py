@@ -229,12 +229,17 @@ def _run(coro):
 
 # ── Инертный диспетчер bybit_call ────────────────────────────────────────────
 
+_PLACE_RESP_DEFAULT = {"retCode": 0, "result": {"orderId": "inert-1"}}
+
+
 def _bybit_dispatcher(*, can_trade=(True, 0.0), ticker_price="95.0",
-                      ticker_list=None, available="1000.0"):
+                      ticker_list=None, available="1000.0",
+                      place_resp=_PLACE_RESP_DEFAULT):
     """AsyncMock для bybit_call: отвечает по идентичности целевой функции.
 
     Возвращает (mock, calls), где calls — список вызванных целей. Ни один
     ответ не выходит в сеть; неожидаемая цель — явная ошибка теста.
+    place_resp — ответ размещения лимитного ордера (источник orderId).
     """
     calls = []
     session = signal_parser.session
@@ -256,7 +261,7 @@ def _bybit_dispatcher(*, can_trade=(True, 0.0), ticker_price="95.0",
         if fn is session.get_wallet_balance:
             return {"result": {"list": [{"totalAvailableBalance": available}]}}
         if fn is signal_parser.place_limit_order:
-            return {"retCode": 0, "result": {"orderId": "inert-1"}}
+            return place_resp
         raise AssertionError(f"Неожидаемая цель bybit_call: {fn!r}")
 
     return AsyncMock(side_effect=_call), calls
@@ -695,3 +700,76 @@ class TestImportHarnessIsolation:
         # Загруженный модуль остаётся пригодным после восстановления процесса.
         assert isinstance(signal_parser.session, MagicMock)
         assert callable(signal_parser.parse_and_trade)
+
+
+# ── Limit placement: canonical order identifier в ENTRY_PLACED ───────────────
+
+class TestLimitEntryCarriesOrderIdentifier:
+    """Точный identifier из ответа размещения попадает в ENTRY_PLACED."""
+
+    @staticmethod
+    def _entry_event(bybit_mock):
+        """Прогоняет лимитный путь и возвращает (event, journal_mock)."""
+        msg = _make_message(text="COIN: BTC STOP LOSS: 100 ENTRY: 90")
+        upd = _plain_update(msg)
+        with _handler_env(bybit_mock):
+            journal = MagicMock(return_value=True)
+            with patch.object(signal_parser, "append_event", new=journal):
+                _run(parse_and_trade(upd, _make_context()))
+        assert journal.call_count == 1, "ENTRY_PLACED пишется ровно один раз"
+        return journal.call_args.args[0], journal
+
+    def test_order_id_from_placement_response_is_recorded(self):
+        """result.orderId → canonical order_id, прежние поля сохранены."""
+        bybit_mock, calls = _bybit_dispatcher(
+            place_resp={"retCode": 0, "retMsg": "OK",
+                        "result": {"orderId": " OID-77 ", "orderLinkId": ""}}
+        )
+        event, _ = self._entry_event(bybit_mock)
+
+        assert signal_parser.place_limit_order in calls
+        assert event["order_id"] == "OID-77", "Идентификатор обрезан и записан"
+        assert "order_link_id" not in event, "Пустой orderLinkId не пишется"
+        # Прежний контракт события сохранён
+        assert event["event"] == "ENTRY_PLACED"
+        assert event["symbol"] == "BTCUSDT" and event["order_type"] == "limit"
+        for field in ("side", "source_tag", "planned_risk_usdt", "qty", "entry", "stop"):
+            assert field in event, f"Потеряно прежнее поле {field}"
+
+    def test_order_link_id_is_recorded_when_present(self):
+        """Присутствующий orderLinkId сохраняется под canonical ключом."""
+        bybit_mock, _ = _bybit_dispatcher(
+            place_resp={"retCode": 0,
+                        "result": {"orderId": "OID-9", "orderLinkId": "LINK-9"}}
+        )
+        event, _ = self._entry_event(bybit_mock)
+        assert event["order_id"] == "OID-9"
+        assert event["order_link_id"] == "LINK-9"
+
+    def test_missing_identifier_is_not_invented(self):
+        """Без identifier событие backward-compatible, id не выдумывается."""
+        bybit_mock, _ = _bybit_dispatcher(
+            place_resp={"retCode": 0, "result": {"orderId": ""}}
+        )
+        event, _ = self._entry_event(bybit_mock)
+
+        assert "order_id" not in event and "order_link_id" not in event
+        assert event["symbol"] == "BTCUSDT", "Symbol не подменяет identifier"
+        assert event["order_type"] == "limit", "Прежний контракт события сохранён"
+
+    def test_failed_journal_write_does_not_replace_order(self):
+        """append_event=False: ордер не переразмещается и не отменяется."""
+        bybit_mock, calls = _bybit_dispatcher()
+        msg = _make_message(text="COIN: BTC STOP LOSS: 100 ENTRY: 90")
+        upd = _plain_update(msg)
+        with _handler_env(bybit_mock):
+            with patch.object(signal_parser, "append_event",
+                              new=MagicMock(return_value=False)):
+                _run(parse_and_trade(upd, _make_context()))
+
+        # Ровно одно live-размещение, никаких повторов и отмен
+        assert len(_live_write_calls(calls)) == 2, "Только set_leverage + одно размещение"
+        assert calls.count(signal_parser.place_limit_order) == 1
+        assert not any(
+            getattr(fn, "_mock_name", "") == "cancel_order" for fn in calls
+        ), "Автоотмена принятого ордера недопустима"

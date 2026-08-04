@@ -14,7 +14,9 @@ from core.trading_core import session, check_daily_limit
 from core.notifier import send_alert, FAIL_CLOSED
 from core.heat import enforce_heat
 from core.conflict import resolve_signal_conflict
-from core.journal import is_source_enabled, append_event, ENTRY_PLACED
+from core.journal import (
+    is_source_enabled, append_event, extract_order_ids, ENTRY_PLACED,
+)
 from core.database import (
     log_source, update_risk_for_symbol,
     get_risk_for_symbol, is_trading_enabled,
@@ -434,19 +436,38 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 risk_usd=current_risk,
             )
             kb = [[InlineKeyboardButton("🎯 Настроить TP", callback_data=f"set_tps|{sym}")]]
-            await bybit_call(place_limit_order, sym, side, qty, entry_price, stop_val)
+            place_resp = await bybit_call(
+                place_limit_order, sym, side, qty, entry_price, stop_val
+            )
             # Записываем риск+источник на диск только после успешного размещения лимитного ордера.
             await asyncio.to_thread(update_risk_for_symbol, sym, current_risk)
             await asyncio.to_thread(log_source, sym, source_tag)
-            await asyncio.to_thread(
-                append_event,
-                {
-                    "event": ENTRY_PLACED, "symbol": sym, "side": side,
-                    "source_tag": source_tag, "planned_risk_usdt": current_risk,
-                    "qty": qty, "entry": entry_price, "stop": stop_val,
-                    "order_type": "limit",
-                },
-            )
+            entry_event = {
+                "event": ENTRY_PLACED, "symbol": sym, "side": side,
+                "source_tag": source_tag, "planned_risk_usdt": current_risk,
+                "qty": qty, "entry": entry_price, "stop": stop_val,
+                "order_type": "limit",
+            }
+            # Точный идентификатор берём из ответа на размещение; пустые и
+            # выдуманные значения не пишутся.
+            order_ids = extract_order_ids(place_resp)
+            entry_event.update(order_ids)
+            if not order_ids:
+                logging.warning(
+                    "Limit %s: в ответе размещения нет orderId/orderLinkId — "
+                    "сверка исполнения недоступна, lifecycle останется PENDING", sym,
+                )
+            journal_ok = await asyncio.to_thread(append_event, entry_event)
+            if not journal_ok:
+                # Ордер уже принят биржей: не переразмещаем и не отменяем его.
+                logging.error(
+                    "Limit %s принят Bybit (ордер %s), но ENTRY_PLACED не записан — "
+                    "lifecycle tracking для этого ордера отсутствует",
+                    sym,
+                    order_ids.get("order_id")
+                    or order_ids.get("order_link_id")
+                    or "идентификатор недоступен",
+                )
             await msg_obj.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
 
     except Exception as e:
