@@ -16,6 +16,8 @@ from .views_orders import view_orders, view_symbol_orders
 
 from .views_positions import check_positions
 
+from .pos_protection import handle_protection_input
+
 from .reporting import send_report
 
 from .startup import on_startup_check

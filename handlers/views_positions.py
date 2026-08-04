@@ -13,6 +13,7 @@ from core.database import get_risk_for_symbol
 from core.utils import safe_float
 from handlers.ui import format_error_message, format_header, format_position_card
 from handlers.orders import bybit_call
+from handlers.pos_protection import SL, TP, build_edit_callback, protection_button_label
 
 
 async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59,6 +60,9 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             cnt = orders_count.get(sym, 0)
 
+            cur_sl = safe_float(p.get('stopLoss'), field='stopLoss') or None
+            cur_tp = safe_float(p.get('takeProfit'), field='takeProfit') or None
+
             msg = format_position_card(
                 sym,
                 side,
@@ -67,14 +71,25 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 entry=safe_float(p.get('avgPrice'), field='avgPrice'),
                 qty=safe_float(p.get('size'), field='size'),
                 leverage=p.get('leverage'),
-                stop=safe_float(p.get('stopLoss'), field='stopLoss') or None,
+                stop=cur_sl,
             )
 
             row1 = [
                 InlineKeyboardButton("🛡 SL в БУ", callback_data=f"to_be|{sym}|{side}"),
                 InlineKeyboardButton("🏁 TP в БУ", callback_data=f"exit_be|{sym}|{side}")
             ]
+            # Ручное изменение защиты позиции — превью и подтверждение (HIGH-4).
             row2 = [
+                InlineKeyboardButton(
+                    protection_button_label(SL, cur_sl),
+                    callback_data=build_edit_callback(SL, sym, side),
+                ),
+                InlineKeyboardButton(
+                    protection_button_label(TP, cur_tp),
+                    callback_data=build_edit_callback(TP, sym, side),
+                ),
+            ]
+            row3 = [
                 InlineKeyboardButton("🎯 Настроить TP", callback_data=f"set_tps|{sym}"),
                 InlineKeyboardButton(f"📋 Ордера ({cnt})", callback_data=f"show_orders|{sym}")
             ]
@@ -83,7 +98,7 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=ALLOWED_ID,
                 text=msg,
                 parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([row1, row2]),
+                reply_markup=InlineKeyboardMarkup([row1, row2, row3]),
             )
 
     except Exception as e:

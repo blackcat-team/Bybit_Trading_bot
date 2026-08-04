@@ -20,7 +20,7 @@ from handlers import (
     start_trading, stop_trading, check_positions,
     send_report, add_note_handler, button_handler,
     parse_and_trade, set_risk_command, view_orders, on_startup_check,
-    status_command,
+    status_command, handle_protection_input,
 )
 from app.jobs import (
     daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job,
@@ -155,6 +155,13 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("status", status_command))
 
     app.add_handler(CallbackQueryHandler(button_handler))
+    # Группа -1: перехватывает текст только когда ожидается значение SL/TP из /pos.
+    # Прочие сообщения пропускаются дальше, в обычный парсер сигналов.
+    app.add_handler(
+        MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND),
+                       handle_protection_input),
+        group=-1,
+    )
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), parse_and_trade))
 
     def _has_updater_polling_traceback(exc) -> bool:

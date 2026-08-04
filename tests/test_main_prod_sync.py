@@ -154,6 +154,7 @@ def runtime():
         def __init__(self, kind, *args):
             self.kind = kind
             self.args = args
+            self.group = None
 
     class JobQueue:
         def __init__(self):
@@ -176,7 +177,8 @@ def runtime():
             self.error_handler = None
             self.polling_kwargs = None
 
-        def add_handler(self, handler):
+        def add_handler(self, handler, group=0):
+            handler.group = group
             self.handlers.append(handler)
 
         def add_error_handler(self, callback):
@@ -242,6 +244,7 @@ def runtime():
             "view_orders",
             "on_startup_check",
             "status_command",
+            "handle_protection_input",
         )
     }
     jobs = {
@@ -556,7 +559,15 @@ def test_runtime_preserves_handlers_and_background_job_schedules(runtime):
         "status",
     ]
     assert sum(h.kind == "CallbackQueryHandler" for h in runtime.app.handlers) == 1
-    assert sum(h.kind == "MessageHandler" for h in runtime.app.handlers) == 1
+
+    message_handlers = [h for h in runtime.app.handlers if h.kind == "MessageHandler"]
+    assert len(message_handlers) == 2
+    # Ввод уровня SL/TP перехватывается строго раньше парсера сигналов.
+    protection, signals = message_handlers
+    assert protection.args[1].__name__ == "handle_protection_input"
+    assert protection.group == -1
+    assert signals.args[1].__name__ == "parse_and_trade"
+    assert signals.group == 0
 
     calls = runtime.app.job_queue.calls
     assert len(calls) == 8

@@ -19,6 +19,10 @@ from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_
 from handlers.orders import place_market_with_retry, close_position_market, bybit_call, set_leverage_safe
 from handlers.views_orders import view_orders, view_symbol_orders
 from handlers.views_positions import check_positions
+from handlers.pos_protection import (
+    CANCEL_INPUT_CALLBACK, cancel_protection, cancel_protection_input,
+    confirm_protection, start_protection_edit,
+)
 from handlers.ui import (
     format_action,
     format_error_message,
@@ -63,6 +67,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sym = data.split("|")[1]
             res = await place_tp_ladder(sym)
             await context.bot.send_message(user_id, res, parse_mode='HTML')
+
+        # --- Ручное изменение защиты позиции (HIGH-4) ---
+        elif data.startswith("pedit|"):
+            _, kind, sym, side = data.split("|")
+            await start_protection_edit(update, context, kind, sym, side)
+
+        elif data.startswith("pconf|"):
+            await confirm_protection(update, context, data.split("|", 1)[1])
+
+        elif data.startswith("pcancel|"):
+            await cancel_protection(update, context, data.split("|", 1)[1])
+
+        elif data == CANCEL_INPUT_CALLBACK:
+            await cancel_protection_input(update, context)
 
         elif data.startswith("to_be|"):
             _, sym, side = data.split("|")
