@@ -68,6 +68,26 @@ def _sl_pct(entry_price: float, stop_val: float) -> float:
     return abs(entry_price - stop_val) / entry_price * 100
 
 
+def _finite_positive(value):
+    """float(value), если это конечное число строго > 0; иначе None.
+
+    Единая проверка отображаемой цены: ``inf``, ``nan``, ноль, отрицательное и
+    нечисловое значение не должны попадать в карточку как реальная цена.
+
+    ``bool`` отклоняется до преобразования: ``float(True)`` дал бы 1.0, то есть
+    флаг превратился бы в финансовое значение "1" в карточке оператора.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
 def _direction(side: str) -> str:
     return "Long" if str(side).upper() in {"LONG", "BUY"} else "Short"
 
@@ -107,9 +127,31 @@ def _join_sections(*parts: str) -> str:
     return "\n\n".join(part for part in parts if part)
 
 
+# Процентный SL для Market пересчитывается заново по свежей цене в момент
+# подтверждения, поэтому карточка не выдаёт превью-значение за окончательное.
+MARKET_PCT_SL_NOTE = (
+    "Для Market окончательная цена SL будет пересчитана при подтверждении."
+)
+
+
+def _sl_mode_row(sl_mode, sl_percent_text):
+    """Строка режима SL или None для обычного абсолютного SL."""
+    if sl_mode == "percent" and sl_percent_text:
+        return ("Режим SL", f"{sl_percent_text}% от цены входа")
+    return None
+
+
+def _sl_label(sl_mode, stop_val, *, indicative: bool) -> str:
+    """SL с пометкой ≈ там, где значение ещё будет пересчитано."""
+    text = _fmt_price(stop_val)
+    if sl_mode == "percent" and indicative:
+        return f"≈{text}"
+    return text
+
+
 def format_market_signal(
     sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
-    risk_usd=None, warnings=(),
+    risk_usd=None, warnings=(), sl_mode=None, sl_percent_text=None,
 ):
     """Карточка разобранного market-сигнала до выбора способа входа."""
     direction = _direction(side)
@@ -122,24 +164,31 @@ def format_market_signal(
         ("Номинал", _fmt_usdt(pos_value_usd)),
         ("Источник", source_tag),
     ])
-    risk = format_value_block([
+    risk_rows = [
         ("Риск", _fmt_usdt(risk_usd) if risk_usd is not None else None),
-        ("SL", _fmt_price(stop_val)),
-        ("До SL", f"{_sl_pct(entry_price, stop_val):.2f}%"),
-    ])
+    ]
+    mode_row = _sl_mode_row(sl_mode, sl_percent_text)
+    if mode_row:
+        risk_rows.append(mode_row)
+    risk_rows.append(("SL", _sl_label(sl_mode, stop_val, indicative=True)))
+    risk_rows.append(("До SL", f"{_sl_pct(entry_price, stop_val):.2f}%"))
+    risk = format_value_block(risk_rows)
+    all_warnings = list(warnings)
+    if mode_row:
+        all_warnings.append(MARKET_PCT_SL_NOTE)
     return _join_sections(
         format_header("🤖", "SIGNAL"),
         f"{direction}: {h(sym)} · x{h(lev)}",
         f"💰 <b>Сделка</b>\n{deal}",
         f"🛡 <b>Риск</b>\n{risk}",
-        format_warning_list(warnings),
+        format_warning_list(all_warnings),
         format_action("выберите способ входа"),
     )
 
 
 def format_limit_signal(
     sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
-    risk_usd=None, warnings=(),
+    risk_usd=None, warnings=(), sl_mode=None, sl_percent_text=None,
 ):
     """Результат принятия существующего лимитного ордера."""
     direction = _direction(side)
@@ -152,12 +201,18 @@ def format_limit_signal(
         ("Номинал", _fmt_usdt(pos_value_usd)),
         ("Источник", source_tag),
     ])
-    protection = format_value_block([
-        ("SL", _fmt_price(stop_val)),
-        ("Плечо", f"x{lev}"),
-        ("Риск", _fmt_usdt(risk_usd) if risk_usd is not None else None),
-        ("До SL", f"{_sl_pct(entry_price, stop_val):.2f}%"),
-    ])
+    protection_rows = []
+    mode_row = _sl_mode_row(sl_mode, sl_percent_text)
+    if mode_row:
+        protection_rows.append(mode_row)
+    # Для лимитного входа процентный SL уже окончательный: цена входа известна.
+    protection_rows.append(("SL", _sl_label(sl_mode, stop_val, indicative=False)))
+    protection_rows.append(("Плечо", f"x{lev}"))
+    protection_rows.append(
+        ("Риск", _fmt_usdt(risk_usd) if risk_usd is not None else None)
+    )
+    protection_rows.append(("До SL", f"{_sl_pct(entry_price, stop_val):.2f}%"))
+    protection = format_value_block(protection_rows)
     return _join_sections(
         format_header("✅", "ORDER ACCEPTED"),
         f"{direction}: {h(sym)} · Limit",
@@ -171,36 +226,70 @@ def format_limit_signal(
 def format_market_preview(
     sym, side, lev, entry_price, stop_val, qty, pos_value_usd,
     risk_usd, source_tag, heat_after, max_heat, ttl_sec=None,
+    sl_mode=None, sl_percent_text=None, qty_indicative=False,
 ):
     direction = _direction(side)
+    # Для процентного Market объём и номинал — производные будущей свежей цены,
+    # поэтому подписываем их как ориентировочные, а не как окончательные (§5).
+    qty_label = "Ориентировочный объём" if qty_indicative else "Объём"
+    # Единая строгая проверка отображаемой цены: только конечное число > 0.
+    # Ноль, отрицательное, inf и nan одинаково означают "цена недоступна" (§3),
+    # поэтому карточка не показывает ни 0, ни inf, ни nan как реальную цену.
+    entry_value = _finite_positive(entry_price)
+    entry_text = f"≈{_fmt_price(entry_value)}" if entry_value is not None else "недоступна"
+    # Номинал производен от цены: без пригодной цены он тоже недоступен.
+    notional_value = (
+        _finite_positive(pos_value_usd) if entry_value is not None else None
+    )
+    notional_text = (
+        f"≈{_fmt_usdt(notional_value)}" if notional_value is not None else "недоступен"
+    )
     deal = format_value_block([
         ("Инструмент", sym),
         ("Направление", direction),
         ("Тип", "Market"),
-        ("Вход", f"≈{_fmt_price(entry_price)}"),
-        ("Объём", _fmt_qty(qty)),
-        ("Номинал", _fmt_usdt(pos_value_usd)),
+        ("Вход", entry_text),
+        (qty_label, _fmt_qty(qty)),
+        ("Номинал", notional_text),
         ("Источник", source_tag),
     ])
-    risk = format_value_block([
-        ("SL", _fmt_price(stop_val)),
-        ("До SL", f"{_sl_pct(entry_price, stop_val):.2f}%"),
-        ("Риск", _fmt_usdt(risk_usd)),
-        (
-            "Heat",
-            f"{heat_after:.1f} / {max_heat:.1f} USDT"
-            if max_heat > 0 else "отключён",
-        ),
-    ])
+    mode_row = _sl_mode_row(sl_mode, sl_percent_text)
+    risk_rows = []
+    if mode_row:
+        risk_rows.append(mode_row)
+    # Ориентировочный SL показывается только когда он сам конечен и положителен.
+    # Дистанция "До SL" требует ещё и пригодной цены входа: иначе она считалась
+    # бы от недоступной или невалидной цены (§4).
+    stop_value = _finite_positive(stop_val)
+    if stop_value is None:
+        risk_rows.append(("Ориентировочный SL", "недоступен"))
+    else:
+        risk_rows.append(("SL", _sl_label(sl_mode, stop_value, indicative=True)))
+        if entry_value is not None:
+            risk_rows.append(("До SL", f"{_sl_pct(entry_value, stop_value):.2f}%"))
+    risk_rows.append(("Риск", _fmt_usdt(risk_usd)))
+    risk_rows.append((
+        "Heat",
+        f"{heat_after:.1f} / {max_heat:.1f} USDT" if max_heat > 0 else "отключён",
+    ))
+    risk = format_value_block(risk_rows)
     ttl = (
         f"⏳ Подтверждение действительно {h(ttl_sec)} сек."
         if ttl_sec is not None else ""
     )
+    notes = []
+    if mode_row:
+        notes.append(MARKET_PCT_SL_NOTE)
+    if stop_value is None and sl_mode == "percent":
+        notes.append(
+            "Окончательный SL будет рассчитан по свежей цене при подтверждении."
+        )
     return _join_sections(
         format_header("🤖", "PREVIEW"),
         f"{direction}: {h(sym)} · x{h(lev)} · Market",
         f"💰 <b>Сделка</b>\n{deal}",
         f"🛡 <b>Риск</b>\n{risk}",
+        format_warning_list(notes) if notes else "",
         ttl,
         format_action("подтвердите или отмените вход"),
     )

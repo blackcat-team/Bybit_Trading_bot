@@ -124,9 +124,9 @@ class TestMarketFallbackSafety:
         ctx = _make_ctx()
         update = _make_update(query)
 
-        # set_leverage raises "110043" (swallowed); get_tickers immediately fails
+        # get_tickers is now the first live call (leverage write happens only
+        # after a successful preflight, so it is never reached here).
         responses = [
-            Exception("110043 already set"),  # set_leverage → swallowed
             RuntimeError("API timeout"),       # get_tickers  → preflight fails
         ]
 
@@ -149,11 +149,13 @@ class TestMarketFallbackSafety:
         ctx = _make_ctx()
         update = _make_update(query)
 
+        # Плечо ставится только после успешного preflight/fallback (§3 FIX A),
+        # поэтому его ответ идёт перед размещением, а не первым.
         responses = [
-            {},              # set_leverage → OK
             _TICKER_OK,      # get_tickers
             _WALLET_OK,      # get_wallet_balance
             _INSTRUMENTS_OK, # get_instruments_info → qty_step/min set
+            {},              # set_leverage → OK (после fallback-валидации qty)
             _PLACE_OK,       # place_market_with_retry
         ]
 
@@ -179,11 +181,10 @@ class TestMarketFallbackSafety:
         update = _make_update(query)
 
         responses = [
-            {},
             _TICKER_OK,
             _WALLET_OK,
             _INSTRUMENTS_OK,
-            # no 5th response: order must NOT be placed
+            # плечо не пишется: fallback отклоняет qty до leverage/размещения
         ]
 
         with patch("handlers.buttons.ALLOWED_ID", _UID), \
@@ -206,11 +207,10 @@ class TestMarketFallbackSafety:
         update = _make_update(query)
 
         responses = [
-            {},
             _TICKER_OK,
             _WALLET_OK,
             _INSTRUMENTS_OK,
-            # no 5th response: order must NOT be placed
+            # плечо не пишется: validate_qty падает до leverage/размещения
         ]
 
         with patch("handlers.buttons.ALLOWED_ID", _UID), \
@@ -242,10 +242,10 @@ class TestMarketEntryCarriesOrderIdentifier:
         update = _make_update(query)
 
         responses = [
-            {},               # set_leverage
             _TICKER_OK,
             _WALLET_OK,
             _INSTRUMENTS_OK,
+            {},               # set_leverage (после fallback-валидации qty)
             place_result,     # place_market_with_retry
             _POS_READBACK,    # readback avgPrice
         ]

@@ -13,6 +13,11 @@ from telegram.ext import ContextTypes
 from core.config import ALLOWED_ID, REQUIRE_MARKET_CONFIRM, MARKET_PREVIEW_TTL_SEC
 from core.database import update_risk_for_symbol, log_source, pop_market_pending, _MARKET_PENDING
 from core.journal import append_event, extract_order_ids, ENTRY_PLACED
+from core.sl_percent import (
+    SL_PERCENT, SignalSLError, compute_percent_sl, decimal_from_price,
+    decode_percent_callback, fmt_decimal, is_percent_callback, read_price_filter,
+    read_price_number, resolve_percent_sl_price,
+)
 from core.trading_core import session, place_tp_ladder
 from core.utils import safe_float
 from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_qty
@@ -194,15 +199,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, sym, side, sl, qty_str, lev_str = data.split("|")
             lev = int(float(lev_str))
             qty = float(qty_str)
-            sl_float = float(sl)
+            sl_is_percent = is_percent_callback(sl)
+            sl_percent = None
+            # None = ориентировочный SL недоступен. Ноль как цену НЕ используем:
+            # он породил бы ложное "SL ≈ 0" и дистанцию от нуля (§4).
+            sl_preview = None
+            if sl_is_percent:
+                try:
+                    sl_percent = decode_percent_callback(sl)
+                except SignalSLError as pct_err:
+                    logging.warning("mkt_preview %s: bad percent token %r: %s", sym, sl, pct_err)
+                    await query.edit_message_text(
+                        format_order_rejected(
+                            sym, side, "invalid percent SL",
+                            action="отправьте сигнал заново",
+                        ),
+                        parse_mode='HTML',
+                    )
+                    return
+            else:
+                sl_preview = float(sl)
 
-            # Получаем свежую цену (мягкий fallback до 0)
-            entry_price = 0.0
+            # Получаем свежую цену. Единая строгая проверка: число, конечное,
+            # строго > 0. "Infinity"/"NaN"/пусто/0/отрицательное дают
+            # entry_price=None — превью не выдаёт их за реальную цену (§3).
+            entry_price = None
             try:
                 ticker = await bybit_call(session.get_tickers, category="linear", symbol=sym)
-                entry_price = float(ticker['result']['list'][0]['lastPrice'])
+                raw_last = ticker['result']['list'][0]['lastPrice']
+                checked = read_price_number(raw_last, allow_zero=False)
+                if checked is None:
+                    logging.warning(
+                        "mkt_preview %s: indicative price unusable (lastPrice=%r)",
+                        sym, raw_last,
+                    )
+                else:
+                    entry_price = float(checked)
             except Exception:
                 pass
+
+            # Ориентировочный SL для превью: окончательный пересчитывается при
+            # подтверждении от новой свежей цены (см. buy_market|). Если рассчитать
+            # безопасно нельзя — оставляем None, а не подставляем 0 (§4).
+            if sl_is_percent and entry_price is not None:
+                try:
+                    sl_preview = float(compute_percent_sl(
+                        decimal_from_price(entry_price), side, sl_percent
+                    ))
+                except SignalSLError as calc_err:
+                    logging.warning("mkt_preview %s: indicative SL unavailable: %s", sym, calc_err)
+                    sl_preview = None
 
             # Рассчитываем прогнозируемый heat (мягкий fallback)
             heat_after = 0.0
@@ -229,12 +275,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            pos_value_usd = qty * entry_price if entry_price > 0 else 0.0
+            # Для процентного Market объём — производная будущей свежей цены и
+            # окончательного SL, поэтому он всегда только ориентировочный (§5).
+            # Номинал считается лишь от конечной положительной цены: иначе
+            # inf/nan/0 утекли бы в карточку как реальная сумма.
+            pos_value_usd = qty * entry_price if entry_price is not None else None
+            qty_indicative = sl_is_percent
 
             preview_msg = format_market_preview(
-                sym, side, lev, entry_price, sl_float, qty, pos_value_usd,
+                sym, side, lev, entry_price, sl_preview, qty, pos_value_usd,
                 risk_usd, source_tag, heat_after, max_heat,
                 ttl_sec=MARKET_PREVIEW_TTL_SEC,
+                sl_mode=SL_PERCENT if sl_is_percent else None,
+                sl_percent_text=fmt_decimal(sl_percent) if sl_is_percent else None,
+                qty_indicative=qty_indicative,
             )
 
             confirm_cb = f"buy_market|{sym}|{side}|{sl}|{qty_str}|{lev_str}"
@@ -280,11 +334,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             qty_from_cb = float(qty_str)
             order_side = "Buy" if side == "LONG" else "Sell"
 
-            # Ставим плечо перед входом — set_leverage_safe тихо игнорирует 110043 ("not modified")
-            try:
-                await bybit_call(set_leverage_safe, sym, lev)
-            except Exception as lev_err:
-                logging.warning("set_leverage(%s, x%s) unexpected error: %s", sym, lev, lev_err)
+            # Разбор поля SL из callback. Абсолютный SL едет в Bybit как раньше;
+            # процент остаётся процентом до подтверждённой свежей цены.
+            sl_percent = None
+            sl_for_order = None   # то, что уйдёт в Bybit; None = ещё не разрешено
+            sl_float = None
+            if is_percent_callback(sl):
+                try:
+                    sl_percent = decode_percent_callback(sl)
+                except SignalSLError as pct_err:
+                    logging.warning("buy_market %s blocked: bad percent token %r: %s", sym, sl, pct_err)
+                    await query.edit_message_text(
+                        format_order_rejected(
+                            sym, side, "invalid percent SL",
+                            action="отправьте сигнал заново",
+                        ),
+                        parse_mode='HTML',
+                    )
+                    return
+            else:
+                sl_for_order = sl
+                sl_float = float(sl)
+
+            # Плечо намеренно НЕ трогаем до полной fail-closed валидации:
+            # свежая цена, разрешённый SL, риск и объём проверяются первыми,
+            # и только успешный preflight допускает set_leverage_safe (§3).
+            # Иначе невыполнимый процентный сигнал мог бы изменить плечо, не
+            # оставив ни одного входного ордера.
 
             # --- RE-PREFLIGHT: свежая цена + свежий баланс ---
             final_qty = qty_from_cb
@@ -308,6 +384,60 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 max_order_qty = float(lot_filter.get('maxOrderQty', 0))
 
                 desired_pos = qty_from_cb * fresh_price
+                baseline_qty = qty_from_cb
+
+                if sl_percent is not None:
+                    # §8: сначала окончательный SL от свежей цены, только потом qty.
+                    # Одна и та же fresh_price — и точка отсчёта SL, и база объёма.
+                    try:
+                        tick, min_price, max_price = read_price_filter(info)
+                        sl_decimal = resolve_percent_sl_price(
+                            percent=sl_percent,
+                            side=side,
+                            entry_ref=decimal_from_price(fresh_price),
+                            tick=tick,
+                            min_price=min_price,
+                            max_price=max_price,
+                        )
+                    except SignalSLError as sl_exc:
+                        logging.warning(
+                            "buy_market %s blocked: side=%s sl_mode=percent percent=%s "
+                            "entry_type=market entry_ref=%s fail_closed=%s",
+                            sym, side, fmt_decimal(sl_percent), fresh_price, sl_exc,
+                        )
+                        await query.edit_message_text(
+                            format_order_rejected(
+                                sym, side, str(sl_exc),
+                                action="исправьте процент SL и отправьте сигнал заново",
+                            ),
+                            parse_mode='HTML',
+                        )
+                        return
+
+                    pending_risk = _MARKET_PENDING.get(sym)
+                    risk_for_qty = pending_risk[0] if pending_risk else None
+                    if not risk_for_qty or risk_for_qty <= 0:
+                        logging.warning(
+                            "buy_market %s blocked: side=%s sl_mode=percent percent=%s "
+                            "entry_ref=%s fail_closed=нет риска сигнала для расчёта объёма",
+                            sym, side, fmt_decimal(sl_percent), fresh_price,
+                        )
+                        await query.edit_message_text(
+                            format_order_rejected(
+                                sym, side, "risk unavailable",
+                                action="отправьте сигнал заново",
+                            ),
+                            parse_mode='HTML',
+                        )
+                        return
+
+                    sl_float = float(sl_decimal)
+                    sl_for_order = fmt_decimal(sl_decimal)
+                    # Прежняя риск-модель, но от новой пары (вход, SL).
+                    diff_pct = (abs(fresh_price - sl_float) / fresh_price) * 100
+                    desired_pos = risk_for_qty / (diff_pct / 100)
+                    baseline_qty = None  # уточняется по desired_qty из clip_qty
+
                 final_qty, reason, details = clip_qty(
                     desired_pos_usd=desired_pos,
                     entry_price=fresh_price,
@@ -318,11 +448,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     max_order_qty=max_order_qty,
                 )
 
+                if baseline_qty is None:
+                    baseline_qty = details.get('desired_qty', final_qty)
+
                 logging.info(
                     f"🧮 Preflight(MARKET) {sym}: cb_qty={qty_from_cb} | "
                     f"fresh_price={fresh_price} | avail={available_usd:.1f}$ ({avail_src}) | "
                     f"lev=x{lev} | qty={final_qty} | reason={reason}"
                 )
+
+                if sl_percent is not None:
+                    logging.info(
+                        "SL resolve %s: side=%s sl_mode=percent percent=%s entry_type=market "
+                        "entry_ref=%s sl=%s risk=%s qty=%s",
+                        sym, side, fmt_decimal(sl_percent), fresh_price,
+                        sl_for_order, risk_for_qty, final_qty,
+                    )
 
                 if reason == "REJECT":
                     await query.edit_message_text(
@@ -334,11 +475,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
 
-                if final_qty < qty_from_cb:
+                if final_qty < baseline_qty:
                     await context.bot.send_message(
                         user_id,
                         format_warning_message(
-                            [f"Объём Market уменьшен: {qty_from_cb} → {final_qty}."],
+                            [f"Объём Market уменьшен: {baseline_qty} → {final_qty}."],
                             context=f"{sym} · {side}",
                             action="проверьте скорректированный объём",
                         ),
@@ -346,6 +487,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             except Exception as pf_err:
                 logging.warning(f"Market preflight error for {sym}: {pf_err}")
+                if sl_percent is not None:
+                    # Процентный SL требует подтверждённой свежей цены: без неё
+                    # нет ни цены SL, ни объёма. Ордер не отправляется.
+                    logging.warning(
+                        "buy_market %s blocked: sl_mode=percent percent=%s "
+                        "fail_closed=свежая цена недоступна после ошибки preflight",
+                        sym, fmt_decimal(sl_percent),
+                    )
+                    await query.edit_message_text(
+                        format_order_rejected(
+                            sym, side, "preflight unavailable",
+                            action="повторите отправку сигнала позже",
+                        ),
+                        parse_mode='HTML',
+                    )
+                    return
                 if qty_step <= 0:
                     # Нет данных лот-фильтра — безопасная валидация qty невозможна; блокируем ордер.
                     logging.warning(f"Market order for {sym} blocked: no lot-filter data after preflight error")
@@ -387,9 +544,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.info(f"Market preflight fallback: cb_qty={qty_from_cb} → validated={final_qty} for {sym}")
 
             # --- PLACE ORDER + 110007 micro-retry ---
+            # Жёсткий барьер: в Bybit уходит только нормализованная цена SL.
+            # Процентный токен ("pct:10") сюда не допускается ни при каких путях.
+            if (
+                sl_for_order is None
+                or sl_float is None
+                or is_percent_callback(sl_for_order)
+            ):
+                logging.error(
+                    "buy_market %s blocked: SL не разрешён в цену (sl=%r) — ордер не отправлен",
+                    sym, sl_for_order if sl_for_order is not None else sl,
+                )
+                await query.edit_message_text(
+                    format_order_rejected(
+                        sym, side, "SL unresolved",
+                        action="отправьте сигнал заново",
+                    ),
+                    parse_mode='HTML',
+                )
+                return
+
+            # Все fail-closed проверки пройдены (свежая цена, SL, риск, объём) —
+            # только теперь единственный live write плеча (§3). set_leverage_safe
+            # тихо игнорирует 110043 ("not modified").
+            try:
+                await bybit_call(set_leverage_safe, sym, lev)
+            except Exception as lev_err:
+                logging.warning("set_leverage(%s, x%s) unexpected error: %s", sym, lev, lev_err)
+
             place_result = await bybit_call(
                 place_market_with_retry,
-                sym, order_side, final_qty, sl, qty_step, min_order_qty
+                sym, order_side, final_qty, sl_for_order, qty_step, min_order_qty
             )
             success, msg_text, placed_qty = place_result[0], place_result[1], place_result[2]
             # Четвёртый элемент — raw-ответ Bybit с точным orderId. Чтение по
@@ -428,7 +613,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "event": ENTRY_PLACED, "symbol": sym,
                         "side": side, "source_tag": src_val or "unknown",
                         "planned_risk_usdt": risk_val or 0.0,
-                        "qty": final_qty, "entry": entry_price, "stop": float(sl),
+                        "qty": final_qty, "entry": entry_price, "stop": sl_float,
                         "order_type": "market",
                     }
                     # Точный идентификатор — из ответа на уже выполненное
@@ -464,7 +649,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     shown_qty,
                     order_type="Market",
                     price=entry_price if entry_price > 0 else None,
-                    stop=float(sl),
+                    stop=sl_float,
                     leverage=lev,
                     risk_usd=risk_val,
                     retried=shown_qty != final_qty,

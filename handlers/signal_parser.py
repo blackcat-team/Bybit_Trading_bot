@@ -5,11 +5,17 @@ Signal parser — разбор текстовых сигналов + основ�
 import asyncio
 import re
 import logging
+from decimal import Decimal
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID, REQUIRE_MARKET_CONFIRM
+from core.sl_percent import (
+    SL_ABSOLUTE, SL_PERCENT, SignalSLError, decimal_from_price,
+    encode_percent_callback, fmt_decimal, normalize_entry_price, parse_sl_token,
+    read_price_filter, resolve_percent_sl_price,
+)
 from core.trading_core import session, check_daily_limit
 from core.notifier import send_alert, FAIL_CLOSED
 from core.heat import enforce_heat
@@ -57,12 +63,50 @@ def _market_callback(sym: str, side: str, stop_val, qty, lev,
 # Чистый парсинг
 # ---------------------------------------------------------------------------
 
+# Токен SL: непрерывный фрагмент до пробела плюс возможный отставший «%».
+# Благодаря хвосту «5 %» и «5 %%» захватываются целиком и отклоняются строгой
+# проверкой, а не превращаются молча в абсолютный SL «5».
+_SL_TOKEN = r'(\S+(?:\s*%)?)'
+# Legacy-извлечение абсолютной цены: сохраняет прежнюю терпимость к «мусорному
+# хвосту» для сигналов без процента и не меняет старый контракт.
+_LEGACY_ABS_RE = re.compile(r'^[\d\.]+')
+
+
+def _read_sl_token(raw_token: str) -> tuple:
+    """Возвращает ``(mode, Decimal, stop_val|None, error|None)`` для поля SL.
+
+    Токен с ``%`` разбирается строго. Токен без ``%`` сначала пробуется строго,
+    а при неудаче падает на прежнее извлечение ведущего числа — абсолютный
+    контракт остаётся тем же, что до HIGH-5.
+    """
+    token = str(raw_token).strip()
+    try:
+        mode, value = parse_sl_token(token)
+    except SignalSLError as exc:
+        if "%" in token:
+            return None, None, None, str(exc)
+        legacy = _LEGACY_ABS_RE.match(token)
+        if not legacy:
+            return None, None, None, str(exc)
+        try:
+            stop_val = float(legacy.group(0))
+        except ValueError:
+            return None, None, None, str(exc)
+        return SL_ABSOLUTE, None, stop_val, None
+    if mode == SL_PERCENT:
+        # stop_val остаётся None: старые получатели не должны молча принять процент за цену.
+        return SL_PERCENT, value, None, None
+    return SL_ABSOLUTE, value, float(value), None
+
+
 def parse_signal(txt: str) -> dict | None:
     """
     Извлекает торговый сигнал из текста.
 
     Returns dict с ключами:
-        coin, entry_val (float|None), stop_val (float),
+        coin, entry_val (float|None), stop_val (float|None — только абсолютный SL),
+        sl_mode ("absolute"|"percent"|None), sl_value (Decimal|None),
+        sl_raw (str — исходный текст SL), sl_error (str|None),
         side (str|None — если явно указан),
         is_market (bool), source_tag (str)
     Или None, если текст не распознан как сигнал.
@@ -72,16 +116,16 @@ def parse_signal(txt: str) -> dict | None:
 
     coin = None
     entry_val = None
-    stop_val = None
+    stop_raw = None
 
     # --- Парсинг (Ключевые слова) ---
     coin_match = re.search(r'(?i)(?:COIN:|Токен)\s*\$?\s*([A-Z0-9]+)', txt)
-    stop_match = re.search(r'(?i)(?:STOP LOSS|STOP|стоп)[:\s]+([\d\.]+)', txt)
+    stop_match = re.search(r'(?i)(?:STOP LOSS|STOP|стоп)[:\s]+' + _SL_TOKEN, txt)
     entry_match = re.search(r'(?i)(?:ENTRY:|вход)(.*)', txt)
 
     if coin_match and stop_match:
         coin = coin_match.group(1)
-        stop_val = float(stop_match.group(1))
+        stop_raw = stop_match.group(1)
         if entry_match:
             nums = [float(x) for x in re.findall(r'[\d\.]+', entry_match.group(1)) if float(x) >= 0]
             if len(nums) >= 2:
@@ -91,14 +135,18 @@ def parse_signal(txt: str) -> dict | None:
 
     # --- Ленивый парсинг ---
     if not coin:
-        lazy_match = re.search(r'^\s*([A-Z0-9]{2,10})\s+([\d\.]+)\s+([\d\.]+)', txt, re.IGNORECASE)
+        lazy_match = re.search(
+            r'^\s*([A-Z0-9]{2,10})\s+([\d\.]+)\s+' + _SL_TOKEN, txt, re.IGNORECASE
+        )
         if lazy_match:
             coin = lazy_match.group(1).upper()
             entry_val = float(lazy_match.group(2))
-            stop_val = float(lazy_match.group(3))
+            stop_raw = lazy_match.group(3)
 
-    if not (coin and stop_val is not None):
+    if not (coin and stop_raw is not None):
         return None
+
+    sl_mode, sl_value, stop_val, sl_error = _read_sl_token(stop_raw)
 
     # --- Рыночный вход ---
     is_market = False
@@ -135,6 +183,10 @@ def parse_signal(txt: str) -> dict | None:
         "coin": coin.upper(),
         "entry_val": entry_val,
         "stop_val": stop_val,
+        "sl_mode": sl_mode,
+        "sl_value": sl_value,
+        "sl_raw": str(stop_raw).strip(),
+        "sl_error": sl_error,
         "is_market": is_market,
         "explicit_side": explicit_side,
         "source_tag": source_tag,
@@ -193,11 +245,28 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         coin = sig["coin"]
         entry_val = sig["entry_val"]
         stop_val = sig["stop_val"]
+        sl_mode = sig["sl_mode"]
+        sl_value = sig["sl_value"]
+        sl_raw = sig["sl_raw"]
+        sl_error = sig["sl_error"]
         is_market = sig["is_market"]
         explicit_side = sig["explicit_side"]
         source_tag = sig["source_tag"]
 
         sym = f"{coin}USDT"
+
+        # Некорректная грамматика SL: превью не создаётся, Bybit не вызывается.
+        if sl_error or sl_mode is None:
+            await msg_obj.reply_text(
+                format_error_message(
+                    "Некорректный Stop Loss в сигнале.",
+                    context=sym,
+                    detail=sl_error or f"SL: {sl_raw}",
+                    action="укажите цену SL или процент вида 10% и отправьте сигнал заново",
+                ),
+                parse_mode='HTML',
+            )
+            return
 
         # ── Source quarantine check ────────────────────────────────────────
         if not is_source_enabled(source_tag):
@@ -250,24 +319,91 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             entry_price = entry_val
 
-        # Определение стороны и валидация
-        if explicit_side:
-            side = explicit_side
-            if (side == "LONG" and stop_val >= entry_price) or (
-                side == "SHORT" and stop_val <= entry_price
-            ):
+        # Метаданные инструмента получаем ДО расчёта SL: процентный SL
+        # нормализуется по tickSize того же снимка, что и лот-фильтр.
+        info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=sym)
+        info = info_resp['result']['list'][0]
+        lot_filter = info['lotSizeFilter']
+        qty_step = float(lot_filter['qtyStep'])
+        min_order_qty = float(lot_filter.get('minOrderQty', qty_step))
+        max_order_qty = float(lot_filter.get('maxOrderQty', 0))
+
+        # --- Разрешение SL ---
+        if sl_mode == SL_PERCENT:
+            # Процент задаёт дистанцию от цены входа, поэтому направление
+            # нельзя вывести из самого SL — оно должно быть указано явно.
+            if not explicit_side:
                 await msg_obj.reply_text(
                     format_error_message(
-                        "SL противоречит направлению сигнала.",
-                        context=f"{sym} · {side}",
-                        detail=f"SL: {stop_val}",
-                        action="исправьте SL и отправьте новый сигнал",
+                        "Процентный SL требует явного направления.",
+                        context=sym,
+                        detail=f"SL: {sl_raw}",
+                        action="добавьте LONG или SHORT и отправьте сигнал заново",
                     ),
                     parse_mode='HTML',
                 )
                 return
+            side = explicit_side
+            try:
+                tick, min_price, max_price = read_price_filter(info)
+                # Для Limit-входа нормализуем заявленную цену по tickSize того же
+                # снимка ДО расчёта SL и объёма: ордер, SL и qty обязаны опираться
+                # на одну и ту же entry (§6). Market берёт цену от свежего тикера,
+                # его нормализовать здесь не нужно.
+                if not is_market:
+                    entry_decimal = normalize_entry_price(
+                        decimal_from_price(entry_price), tick, min_price, max_price
+                    )
+                    entry_price = float(entry_decimal)
+                else:
+                    entry_decimal = decimal_from_price(entry_price)
+                sl_decimal = resolve_percent_sl_price(
+                    percent=sl_value,
+                    side=side,
+                    entry_ref=entry_decimal,
+                    tick=tick,
+                    min_price=min_price,
+                    max_price=max_price,
+                )
+            except SignalSLError as sl_exc:
+                await msg_obj.reply_text(
+                    format_error_message(
+                        "Не удалось рассчитать SL по проценту.",
+                        context=f"{sym} · {side}",
+                        detail=str(sl_exc),
+                        action="исправьте процент SL и отправьте сигнал заново",
+                    ),
+                    parse_mode='HTML',
+                )
+                return
+            stop_val = float(sl_decimal)
+            logging.info(
+                "SL resolve %s: side=%s sl_mode=percent percent=%s entry_type=%s "
+                "entry_ref=%s sl=%s",
+                sym, side, fmt_decimal(sl_value),
+                "market" if is_market else "limit",
+                entry_price, fmt_decimal(sl_decimal),
+            )
         else:
-            side = "LONG" if entry_price > stop_val else "SHORT"
+            sl_decimal = None
+            # Абсолютный SL — прежняя математика и прежние проверки.
+            if explicit_side:
+                side = explicit_side
+                if (side == "LONG" and stop_val >= entry_price) or (
+                    side == "SHORT" and stop_val <= entry_price
+                ):
+                    await msg_obj.reply_text(
+                        format_error_message(
+                            "SL противоречит направлению сигнала.",
+                            context=f"{sym} · {side}",
+                            detail=f"SL: {stop_val}",
+                            action="исправьте SL и отправьте новый сигнал",
+                        ),
+                        parse_mode='HTML',
+                    )
+                    return
+            else:
+                side = "LONG" if entry_price > stop_val else "SHORT"
 
         # ── Conflict resolver ──────────────────────────────────────────────
         # По умолчанию (CONFLICT_POLICY_SAME_DIR=ignore): поведение как раньше.
@@ -322,14 +458,6 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         pos_usd = current_risk / (diff_pct / 100)
-
-        # Получаем инфо инструмента
-        info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=sym)
-        info = info_resp['result']['list'][0]
-        lot_filter = info['lotSizeFilter']
-        qty_step = float(lot_filter['qtyStep'])
-        min_order_qty = float(lot_filter.get('minOrderQty', qty_step))
-        max_order_qty = float(lot_filter.get('maxOrderQty', 0))
 
         # Плечо
         effective_lev = await bybit_call(set_leverage_safe, sym, lev)
@@ -418,15 +546,24 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        sl_percent_text = fmt_decimal(sl_value) if sl_mode == SL_PERCENT else None
+
         if is_market:
             # Сохраняем риск+источник в памяти; на диск записываем только после успешного GO MARKET.
             set_market_pending(sym, current_risk, source_tag)
             msg = format_market_signal(
                 sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
                 risk_usd=current_risk,
+                sl_mode=sl_mode, sl_percent_text=sl_percent_text,
+            )
+            # Абсолютный SL кодируется как раньше; процент едет отдельным
+            # токеном и превращается в цену только при подтверждении.
+            sl_cb = (
+                encode_percent_callback(sl_value)
+                if sl_mode == SL_PERCENT else stop_val
             )
             btn_label, cb_data = _market_callback(
-                sym, side, stop_val, qty, effective_lev, REQUIRE_MARKET_CONFIRM
+                sym, side, sl_cb, qty, effective_lev, REQUIRE_MARKET_CONFIRM
             )
             kb = [[InlineKeyboardButton(btn_label, callback_data=cb_data)]]
             await msg_obj.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
@@ -434,10 +571,13 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = format_limit_signal(
                 sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
                 risk_usd=current_risk,
+                sl_mode=sl_mode, sl_percent_text=sl_percent_text,
             )
             kb = [[InlineKeyboardButton("🎯 Настроить TP", callback_data=f"set_tps|{sym}")]]
+            # Для процентного SL в ордер уходит нормализованный Decimal, а не процент.
+            sl_for_order = sl_decimal if sl_decimal is not None else stop_val
             place_resp = await bybit_call(
-                place_limit_order, sym, side, qty, entry_price, stop_val
+                place_limit_order, sym, side, qty, entry_price, sl_for_order
             )
             # Записываем риск+источник на диск только после успешного размещения лимитного ордера.
             await asyncio.to_thread(update_risk_for_symbol, sym, current_risk)

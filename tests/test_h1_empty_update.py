@@ -399,10 +399,18 @@ class TestEditedMessagePath:
 
         # Парсинг реально пройден производственным парсером.
         env.parse_signal.assert_called_once()
-        assert env.parse_results == [{
+        # Прежние поля разбора не изменились; HIGH-5 только добавил SL-режим.
+        assert len(env.parse_results) == 1
+        parsed = env.parse_results[0]
+        assert {key: parsed[key] for key in (
+            "coin", "entry_val", "stop_val",
+            "is_market", "explicit_side", "source_tag",
+        )} == {
             "coin": "BTC", "entry_val": 90.0, "stop_val": 100.0,
             "is_market": False, "explicit_side": None, "source_tag": "#Manual",
-        }]
+        }
+        assert parsed["sl_mode"] == "absolute"
+        assert parsed["sl_error"] is None
         # Соответствующий mocked Bybit action вызван.
         assert signal_parser.place_limit_order in calls
         # Success-reply ушёл в edited_message, а update.message остался None.
