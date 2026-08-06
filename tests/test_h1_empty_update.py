@@ -234,12 +234,16 @@ _PLACE_RESP_DEFAULT = {"retCode": 0, "result": {"orderId": "inert-1"}}
 
 def _bybit_dispatcher(*, can_trade=(True, 0.0), ticker_price="95.0",
                       ticker_list=None, available="1000.0",
-                      place_resp=_PLACE_RESP_DEFAULT):
+                      place_resp=_PLACE_RESP_DEFAULT, exchange_sl="100"):
     """AsyncMock для bybit_call: отвечает по идентичности целевой функции.
 
     Возвращает (mock, calls), где calls — список вызванных целей. Ни один
     ответ не выходит в сеть; неожидаемая цель — явная ошибка теста.
     place_resp — ответ размещения лимитного ордера (источник orderId).
+    exchange_sl — состояние SL **на бирже**, задаваемое тестом независимо от
+    запроса. Выводить снимок из аргументов размещения нельзя: такой снимок
+    отражает намерение, поэтому проверка HIGH-6 совпадала бы всегда и не могла
+    бы обнаружить ни расхождение, ни отсутствие защиты.
     """
     calls = []
     session = signal_parser.session
@@ -255,13 +259,21 @@ def _bybit_dispatcher(*, can_trade=(True, 0.0), ticker_price="95.0",
         if fn is session.get_instruments_info:
             return {"result": {"list": [{"lotSizeFilter": {
                 "qtyStep": "0.001", "minOrderQty": "0.001", "maxOrderQty": "0",
-            }}]}}
+            }, "priceFilter": {"tickSize": "0.01"}}]}}
         if fn is signal_parser.set_leverage_safe:
             return 3
         if fn is session.get_wallet_balance:
             return {"result": {"list": [{"totalAvailableBalance": available}]}}
         if fn is signal_parser.place_limit_order:
             return place_resp
+        if fn is session.get_open_orders:
+            placed = place_resp.get("result") if isinstance(place_resp, dict) else None
+            return {"retCode": 0, "result": {"list": [{
+                "symbol": kwargs.get("symbol"),
+                "orderId": (placed or {}).get("orderId", ""),
+                "orderLinkId": (placed or {}).get("orderLinkId", ""),
+                "stopLoss": exchange_sl,
+            }]}}
         raise AssertionError(f"Неожидаемая цель bybit_call: {fn!r}")
 
     return AsyncMock(side_effect=_call), calls
@@ -728,7 +740,12 @@ class TestLimitEntryCarriesOrderIdentifier:
         return journal.call_args.args[0], journal
 
     def test_order_id_from_placement_response_is_recorded(self):
-        """result.orderId → canonical order_id, прежние поля сохранены."""
+        """result.orderId → canonical order_id, прежние поля сохранены.
+
+        HIGH-6 §4: orderLinkId теперь создаётся ДО размещения, поэтому
+        событие содержит предсозданный orderLinkId даже когда ответ Bybit
+        его не возвращает (пустой или отсутствует).
+        """
         bybit_mock, calls = _bybit_dispatcher(
             place_resp={"retCode": 0, "retMsg": "OK",
                         "result": {"orderId": " OID-77 ", "orderLinkId": ""}}
@@ -737,7 +754,9 @@ class TestLimitEntryCarriesOrderIdentifier:
 
         assert signal_parser.place_limit_order in calls
         assert event["order_id"] == "OID-77", "Идентификатор обрезан и записан"
-        assert "order_link_id" not in event, "Пустой orderLinkId не пишется"
+        # §4: предсозданный orderLinkId присутствует для bounded readback
+        assert "order_link_id" in event
+        assert isinstance(event["order_link_id"], str) and len(event["order_link_id"]) == 8
         # Прежний контракт события сохранён
         assert event["event"] == "ENTRY_PLACED"
         assert event["symbol"] == "BTCUSDT" and event["order_type"] == "limit"
@@ -755,15 +774,47 @@ class TestLimitEntryCarriesOrderIdentifier:
         assert event["order_link_id"] == "LINK-9"
 
     def test_missing_identifier_is_not_invented(self):
-        """Без identifier событие backward-compatible, id не выдумывается."""
+        """Без orderId из ответа order_id не выдумывается.
+
+        HIGH-6 §4: order_link_id при этом присутствует — он не выдуман, а
+        реально отправлен в Bybit вместе с запросом на размещение, поэтому
+        является допустимым ключом корреляции для bounded readback.
+        """
         bybit_mock, _ = _bybit_dispatcher(
             place_resp={"retCode": 0, "result": {"orderId": ""}}
         )
         event, _ = self._entry_event(bybit_mock)
 
-        assert "order_id" not in event and "order_link_id" not in event
+        assert "order_id" not in event, "Пустой orderId не выдумывается"
+        assert "order_link_id" in event, "§4: предсозданный orderLinkId сохраняется"
         assert event["symbol"] == "BTCUSDT", "Symbol не подменяет identifier"
         assert event["order_type"] == "limit", "Прежний контракт события сохранён"
+
+    def test_exchange_state_decides_verdict_not_the_request(self):
+        """Снимок биржи независим от запроса: расхождение реально обнаруживается.
+
+        Снимок, выведенный из аргументов размещения, совпадал бы всегда и
+        превращал бы проверку в тавтологию. Здесь SL на бирже задан тестом
+        отдельно, поэтому доказательство относится к состоянию, а не к запросу.
+        """
+        # Запрошено 100, на бирже 111 — доказанное расхождение.
+        bybit_mock, _ = _bybit_dispatcher(exchange_sl="111")
+        event, _ = self._entry_event(bybit_mock)
+        assert event["sl_verify_status"] == "MISMATCH"
+        assert event["sl_requested"] == "100"
+        assert event["sl_on_exchange"] == "111"
+
+        # Тот же путь при совпавшем состоянии даёт VERIFIED.
+        bybit_mock, _ = _bybit_dispatcher(exchange_sl="100")
+        event, _ = self._entry_event(bybit_mock)
+        assert event["sl_verify_status"] == "VERIFIED"
+        assert event["sl_on_exchange"] == "100"
+
+        # SL на бирже отсутствует — это расхождение, а не неизвестность.
+        bybit_mock, _ = _bybit_dispatcher(exchange_sl="")
+        event, _ = self._entry_event(bybit_mock)
+        assert event["sl_verify_status"] == "MISMATCH"
+        assert event["sl_on_exchange"] == "—"
 
     def test_failed_journal_write_does_not_replace_order(self):
         """append_event=False: ордер не переразмещается и не отменяется."""

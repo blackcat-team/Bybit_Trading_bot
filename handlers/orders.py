@@ -12,6 +12,7 @@ import logging
 from core.bybit_call import bybit_call, _SLOW_CALL_THRESHOLD  # noqa: F401 — re-export
 from core.trading_core import session
 from core.utils import safe_float
+from core.write_verify import proven_rejection_code
 from handlers.preflight import floor_qty
 
 
@@ -34,19 +35,30 @@ def set_leverage_safe(sym: str, lev: int) -> int:
         return 1
 
 
-def place_limit_order(sym: str, side: str, qty: float, price: float, stop_loss: float):
+def place_limit_order(sym: str, side: str, qty: float, price: float, stop_loss: float,
+                      order_link_id: str | None = None):
     """
     Размещает лимитный ордер.
 
     Возвращает raw-ответ Bybit: из него берётся точный orderId/orderLinkId для
     корреляции исполнения при сверке. Дополнительный read ради идентификатора
     не нужен — он уже есть в ответе на размещение.
+
+    ``order_link_id`` создаётся вызывающим кодом ДО размещения и передаётся
+    сюда: при потерянном ответе (таймаут, обрыв) это единственный идентификатор,
+    по которому размещённый ордер можно найти чтением. Идентификатор из ответа
+    в таком случае недоступен, а payload запроса доказательством не является.
+    Пустое значение не передаётся в Bybit: он сгенерировал бы свой собственный,
+    и корреляция всё равно была бы невозможна.
     """
     order_side = "Buy" if side == "LONG" else "Sell"
-    resp = session.place_order(
+    params = dict(
         category="linear", symbol=sym, side=order_side,
         orderType="Limit", qty=str(qty), price=str(price), stopLoss=str(stop_loss),
     )
+    if isinstance(order_link_id, str) and order_link_id.strip():
+        params["orderLinkId"] = order_link_id.strip()
+    resp = session.place_order(**params)
     logging.info(f"Limit order placed: {sym} | {side} | Entry: {price} | SL: {stop_loss}")
     return resp
 
@@ -58,12 +70,18 @@ def place_market_with_retry(
     """
     Размещает маркет-ордер. При 110007 уменьшает qty на 1 шаг и ретраит.
 
-    Returns: (success: bool, message: str, final_qty: float, response: dict | None)
+    Returns: (success, message, final_qty, response, reject_code)
 
     Четвёртый элемент — raw-ответ Bybit на фактически принятое размещение;
-    из него берётся точный orderId/orderLinkId. Изменение backward-compatible:
-    вызывающий код читает элементы по индексу, поэтому прежние трёхэлементные
-    возвраты (в том числе в тестовых заглушках) остаются рабочими.
+    из него берётся точный orderId/orderLinkId. Пятый — доказанный business-код
+    отказа Bybit (``int``) либо ``None``, если отказ не доказан: таймаут, обрыв,
+    неразобранный ответ и внутренняя ошибка SDK структурного кода не дают, и
+    вызывающий код обязан считать такой исход неоднозначным. Текст сообщения
+    доказательством не является и здесь не разбирается.
+
+    Изменение backward-compatible: вызывающий код читает элементы по индексу,
+    поэтому прежние трёх- и четырёхэлементные возвраты (в том числе в тестовых
+    заглушках) остаются рабочими.
     """
     try:
         resp = session.place_order(
@@ -71,8 +89,9 @@ def place_market_with_retry(
             orderType="Market", qty=str(qty), stopLoss=sl,
         )
         logging.info(f"⚡ Market order: {sym} | {order_side} | qty={qty}")
-        return True, f"⚡️ Исполнен Маркет по {sym}", qty, resp
+        return True, f"⚡️ Исполнен Маркет по {sym}", qty, resp, None
     except Exception as ord_err:
+        reject_code = proven_rejection_code(ord_err)
         if "110007" in str(ord_err) and qty_step > 0:
             retry_qty = floor_qty(qty - qty_step, qty_step)
             if retry_qty >= min_order_qty and retry_qty > 0:
@@ -85,20 +104,21 @@ def place_market_with_retry(
                     logging.info(f"⚡ Market order (retry): {sym} | {order_side} | qty={retry_qty}")
                     return (
                         True, f"⚡️ Исполнен Маркет по {sym} (retry: {retry_qty})",
-                        retry_qty, retry_resp,
+                        retry_qty, retry_resp, None,
                     )
                 except Exception as retry_err:
                     logging.error(f"Market retry failed: {retry_err}")
-                    return False, f"❌ Market {sym}: {retry_err}", 0.0, None
+                    return (False, f"❌ Market {sym}: {retry_err}", 0.0, None,
+                            proven_rejection_code(retry_err))
             else:
                 return (
                     False,
                     f"❌ <b>Market {sym}:</b> недостаточно средств даже после retry",
-                    0.0, None,
+                    0.0, None, reject_code,
                 )
         else:
             logging.error(f"Market order error: {ord_err}")
-            return False, f"❌ Market {sym}: {ord_err}", 0.0, None
+            return False, f"❌ Market {sym}: {ord_err}", 0.0, None, reject_code
 
 
 def close_position_market(sym: str) -> tuple:

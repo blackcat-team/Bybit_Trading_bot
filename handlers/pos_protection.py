@@ -28,6 +28,7 @@ float даёт ошибку представления и может сдвин�
 от цены входа.
 """
 
+import asyncio
 import logging
 import re
 import secrets
@@ -39,6 +40,30 @@ from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from core.config import ALLOWED_ID, MARKET_PREVIEW_TTL_SEC
 from core.trading_core import session
+from core.write_verify import (
+    MALFORMED,
+    MISSING,
+    READBACK_ATTEMPTS,
+    READBACK_DELAY_SEC,
+    SOURCE_POSITION,
+    UNVERIFIED,
+    VERIFIED,
+)
+from core.write_verify import MISMATCH as WRITE_MISMATCH
+from core.write_verify import (
+    envelope_ok,
+    journal_fields,
+    levels_equal,
+    log_evidence,
+    make_result,
+    proven_rejection_code,
+    read_field_level,
+    read_protection_level as read_level,
+    read_position_idx,
+    resolve_write_status,
+    write_outcome_for,
+)
+from core.journal import PROTECTION_WRITE, append_event
 from handlers.orders import bybit_call
 from handlers.ui import (
     format_action,
@@ -69,14 +94,49 @@ TPSL_MODE = "Full"
 ORDER_TYPE = "Market"
 
 # --- Результаты authoritative readback ---
-CONFIRMED = "CONFIRMED"
-MISMATCH = "MISMATCH"
-UNKNOWN = "UNKNOWN"
+# Значения задаёт общий контракт core.write_verify (HIGH-6). Прежние имена
+# сохранены как псевдонимы: они читаемы в контексте /pos и уже используются
+# вызывающим кодом и тестами.
+CONFIRMED = VERIFIED
+MISMATCH = WRITE_MISMATCH
+UNKNOWN = UNVERIFIED
 
 # --- Проверка типа триггера при readback ---
 TRIGGER_VERIFIED = "verified"
 TRIGGER_UNVERIFIED = "unverified"
 TRIGGER_MISMATCH = "mismatch"
+
+# Имя пути записи в доказательствах проверки (HIGH-6).
+_PROTECTION_VERIFY_PATH = "protection_edit"
+
+
+async def _journal_protection_write(kind: str, evidence: dict) -> None:
+    """Пишет доказательство записи защиты в журнал.
+
+    Событие аддитивно и lifecycle не меняет. Неудача записи журнала не
+    откатывает уже выполненную запись на бирже и не превращается в ошибку
+    оператору: она только логируется, иначе доказательство было бы потеряно
+    молча.
+    """
+    event = {
+        "event": PROTECTION_WRITE,
+        "symbol": evidence.get("symbol"),
+        "side": evidence.get("side"),
+        "protection_kind": kind,
+    }
+    event.update(journal_fields(evidence))
+    try:
+        ok = await asyncio.to_thread(append_event, event)
+    except Exception as exc:
+        logging.error("journal PROTECTION_WRITE failed для %s: %s",
+                      evidence.get("symbol"), exc)
+        return
+    if not ok:
+        logging.error(
+            "journal PROTECTION_WRITE не записан для %s (%s) — доказательство "
+            "проверки защиты осталось только в логе",
+            evidence.get("symbol"), evidence.get("status"),
+        )
 
 # Ожидающий ввод значения: user_id → спецификация уровня.
 _PENDING_INPUT: dict = {}
@@ -90,13 +150,6 @@ _ABS_RE = re.compile(r"^\d+(?:\.\d+)?$")
 _PCT_RE = re.compile(r"^\d+(?:\.\d+)?%$")
 
 _HUNDRED = Decimal("100")
-
-# Bybit допускает только эти значения positionIdx: 0 — one-way,
-# 1 — hedge Buy, 2 — hedge Sell.
-_ALLOWED_POSITION_IDX = (0, 1, 2)
-
-# Значение поля присутствует, но неразбираемо: доказательств нет.
-MALFORMED = object()
 
 CANCEL_INPUT_CALLBACK = "pincancel"
 
@@ -168,40 +221,6 @@ def to_decimal(raw):
     return value
 
 
-def read_level(raw):
-    """Читает уровень защиты из position payload.
-
-    ``None`` — уровень отсутствует (Bybit отдаёт для этого ``""``, ``None``
-    либо ``"0"``). ``Decimal`` — уровень задан. ``MALFORMED`` — значение есть,
-    но не разбирается; доказательств состояния нет.
-    """
-    if raw is None:
-        return None
-    if isinstance(raw, bool):
-        return MALFORMED
-    text = str(raw).strip()
-    if text == "":
-        return None
-    try:
-        value = Decimal(text)
-    except (InvalidOperation, ValueError):
-        return MALFORMED
-    if not value.is_finite() or value < 0:
-        return MALFORMED
-    if value == 0:
-        return None
-    return value
-
-
-def levels_equal(left, right) -> bool:
-    """Сравнивает два результата :func:`read_level`. MALFORMED не равен ничему."""
-    if left is MALFORMED or right is MALFORMED:
-        return False
-    if left is None or right is None:
-        return left is None and right is None
-    return left == right
-
-
 def read_instrument_number(raw, *, allow_zero: bool):
     """Строгий разбор числа из instrument metadata (``priceFilter``).
 
@@ -230,24 +249,6 @@ def read_instrument_number(raw, *, allow_zero: bool):
     if value == 0 and not allow_zero:
         return None
     return value
-
-
-def read_position_idx(raw):
-    """Строгий разбор ``positionIdx``: только 0, 1 или 2.
-
-    Возвращает ``int`` либо ``None``, если значение отсутствует, является
-    ``bool``, нечисловым или вне допустимого набора. ``None`` означает
-    «идентичность позиции не доказана» и обязано трактоваться fail-closed:
-    one-way режим по отсутствию поля не предполагается.
-    """
-    if raw is None or isinstance(raw, bool):
-        return None
-    if isinstance(raw, int):
-        return raw if raw in _ALLOWED_POSITION_IDX else None
-    if isinstance(raw, str):
-        text = raw.strip()
-        return int(text) if text in {"0", "1", "2"} else None
-    return None
 
 
 def fmt_decimal(value) -> str:
@@ -372,8 +373,13 @@ def match_position(resp, symbol: str, side, position_idx=None):
 
     Возвращает строку позиции либо None. None означает «доказательств нет» —
     вызывающая сторона обязана трактовать это fail-closed, а не как успех.
+    Ответ без доказанного ``retCode == 0`` строк не даёт: ``result.list`` в
+    ответе с ошибкой относится к неизвестному состоянию, и совпавшая в нём
+    строка доказала бы несуществующую защиту.
     """
     if not isinstance(resp, dict):
+        return None
+    if not envelope_ok(resp):
         return None
     result = resp.get("result")
     if not isinstance(result, dict):
@@ -996,7 +1002,35 @@ async def _stale_preview(query, reason: str = None) -> None:
 async def _readback_state(symbol: str, side, position_idx, kind: str,
                           expected: Decimal, expected_other,
                           pre_write: dict = None) -> dict:
-    """Узкий authoritative readback фактического состояния защиты.
+    """Ограниченный authoritative readback фактического состояния защиты.
+
+    Чтение повторяется не более :data:`READBACK_ATTEMPTS` раз с короткой
+    паузой: изменение могло ещё не отразиться в снимке позиции. Повтор
+    относится **только к чтению** — запись не повторяется и не восстанавли-
+    вается ни при каком исходе. Цикл прерывается досрочно при доказанном
+    совпадении и при доказанной смене идентичности: в первом случае повторять
+    нечего, во втором читается уже другая позиция.
+
+    Итог последней попытки и есть результат: недоступность, malformed-ответ,
+    исчезнувшая позиция или изменившаяся идентичность дают UNKNOWN, успех без
+    доказательства не утверждается.
+    """
+    result = None
+    for attempt in range(1, READBACK_ATTEMPTS + 1):
+        if attempt > 1:
+            await asyncio.sleep(READBACK_DELAY_SEC)
+        result = await _readback_once(symbol, side, position_idx, kind,
+                                      expected, expected_other, pre_write)
+        result["attempts"] = attempt
+        if result["status"] == CONFIRMED or result.get("identity_changed"):
+            return result
+    return result
+
+
+async def _readback_once(symbol: str, side, position_idx, kind: str,
+                         expected: Decimal, expected_other,
+                         pre_write: dict = None) -> dict:
+    """Одно узкое authoritative чтение состояния защиты.
 
     Сначала доказывается, что прочитана **та же** позиция: symbol, side,
     positionIdx, size и avgPrice должны совпасть с authoritative pre-write
@@ -1006,9 +1040,7 @@ async def _readback_state(symbol: str, side, position_idx, kind: str,
 
     Затем проверяются запрошенный уровень, сохранность второго уровня
     относительно pre-write снимка и — только если payload его отдаёт — тип
-    триггера. Недоступность, malformed-ответ, исчезнувшая позиция или
-    изменившаяся идентичность дают UNKNOWN: успех без доказательства не
-    утверждается. Ни повторной записи, ни retry здесь не выполняется.
+    триггера. Ни повторной записи, ни ремонта состояния здесь не выполняется.
     """
     empty = {
         "status": UNKNOWN, "level": None, "other": None,
@@ -1044,9 +1076,14 @@ async def _readback_state(symbol: str, side, position_idx, kind: str,
         return result
 
     other_kind = TP if kind == SL else SL
-    level = read_level(row.get(_KIND_FIELD[kind]))
-    other = read_level(row.get(_KIND_FIELD[other_kind]))
+    # Отсутствие ключа — не то же самое, что пустое значение: пустое означает
+    # «защиты нет», отсутствие ключа означает, что ответ о защите ничего не
+    # утверждает, и объявлять по нему расхождение нельзя.
+    level = read_field_level(row, _KIND_FIELD[kind])
+    other = read_field_level(row, _KIND_FIELD[other_kind])
     if level is MALFORMED or other is MALFORMED:
+        return empty
+    if level is MISSING or other is MISSING:
         return empty
 
     trigger_raw = row.get(_TRIGGER_FIELD[kind])
@@ -1174,6 +1211,67 @@ async def confirm_protection(update: Update, context: ContextTypes.DEFAULT_TYPE,
                  kind, symbol, side, position_idx, fmt_decimal(price),
                  result["status"], fmt_decimal(result["level"]),
                  fmt_decimal(result["other"]), result["trigger"])
+    # Durable-строка доказательства: одна проверка — одна строка, в общем
+    # формате всех safety-critical записей.
+    #
+    # §8: доказанный business-код отказа Bybit (структурный retCode из
+    # exception или response) даёт REJECTED; таймаут/обрыв/неразборный ответ
+    # (exception без структурного кода) остаются неоднозначным исходом.
+    reject_code = (
+        proven_rejection_code(write_failed) if write_failed is not None else None
+    )
+    write_rejected = reject_code is not None
+    resolved_status = resolve_write_status(
+        result["status"], write_error=write_failed, write_rejected=write_rejected,
+    )
+    # §6: оба уровня фиксируются раздельно и всегда. Запись меняет один уровень
+    # и обязана сохранить второй, поэтому доказательство обязано содержать и
+    # запрошенный, и фактический уровень для SL, и для TP. Без этого сохранённый
+    # уровень нельзя ни доказать, ни отличить от затёртого: TP-only запись,
+    # записанная только в SL-слоты, теряет и то, что просили, и то, что вышло.
+    #
+    # Изменяемый уровень: запрошено = price, фактически = result["level"].
+    # Второй уровень: запрошено = его pre-write значение (его сохранение и есть
+    # требование), фактически = result["other"] из того же readback.
+    if kind == SL:
+        level_slots = {
+            "requested_stop_loss": price,
+            "observed_stop_loss": result["level"],
+            "requested_take_profit": expected_other,
+            "observed_take_profit": result["other"],
+        }
+    else:
+        level_slots = {
+            "requested_take_profit": price,
+            "observed_take_profit": result["level"],
+            "requested_stop_loss": expected_other,
+            "observed_stop_loss": result["other"],
+        }
+    evidence = make_result(
+        status=resolved_status,
+        path=_PROTECTION_VERIFY_PATH, symbol=symbol, side=side,
+        position_idx=position_idx, field=_KIND_FIELD[kind],
+        expected=price, actual=result["level"],
+        attempts=result.get("attempts", 0), source=SOURCE_POSITION,
+        # Судьба самой записи, отдельно от совпадения уровней: подтверждённый
+        # ответ, доказанный отказ или восстановление сверкой после потери ответа.
+        write_outcome=write_outcome_for(
+            resolved_status,
+            write_acknowledged=(write_failed is None),
+            write_rejected=write_rejected,
+        ),
+        **level_slots,
+        detail=(
+            f"Bybit отклонил запись, retCode={reject_code}" if write_rejected
+            else "исход записи неизвестен: ответ Bybit не получен"
+            if write_failed is not None
+            else ("идентичность изменилась" if result.get("identity_changed") else "")
+        ),
+    )
+    log_evidence(evidence)
+    # Журнал, а не только лог: лог ротируется, а расследование исчезнувшей
+    # защиты опирается на durable-доказательство.
+    await _journal_protection_write(kind, evidence)
 
     if write_failed is not None:
         if result["status"] == CONFIRMED:

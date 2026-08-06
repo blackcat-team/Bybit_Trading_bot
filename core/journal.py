@@ -15,6 +15,8 @@
                       снимке Bybit; локальное состояние переведено в терминальное.
                       Причина, PnL и цена выхода НЕ подтверждены.
   FAIL              — попытка сделки заблокирована или провалилась
+  PROTECTION_WRITE  — доказательство authoritative-проверки записи SL/TP из /pos.
+                      Lifecycle не меняет и терминальным не является.
 
 Lifecycle по символу (порядок строк в JSONL, не timestamp):
   ENTRY_PLACED → PENDING; POSITION_CONFIRMED → CONFIRMED;
@@ -48,6 +50,10 @@ POSITION_CONFIRMED = "POSITION_CONFIRMED"
 CLOSED             = "CLOSED"
 RECONCILED         = "RECONCILED"
 FAIL               = "FAIL"
+# Доказательство authoritative-записи защиты (/pos). Событие только фиксирует
+# факт проверки: lifecycle оно не меняет и терминальным не является, поэтому
+# build_lifecycles его намеренно не обрабатывает.
+PROTECTION_WRITE   = "PROTECTION_WRITE"
 
 # Терминальные события: после любого из них символ больше не отслеживается,
 # пока не появится новое ENTRY_PLACED.

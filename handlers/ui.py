@@ -13,6 +13,7 @@ from collections.abc import Mapping
 
 from core.notifier import sanitize_operator_text
 from core.utils import safe_float
+from core.write_verify import MISMATCH, REJECTED, UNVERIFIED, VERIFIED
 
 
 TELEGRAM_TEXT_LIMIT = 4096
@@ -149,6 +150,79 @@ def _sl_label(sl_mode, stop_val, *, indicative: bool) -> str:
     return text
 
 
+# --- Итог authoritative-проверки записи SL (HIGH-6) ---
+# Карточка утверждает только доказанное. ``sl_status is None`` означает, что
+# проверка не выполнялась: тогда отображение остаётся прежним и ничего лишнего
+# не заявляется.
+_SL_VERIFY_LABEL = {
+    VERIFIED: "подтверждён на Bybit",
+    MISMATCH: "расхождение с Bybit",
+    UNVERIFIED: "не подтверждён",
+    REJECTED: "запись отклонена Bybit",
+}
+_SL_VERIFY_WARNING = {
+    MISMATCH: "Фактический SL на Bybit отличается от запрошенного.",
+    UNVERIFIED: "Подтвердить SL на Bybit не удалось: фактическое состояние неизвестно.",
+    REJECTED: "Bybit отклонил установку SL: защита не установлена.",
+}
+_SL_VERIFY_ACTION = "проверьте SL на Bybit вручную"
+
+
+def _normalize_sl_status(sl_status):
+    """Приводит статус к контракту перед отображением.
+
+    Неизвестный статус не имеет права попасть в карточку как успех: любое
+    значение вне контракта означает «не доказано» и показывается как
+    ``UNVERIFIED`` вместе с обязательным предупреждением.
+    """
+    if sl_status is None:
+        return None
+    return sl_status if sl_status in _SL_VERIFY_LABEL else UNVERIFIED
+
+
+def _sl_verify_rows(sl_status, requested_text, sl_actual):
+    """Строки SL с учётом фактического состояния биржи.
+
+    Совпадение показывается одной строкой, расхождение — обеими: оператор
+    должен видеть и запрошенный, и фактический уровень. Недоказанное состояние
+    никогда не печатается как фактическое.
+    """
+    status = _normalize_sl_status(sl_status)
+    if status is None:
+        return [("SL", requested_text)]
+    actual_text = str(sl_actual).strip() if sl_actual not in (None, "") else ""
+    if status == VERIFIED:
+        # Показывается только наблюдённый уровень. Подстановка запрошенного
+        # значения в строке «подтверждён на Bybit» выдала бы содержимое запроса
+        # за факт биржи — ровно та ложь, которую проверка и должна исключать.
+        if actual_text and actual_text != "—":
+            rows = [("SL на Bybit", actual_text)]
+        else:
+            # Статус VERIFIED без наблюдённого значения недоказуем.
+            status = UNVERIFIED
+            rows = [("SL запрошен", requested_text)]
+    else:
+        rows = [("SL запрошен", requested_text)]
+        if status == MISMATCH:
+            rows.append(("SL на Bybit", actual_text or "—"))
+    rows.append(("Проверка", _SL_VERIFY_LABEL[status]))
+    return rows
+
+
+def _sl_verify_warning(sl_status, sl_actual=None):
+    """Предупреждение о недоказанном или расходящемся SL, иначе None."""
+    status = _normalize_sl_status(sl_status)
+    if status is None:
+        return None
+    if status == VERIFIED:
+        actual_text = str(sl_actual).strip() if sl_actual not in (None, "") else ""
+        if not actual_text or actual_text == "—":
+            # Тот же вырожденный VERIFIED, что и в _sl_verify_rows.
+            return _SL_VERIFY_WARNING[UNVERIFIED]
+        return None
+    return _SL_VERIFY_WARNING.get(status)
+
+
 def format_market_signal(
     sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
     risk_usd=None, warnings=(), sl_mode=None, sl_percent_text=None,
@@ -189,6 +263,7 @@ def format_market_signal(
 def format_limit_signal(
     sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
     risk_usd=None, warnings=(), sl_mode=None, sl_percent_text=None,
+    sl_status=None, sl_actual=None,
 ):
     """Результат принятия существующего лимитного ордера."""
     direction = _direction(side)
@@ -206,20 +281,29 @@ def format_limit_signal(
     if mode_row:
         protection_rows.append(mode_row)
     # Для лимитного входа процентный SL уже окончательный: цена входа известна.
-    protection_rows.append(("SL", _sl_label(sl_mode, stop_val, indicative=False)))
+    protection_rows.extend(_sl_verify_rows(
+        sl_status, _sl_label(sl_mode, stop_val, indicative=False), sl_actual,
+    ))
     protection_rows.append(("Плечо", f"x{lev}"))
     protection_rows.append(
         ("Риск", _fmt_usdt(risk_usd) if risk_usd is not None else None)
     )
     protection_rows.append(("До SL", f"{_sl_pct(entry_price, stop_val):.2f}%"))
     protection = format_value_block(protection_rows)
+    verify_warning = _sl_verify_warning(sl_status, sl_actual)
+    all_warnings = list(warnings)
+    if verify_warning:
+        all_warnings.append(verify_warning)
     return _join_sections(
         format_header("✅", "ORDER ACCEPTED"),
         f"{direction}: {h(sym)} · Limit",
         f"📌 <b>Ордер</b>\n{order}",
         f"🛡 <b>Защита</b>\n{protection}",
-        format_warning_list(warnings),
-        format_action("контролируйте ордер через /orders"),
+        format_warning_list(all_warnings),
+        format_action(
+            _SL_VERIFY_ACTION if verify_warning
+            else "контролируйте ордер через /orders"
+        ),
     )
 
 
@@ -296,7 +380,8 @@ def format_market_preview(
 
 
 def format_order_accepted(sym, side, qty, *, order_type="Market", price=None,
-                          stop=None, leverage=None, risk_usd=None, retried=False):
+                          stop=None, leverage=None, risk_usd=None, retried=False,
+                          sl_status=None, sl_actual=None):
     direction = _direction(side)
     order = format_value_block([
         ("Инструмент", sym),
@@ -306,17 +391,23 @@ def format_order_accepted(sym, side, qty, *, order_type="Market", price=None,
         ("Цена", _fmt_price(price) if price is not None else None),
         ("Статус", "принят после retry" if retried else "принят Bybit"),
     ])
-    protection = format_value_block([
-        ("SL", _fmt_price(stop) if stop is not None else None),
-        ("Плечо", f"x{leverage}" if leverage is not None else None),
-        ("Риск", _fmt_usdt(risk_usd) if risk_usd is not None else None),
-    ])
+    protection_rows = _sl_verify_rows(
+        sl_status, _fmt_price(stop) if stop is not None else None, sl_actual,
+    )
+    protection_rows.append(("Плечо", f"x{leverage}" if leverage is not None else None))
+    protection_rows.append(("Риск", _fmt_usdt(risk_usd) if risk_usd is not None else None))
+    protection = format_value_block(protection_rows)
+    verify_warning = _sl_verify_warning(sl_status, sl_actual)
     return _join_sections(
         format_header("✅", "ORDER ACCEPTED"),
         f"{direction}: {h(sym)} · {h(order_type)}",
         f"📌 <b>Ордер</b>\n{order}",
         f"🛡 <b>Защита</b>\n{protection}" if protection else "",
-        format_action("контролируйте позицию через /status"),
+        format_warning_list([verify_warning] if verify_warning else []),
+        format_action(
+            _SL_VERIFY_ACTION if verify_warning
+            else "контролируйте позицию через /status"
+        ),
     )
 
 

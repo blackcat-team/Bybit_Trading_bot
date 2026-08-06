@@ -69,10 +69,12 @@ def _pos(*, symbol="BTCUSDT", side="Buy", entry="100", size="1",
         row["positionIdx"] = idx
     if trigger is not None:
         row["slTriggerBy"] = trigger
-    return {"result": {"list": [row]}}
+    # retCode обязателен: readback читает строки только из доказанно успешного
+    # ответа, а реальный ответ Bybit всегда содержит код.
+    return {"retCode": 0, "result": {"list": [row]}}
 
 
-_EMPTY_POS = {"result": {"list": []}}
+_EMPTY_POS = {"retCode": 0, "result": {"list": []}}
 
 # Лимитная ступень фиксации прибыли для Long: закрытие Sell, reduceOnly, Limit.
 _LADDER_ORDER = {

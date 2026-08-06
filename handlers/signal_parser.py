@@ -5,6 +5,7 @@ Signal parser — разбор текстовых сигналов + основ�
 import asyncio
 import re
 import logging
+import secrets
 from decimal import Decimal
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -20,8 +21,16 @@ from core.trading_core import session, check_daily_limit
 from core.notifier import send_alert, FAIL_CLOSED
 from core.heat import enforce_heat
 from core.conflict import resolve_signal_conflict
+from core.write_verify import (
+    READBACK_ATTEMPTS, READBACK_DELAY_SEC, SOURCE_OPEN_ORDER, UNVERIFIED,
+    VERIFIED, MISMATCH, WRITE_AMBIGUOUS_UNVERIFIED, align_expected, fmt_level,
+    journal_fields, log_evidence, make_result, proven_rejection_code,
+    read_protection_level, read_tick, read_tick_size, tick_unproven,
+    verify_order_protection, write_outcome_for,
+)
 from core.journal import (
     is_source_enabled, append_event, extract_order_ids, ENTRY_PLACED,
+    PROTECTION_WRITE,
 )
 from core.database import (
     log_source, update_risk_for_symbol,
@@ -35,6 +44,7 @@ from handlers.ui import (
     format_error_message,
     format_limit_signal,
     format_market_signal,
+    format_order_rejected,
     format_warning_message,
 )
 
@@ -197,6 +207,80 @@ def parse_signal(txt: str) -> dict | None:
 # Обработчик Telegram
 # ---------------------------------------------------------------------------
 
+# Имя пути записи в доказательствах проверки (HIGH-6).
+_LIMIT_VERIFY_PATH = "limit_entry"
+
+
+async def _verify_limit_protection(sym, sl_for_order, tick_raw, order_ids):
+    """Доказывает SL, прикреплённый к размещённому лимитному ордеру.
+
+    Чтение ограничено по числу попыток, ничего не изменяет и никогда не
+    повторяет запись. Недоступный список, недоказанный конверт ответа,
+    недоказуемый шаг цены, отсутствующий идентификатор и ненайденный ордер дают
+    ``UNVERIFIED``: неизвестное не выдаётся ни за успех, ни за расхождение с
+    биржей.
+    """
+    order_id = order_ids.get("order_id")
+    order_link_id = order_ids.get("order_link_id")
+    tick_bad = tick_unproven(tick_raw)
+    expected = read_protection_level(sl_for_order)
+    if not tick_bad:
+        expected = align_expected(expected, read_tick(tick_raw))
+    if tick_bad:
+        # Сетка сравнения не доказана: нормализация по ней могла бы объявить
+        # совпадением два разных уровня.
+        return make_result(
+            status=UNVERIFIED, path=_LIMIT_VERIFY_PATH, symbol=sym,
+            expected=expected, source=SOURCE_OPEN_ORDER,
+            order_id=order_id, order_link_id=order_link_id,
+            detail="шаг цены инструмента (tickSize) не доказан",
+        )
+    if not order_id and not order_link_id:
+        # Совпадения по символу недостаточно: на инструменте может быть чужой
+        # или более старый ордер, и его SL ничего не доказывает про наш.
+        return make_result(
+            status=UNVERIFIED, path=_LIMIT_VERIFY_PATH, symbol=sym,
+            expected=expected, source=SOURCE_OPEN_ORDER,
+            detail="точный идентификатор ордера недоступен",
+        )
+    result = make_result(
+        status=UNVERIFIED, path=_LIMIT_VERIFY_PATH, symbol=sym, expected=expected,
+        source=SOURCE_OPEN_ORDER, order_id=order_id, order_link_id=order_link_id,
+        detail="список открытых ордеров недоступен",
+    )
+    for attempt in range(1, READBACK_ATTEMPTS + 1):
+        if attempt > 1:
+            await asyncio.sleep(READBACK_DELAY_SEC)
+        try:
+            resp = await bybit_call(
+                session.get_open_orders, category="linear", symbol=sym
+            )
+        except Exception as rb_err:
+            # Неудачное чтение — не конец проверки: обрыв одной попытки не
+            # доказывает недоступность биржи, а прекращение цикла здесь ещё и
+            # занижало бы число попыток в доказательстве.
+            logging.warning(
+                "Limit readback %s попытка %s недоступна: %s", sym, attempt, rb_err
+            )
+            result = make_result(
+                status=UNVERIFIED, path=_LIMIT_VERIFY_PATH, symbol=sym,
+                expected=expected, attempts=attempt, source=SOURCE_OPEN_ORDER,
+                order_id=order_id, order_link_id=order_link_id,
+                detail="список открытых ордеров недоступен",
+            )
+            continue
+        result = verify_order_protection(
+            resp, symbol=sym, expected_raw=sl_for_order, order_id=order_id,
+            order_link_id=order_link_id, tick_raw=tick_raw, attempts=attempt,
+            path=_LIMIT_VERIFY_PATH,
+        )
+        # Найденный ордер — уже доказательство: и совпадение, и расхождение
+        # окончательны, повторное чтение их не изменит.
+        if result["status"] != UNVERIFIED:
+            return result
+    return result
+
+
 async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ALLOWED_ID:
         return
@@ -323,6 +407,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # нормализуется по tickSize того же снимка, что и лот-фильтр.
         info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=sym)
         info = info_resp['result']['list'][0]
+        tick_raw = read_tick_size(info)
         lot_filter = info['lotSizeFilter']
         qty_step = float(lot_filter['qtyStep'])
         min_order_qty = float(lot_filter.get('minOrderQty', qty_step))
@@ -568,47 +653,202 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb = [[InlineKeyboardButton(btn_label, callback_data=cb_data)]]
             await msg_obj.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
         else:
-            msg = format_limit_signal(
-                sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
-                risk_usd=current_risk,
-                sl_mode=sl_mode, sl_percent_text=sl_percent_text,
-            )
             kb = [[InlineKeyboardButton("🎯 Настроить TP", callback_data=f"set_tps|{sym}")]]
             # Для процентного SL в ордер уходит нормализованный Decimal, а не процент.
             sl_for_order = sl_decimal if sl_decimal is not None else stop_val
-            place_resp = await bybit_call(
-                place_limit_order, sym, side, qty, entry_price, sl_for_order
+            # §4: создаём orderLinkId ДО размещения тем же безопасным методом,
+            # который используется во всех прочих точках входа. При потере ответа
+            # (таймаут, обрыв, exception после записи) именно он остаётся
+            # единственным способом найти размещённый ордер. Bybit принимает
+            # до 36 символов; репозиторный token_urlsafe(6) даёт 8 символов (6 байт
+            # → base64 → 8 символов). Передаётся в единственный вызов place_limit_order.
+            order_link_id_created = secrets.token_urlsafe(6)
+            place_resp = None
+            place_success = False
+            place_error = None
+            place_exc = None
+            try:
+                place_resp = await bybit_call(
+                    place_limit_order, sym, side, qty, entry_price, sl_for_order,
+                    order_link_id=order_link_id_created
+                )
+                place_success = True
+            except Exception as limit_err:
+                # Сам объект исключения сохраняем отдельно: только он несёт
+                # структурный retCode/status_code, по которому §2 отличает
+                # доказанный отказ биржи от неоднозначного транспортного сбоя.
+                # Строка нужна лишь для текста оператору и никогда не участвует
+                # в классификации исхода.
+                place_exc = limit_err
+                place_error = str(limit_err)
+                logging.warning("Limit placement %s exception: %s", sym, limit_err)
+            # После успеха берём orderId из ответа; orderLinkId уже известен — тот,
+            # который мы сами предсоздали. После exception (таймаут, обрыв) ответа
+            # нет, но предсозданный orderLinkId остаётся, и bounded readback сможет
+            # использовать его для точной корреляции.
+            order_ids = extract_order_ids(place_resp) if place_resp else {}
+            if "order_link_id" not in order_ids:
+                order_ids["order_link_id"] = order_link_id_created
+            # §6: три ветви (A/B/C) по исходу размещения. Классификация идёт
+            # до readback, потому что доказанный отказ делает чтение ненужным.
+            reject_code = (
+                proven_rejection_code(place_exc) if place_exc is not None else None
             )
-            # Записываем риск+источник на диск только после успешного размещения лимитного ордера.
-            await asyncio.to_thread(update_risk_for_symbol, sym, current_risk)
-            await asyncio.to_thread(log_source, sym, source_tag)
-            entry_event = {
-                "event": ENTRY_PLACED, "symbol": sym, "side": side,
-                "source_tag": source_tag, "planned_risk_usdt": current_risk,
-                "qty": qty, "entry": entry_price, "stop": stop_val,
-                "order_type": "limit",
-            }
-            # Точный идентификатор берём из ответа на размещение; пустые и
-            # выдуманные значения не пишутся.
-            order_ids = extract_order_ids(place_resp)
-            entry_event.update(order_ids)
-            if not order_ids:
-                logging.warning(
-                    "Limit %s: в ответе размещения нет orderId/orderLinkId — "
-                    "сверка исполнения недоступна, lifecycle останется PENDING", sym,
+            write_rejected = reject_code is not None
+            if write_rejected:
+                # Случай B: биржа вернула структурный business-код — ордер
+                # не создан, читать нечего. Bounded readback пропускаем, чтобы
+                # не выдавать UNVERIFIED там, где исход уже доказан.
+                verify = None
+            else:
+                # Случаи A и C: ордер мог существовать. При exception (таймаут,
+                # обрыв) ответа нет, но предсозданный orderLinkId остался —
+                # bounded readback использует его для точной корреляции.
+                verify = await _verify_limit_protection(
+                    sym, sl_for_order, tick_raw, order_ids
                 )
-            journal_ok = await asyncio.to_thread(append_event, entry_event)
-            if not journal_ok:
-                # Ордер уже принят биржей: не переразмещаем и не отменяем его.
-                logging.error(
-                    "Limit %s принят Bybit (ордер %s), но ENTRY_PLACED не записан — "
-                    "lifecycle tracking для этого ордера отсутствует",
-                    sym,
-                    order_ids.get("order_id")
-                    or order_ids.get("order_link_id")
-                    or "идентификатор недоступен",
+                log_evidence(verify)
+            # Три маршрута после верификации.
+            # A: размещение подтверждено → ENTRY_PLACED с risk/source.
+            # B: readback доказал ордер (VERIFIED/MISMATCH) после ambiguous placement
+            #    → ENTRY_PLACED с risk/source, но write_outcome = ambiguous-readback-*.
+            # C: readback не доказал ордер (UNVERIFIED) после ambiguous placement
+            #    → lifecycle-neutral PROTECTION_WRITE без risk/source.
+            readback_proven = (
+                verify is not None and verify["status"] in (VERIFIED, MISMATCH)
+            )
+            if place_success or readback_proven:
+                # Случай A (place_success=True) или Случай B (readback доказал
+                # exact order после ambiguous write): создаём ENTRY_PLACED ровно
+                # один раз, пишем risk+источник на диск.
+                wo = write_outcome_for(
+                    verify["status"] if verify else VERIFIED,
+                    write_acknowledged=place_success,
+                    write_rejected=False,
                 )
-            await msg_obj.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
+                await asyncio.to_thread(update_risk_for_symbol, sym, current_risk)
+                await asyncio.to_thread(log_source, sym, source_tag)
+                entry_event = {
+                    "event": ENTRY_PLACED, "symbol": sym, "side": side,
+                    "source_tag": source_tag, "planned_risk_usdt": current_risk,
+                    "qty": qty, "entry": entry_price, "stop": stop_val,
+                    "order_type": "limit",
+                }
+                # Для восстановленного случая берём orderId из authoritative-
+                # строки: после потери ответа только readback знает настоящий
+                # orderId, и без него сверка исполнения невозможна.
+                if verify and verify.get("order_id"):
+                    entry_event["order_id"] = verify["order_id"]
+                elif order_ids.get("order_id"):
+                    entry_event["order_id"] = order_ids["order_id"]
+                if verify and verify.get("order_link_id"):
+                    entry_event["order_link_id"] = verify["order_link_id"]
+                elif order_ids.get("order_link_id"):
+                    entry_event["order_link_id"] = order_ids["order_link_id"]
+                if not entry_event.get("order_id") and not entry_event.get("order_link_id"):
+                    logging.warning(
+                        "Limit %s: в ответе размещения и readback нет orderId/orderLinkId — "
+                        "сверка исполнения недоступна, lifecycle останется PENDING", sym,
+                    )
+                if verify:
+                    entry_event.update(journal_fields(verify))
+                # write_outcome обязателен: по одному VERIFIED нельзя отличить
+                # обычное подтверждение от восстановления сверкой.
+                entry_event["write_outcome"] = wo
+                journal_ok = await asyncio.to_thread(append_event, entry_event)
+                if not journal_ok:
+                    logging.error(
+                        "Limit %s принят Bybit (ордер %s), но ENTRY_PLACED не записан — "
+                        "lifecycle tracking для этого ордера отсутствует",
+                        sym,
+                        entry_event.get("order_id")
+                        or entry_event.get("order_link_id")
+                        or "идентификатор недоступен",
+                    )
+                # Случай A: обычная карточка.
+                # Случай B: карточка с явным указанием, что результат восстановлен
+                # authoritative-чтением после потери write response.
+                if place_success:
+                    msg = format_limit_signal(
+                        sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
+                        risk_usd=current_risk,
+                        sl_mode=sl_mode, sl_percent_text=sl_percent_text,
+                        sl_status=verify["status"] if verify else None,
+                        sl_actual=fmt_level(verify["actual"]) if verify else None,
+                    )
+                else:
+                    # Readback нашёл ордер после ambiguous placement: результат
+                    # восстановлен сверкой.
+                    recovery_prefix = (
+                        "⚠️ Ответ Bybit на размещение не получен. Ордер и его "
+                        "защита восстановлены сверкой чтением.\n\n"
+                    )
+                    msg = recovery_prefix + format_limit_signal(
+                        sym, side, lev, entry_price, stop_val, qty, pos_value_usd, source_tag,
+                        risk_usd=current_risk,
+                        sl_mode=sl_mode, sl_percent_text=sl_percent_text,
+                        sl_status=verify["status"], sl_actual=fmt_level(verify["actual"]),
+                    )
+                await msg_obj.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
+            elif write_rejected:
+                # Случай B (explicit rejection): доказанный business-код отказа —
+                # запись НЕ принята биржей. Риск+источник не пишем, ENTRY_PLACED
+                # не пишем, readback не нужен (отказ окончателен).
+                await msg_obj.reply_text(
+                    format_order_rejected(
+                        sym, side,
+                        place_error or "неизвестная ошибка бизнес-логики",
+                    ),
+                    parse_mode='HTML',
+                )
+            else:
+                # Случай C: исход размещения неоднозначен (таймаут, обрыв,
+                # неразборный ответ, внутренняя ошибка SDK без структурного кода),
+                # и bounded readback НЕ смог доказать exact order. Статус UNVERIFIED.
+                # Риск+источник не пишем, ENTRY_PLACED не пишем — lifecycle не
+                # создаём. Создаём lifecycle-neutral durable evidence event
+                # (PROTECTION_WRITE), чтобы расследование потерянного placement
+                # имело постоянный след, а не только rotating log.
+                evidence_event = {
+                    "event": PROTECTION_WRITE,
+                    "symbol": sym,
+                    "side": side,
+                    "source_tag": source_tag,
+                    "order_type": "limit",
+                    "qty": qty,
+                    "entry": entry_price,
+                    "stop": stop_val,
+                }
+                if order_ids.get("order_link_id"):
+                    evidence_event["order_link_id"] = order_ids["order_link_id"]
+                if verify:
+                    evidence_event.update(journal_fields(verify))
+                    evidence_event["write_outcome"] = write_outcome_for(
+                        verify["status"], write_acknowledged=False, write_rejected=False
+                    )
+                else:
+                    evidence_event["write_outcome"] = WRITE_AMBIGUOUS_UNVERIFIED
+                await asyncio.to_thread(append_event, evidence_event)
+                # Truthful UX: не утверждаем "ордер не найден" как факт. UNVERIFIED
+                # означает "не смог подтвердить", не "доказанно отсутствует". Ордер
+                # мог существовать с неправильной защитой или под другим identifier.
+                await msg_obj.reply_text(
+                    format_warning_message(
+                        [
+                            "Исход размещения лимитного ордера не подтверждён.",
+                            "Ордер мог быть принят биржей.",
+                            "Сверка чтением не смогла однозначно выделить ордер "
+                            "и его защиту.",
+                            f"Детали: {place_error or 'ответ Bybit не получен'}",
+                        ],
+                        context=f"{sym} · {side} · Limit",
+                        action=(
+                            "вручную проверьте список открытых ордеров и SL на Bybit; "
+                            "не отправляйте сигнал повторно до проверки"
+                        ),
+                    ),
+                    parse_mode='HTML',
+                )
 
     except Exception as e:
         logging.error(f"Trade Error: {e}")

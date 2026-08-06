@@ -156,6 +156,7 @@ class TestMarketFallbackSafety:
             _WALLET_OK,      # get_wallet_balance
             _INSTRUMENTS_OK, # get_instruments_info → qty_step/min set
             {},              # set_leverage → OK (после fallback-валидации qty)
+            _PRE_SNAPSHOT,   # предвходовый снимок позиций
             _PLACE_OK,       # place_market_with_retry
         ]
 
@@ -225,8 +226,17 @@ class TestMarketFallbackSafety:
         assert "❌" in msg
 
 
-# Readback позиции после размещения: одна успешная строка прерывает опрос.
-_POS_READBACK = {"result": {"list": [{"size": "0.01", "avgPrice": "50000"}]}}
+# Предвходовый снимок позиций: пустой, чтобы найденная после записи позиция
+# однозначно принадлежала этой записи. retCode обязателен — строки читаются
+# только из доказанно успешного ответа.
+_PRE_SNAPSHOT = {"retCode": 0, "result": {"list": []}}
+
+# Readback позиции после размещения: одна доказанная строка прерывает опрос.
+_POS_READBACK = {"retCode": 0, "result": {"list": [{
+    "symbol": "BTCUSDT", "side": "Buy", "positionIdx": "0",
+    "size": "0.01", "avgPrice": "50000",
+    "stopLoss": "40000", "takeProfit": "",
+}]}}
 
 
 class TestMarketEntryCarriesOrderIdentifier:
@@ -246,8 +256,9 @@ class TestMarketEntryCarriesOrderIdentifier:
             _WALLET_OK,
             _INSTRUMENTS_OK,
             {},               # set_leverage (после fallback-валидации qty)
+            _PRE_SNAPSHOT,    # предвходовый снимок позиций
             place_result,     # place_market_with_retry
-            _POS_READBACK,    # readback avgPrice
+            _POS_READBACK,    # readback avgPrice + SL
         ]
         calls = []
         seq = _seq_bybit(responses)
