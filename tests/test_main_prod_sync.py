@@ -257,6 +257,7 @@ def runtime():
             "time_management_job",
             "reconcile_journal_job",
             "weekly_source_report_job",
+            "register_protection_watchdog",
         )
     }
     jobs["_next_monday_9utc_secs"] = lambda: 1234

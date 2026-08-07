@@ -92,3 +92,16 @@ DISABLED_SOURCES_FILE = DATA_DIR / "disabled_sources.json"
 REQUIRE_MARKET_CONFIRM = int(os.getenv('REQUIRE_MARKET_CONFIRM', 0))
 # MARKET_PREVIEW_TTL_SEC: секунды, в течение которых кнопка подтверждения действительна.
 MARKET_PREVIEW_TTL_SEC = int(os.getenv('MARKET_PREVIEW_TTL_SEC', 300))
+
+# --- WATCHDOG ЗАЩИТЫ ОТКРЫТЫХ ПОЗИЦИЙ ---
+# WATCHDOG_ENABLED: периодическая alert-only проверка Stop Loss по открытым позициям.
+#   Включён по умолчанию; выключается только явным значением 0/false/no/off,
+#   чтобы опечатка не сняла наблюдение за защитой молча.
+WATCHDOG_ENABLED = os.getenv('WATCHDOG_ENABLED', '1').strip().lower() not in (
+    '0', 'false', 'no', 'off',
+)
+# WATCHDOG_INTERVAL_SEC: период запуска проверки (секунды).
+WATCHDOG_INTERVAL_SEC = max(1, int(os.getenv('WATCHDOG_INTERVAL_SEC', 300)))
+# WATCHDOG_COOLDOWN_SEC: кулдаун повторного алерта по одной и той же позиции
+#   (symbol, side, positionIdx). 0 = алерт на каждом цикле.
+WATCHDOG_COOLDOWN_SEC = max(0, int(os.getenv('WATCHDOG_COOLDOWN_SEC', 1800)))

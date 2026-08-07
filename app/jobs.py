@@ -3,8 +3,9 @@
 
 Включает: пульс (heartbeat), авто-трейлинг стопа (breakeven),
 очистку устаревших ордеров, утренний отчёт о балансе,
-управление по времени (5/7 дней), сверку журнала сделок
-и еженедельный отчёт по источникам сигналов.
+управление по времени (5/7 дней), сверку журнала сделок,
+еженедельный отчёт по источникам сигналов и alert-only watchdog
+защиты открытых позиций.
 """
 import asyncio
 import time
@@ -15,7 +16,13 @@ from decimal import Decimal, InvalidOperation
 from telegram.ext import ContextTypes
 
 
-from core.config import ALLOWED_ID, ORDER_TIMEOUT_DAYS
+from core.config import (
+    ALLOWED_ID,
+    ORDER_TIMEOUT_DAYS,
+    WATCHDOG_COOLDOWN_SEC,
+    WATCHDOG_ENABLED,
+    WATCHDOG_INTERVAL_SEC,
+)
 from core.database import is_trading_enabled, get_risk_for_symbol, get_source_at_time
 from core.trading_core import session
 from core.bybit_call import bybit_call
@@ -926,3 +933,361 @@ async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
         # Перепланируем на следующий понедельник 09:00 UTC
         delay = _next_monday_9utc_secs()
         context.job_queue.run_once(weekly_source_report_job, delay)
+
+
+# --- 9. Watchdog защиты открытых позиций (только наблюдение) ---
+
+# Состояния поля stopLoss в строке позиции.
+SL_MISSING = "MISSING"      # ключа нет, None, пустая строка или доказанный ноль
+SL_PRESENT = "PRESENT"      # доказанный конечный положительный уровень
+SL_UNPROVEN = "UNPROVEN"    # bool, NaN, Infinity, отрицательное, нечисловое
+
+_WATCHDOG_SIDES = {"BUY": "Buy", "SELL": "Sell"}
+
+# identity (symbol, side, positionIdx) → время последнего ДОСТАВЛЕННОГО алерта.
+# Отметка ставится только после успешной отправки в Telegram, поэтому сбой
+# доставки не подавляет следующую попытку на полный кулдаун.
+_watchdog_alerted: dict[tuple[str, str, int], float] = {}
+# Время последнего доставленного fail-closed сообщения о недостоверной проверке.
+_watchdog_unknown_alerted: dict[str, float] = {}
+
+_WATCHDOG_UNKNOWN_KEY = "watchdog_protection_unknown"
+
+
+def _watchdog_side(raw) -> str:
+    """Доказанная сторона позиции: только Buy или Sell, иначе ""."""
+    if not isinstance(raw, str):
+        return ""
+    return _WATCHDOG_SIDES.get(raw.strip().upper(), "")
+
+
+def _watchdog_position_idx(raw) -> int | None:
+    """Доказанный positionIdx: неотрицательный int или строка целого числа.
+
+    bool, float, отрицательное и нечисловое значение доказательством не
+    считаются: угадывать positionIdx нельзя, идентичность позиции должна быть
+    точной.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    if isinstance(raw, str) and raw.strip().isdigit():
+        return int(raw.strip())
+    return None
+
+
+def _watchdog_decimal(raw) -> Decimal | None:
+    """Возвращает конечный Decimal или None, если значение не доказано."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        source = text
+    elif isinstance(raw, (int, float, Decimal)):
+        source = raw
+    else:
+        return None
+    try:
+        value = Decimal(source)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return value if value.is_finite() else None
+
+
+def _watchdog_stop_loss_state(row: dict) -> str:
+    """Классифицирует поле stopLoss строки позиции.
+
+    MISSING — ключ отсутствует, значение None, пустая строка или доказанный
+    ноль: защиты нет.
+    PRESENT — доказанный конечный положительный уровень.
+    UNPROVEN — bool, NaN, Infinity, отрицательное или нечисловое значение:
+    состояние защиты недостоверно и НЕ превращается в missing-SL.
+    """
+    if "stopLoss" not in row:
+        return SL_MISSING
+    raw = row["stopLoss"]
+    if raw is None:
+        return SL_MISSING
+    if isinstance(raw, str) and not raw.strip():
+        return SL_MISSING
+    value = _watchdog_decimal(raw)
+    if value is None:
+        return SL_UNPROVEN
+    if value == 0:
+        return SL_MISSING
+    return SL_PRESENT if value > 0 else SL_UNPROVEN
+
+
+def _watchdog_entry_price(row: dict) -> str:
+    """Доказанная цена входа или безопасное UNKNOWN."""
+    value = _watchdog_decimal(row.get("avgPrice"))
+    if value is None or value <= 0:
+        return "UNKNOWN"
+    return format(value.normalize(), "f")
+
+
+def classify_protection_snapshot(resp) -> tuple[list, list]:
+    """Разбирает снимок get_positions на доказанные позиции и недостоверные строки.
+
+    Конверт проверяется тем же строгим контрактом, что и сверка журнала
+    (_require_result_rows): недопустимый retCode, отсутствующий result или
+    list → _SnapshotUnknown, весь прогон недостоверен.
+
+    Возвращает (positions, unproven):
+      positions — по одной записи на доказанную активную позицию
+                  (symbol, side, position_idx, size, entry, sl_state);
+      unproven  — операторские описания строк, которые доказать не удалось.
+
+    size == 0 означает отсутствие позиции: такая строка не попадает ни в один
+    список и не может создать missing-SL алерт. Недоказанная строка никогда не
+    превращается в missing-SL по конкретной позиции и не делает остальные
+    доказанные строки недостоверными.
+    """
+    rows = _require_result_rows(resp, "get_positions")
+
+    positions: list = []
+    unproven: list = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            unproven.append(f"строка #{index}: не dict ({type(row).__name__})")
+            continue
+
+        try:
+            size = _parse_decimal_qty(row.get("size"), f"строка #{index} size")
+        except _SnapshotUnknown as bad_size:
+            unproven.append(str(bad_size))
+            continue
+        if size == 0:
+            continue
+
+        symbol = normalize_symbol(row.get("symbol"))
+        if not symbol:
+            unproven.append(f"строка #{index}: символ не доказан")
+            continue
+        side = _watchdog_side(row.get("side"))
+        if not side:
+            unproven.append(f"{symbol}: сторона позиции не доказана")
+            continue
+        position_idx = _watchdog_position_idx(row.get("positionIdx"))
+        if position_idx is None:
+            unproven.append(f"{symbol} {side}: positionIdx не доказан")
+            continue
+
+        positions.append({
+            "symbol": symbol,
+            "side": side,
+            "position_idx": position_idx,
+            "size": format(size.normalize(), "f"),
+            "entry": _watchdog_entry_price(row),
+            "sl_state": _watchdog_stop_loss_state(row),
+        })
+
+    return positions, unproven
+
+
+def _format_watchdog_missing_sl(positions: list, stamp: str) -> str:
+    """Строит критическую карточку о позициях без доказанного Stop Loss."""
+    blocks = []
+    for pos in positions:
+        direction = "Long" if pos["side"] == "Buy" else "Short"
+        blocks.append(
+            f"🛡 <b>{h(pos['symbol'])}</b> · {direction}\n"
+            + format_value_block([
+                ("Сторона", pos["side"]),
+                ("positionIdx", pos["position_idx"]),
+                ("Размер", pos["size"]),
+                ("Вход", pos["entry"]),
+            ])
+        )
+
+    warnings = format_warning_list([
+        "Stop Loss отсутствует или равен нулю.",
+        "Позиция открыта без защиты.",
+        "Автоматическое восстановление не выполняется.",
+    ])
+    return (
+        f"{format_header('⛔', 'PROTECTION MISSING')}\n"
+        f"Проверка защиты · {h(stamp)}\n\n"
+        + "\n\n".join(blocks)
+        + f"\n\n{warnings}\n\n"
+        + format_action("проверьте и восстановите Stop Loss вручную")
+    )
+
+
+async def _watchdog_report_missing_sl(
+    context: ContextTypes.DEFAULT_TYPE, positions: list
+) -> None:
+    """Отправляет критический алерт и помечает дедупликацию только по факту доставки.
+
+    Неуспешная доставка не считается отправленным алертом: отметка не ставится,
+    и следующий цикл watchdog повторит попытку сразу, не выжидая кулдаун.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    identities = [
+        (pos["symbol"], pos["side"], pos["position_idx"]) for pos in positions
+    ]
+    logging.error(
+        "Watchdog: защита отсутствует у позиций: %s",
+        ", ".join(f"{s}/{side}/idx={idx}" for s, side, idx in identities),
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=ALLOWED_ID,
+            text=_format_watchdog_missing_sl(positions, stamp),
+            parse_mode='HTML',
+        )
+    except Exception as notify_err:
+        logging.error(
+            "Watchdog: критический алерт не доставлен, повтор на следующем цикле: %s",
+            notify_err,
+        )
+        return
+
+    sent_at = time.time()
+    for identity in identities:
+        _watchdog_alerted[identity] = sent_at
+
+
+async def _watchdog_report_unknown(
+    context: ContextTypes.DEFAULT_TYPE, reasons: list
+) -> None:
+    """Сообщает оператору, что проверка защиты недостоверна (fail-closed).
+
+    Недоказанный снимок не является доказательством наличия защиты и не
+    выдаётся за успешную проверку. Никаких записей на бирже отсюда не следует.
+    """
+    now = time.time()
+    last_sent = _watchdog_unknown_alerted.get(_WATCHDOG_UNKNOWN_KEY)
+    if last_sent is not None and (now - last_sent) < WATCHDOG_COOLDOWN_SEC:
+        return
+
+    detail = "; ".join(reasons[:3])
+    if len(reasons) > 3:
+        detail += f"; ещё {len(reasons) - 3}"
+    logging.warning("Watchdog: проверка защиты недостоверна: %s", detail)
+
+    # cooldown_sec=0: кулдауном управляет сам watchdog по факту доставки,
+    # поэтому неудачная отправка не подавляет следующую попытку.
+    delivered = await send_alert(
+        context.bot, ALLOWED_ID, "WARNING", FAIL_CLOSED,
+        f"Проверка защиты позиций недостоверна ({len(reasons)}): {detail}. "
+        f"Проверьте Stop Loss вручную.",
+        dedup_key=_WATCHDOG_UNKNOWN_KEY,
+        cooldown_sec=0,
+    )
+    if delivered:
+        _watchdog_unknown_alerted[_WATCHDOG_UNKNOWN_KEY] = time.time()
+
+
+async def protection_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
+    """Периодическая alert-only проверка Stop Loss у всех открытых позиций.
+
+    Работает независимо от is_trading_enabled(): остановка торговли снимает
+    вход в новые сделки, но не наблюдение за защитой уже открытых позиций.
+
+    Один authoritative read get_positions(category="linear", settleCoin="USDT")
+    покрывает весь прогон. Watchdog только наблюдает: отсюда не вызываются
+    set_trading_stop, amend, cancel и place_order, не меняется lifecycle и не
+    пишется торговый журнал. Автоматическое восстановление SL не выполняется —
+    оператор действует вручную.
+
+    Доказанная активная позиция (size > 0 плюс доказанные symbol, side и
+    positionIdx) без доказанного ненулевого stopLoss даёт критический алерт с
+    точной идентичностью позиции. Дедупликация — по (symbol, side, positionIdx)
+    с кулдауном WATCHDOG_COOLDOWN_SEC; доказанное восстановление защиты
+    сбрасывает дедупликацию, поэтому новая потеря SL алертит немедленно.
+
+    Недоказанная строка снимка не считается защищённой и не превращается в
+    ложный missing-SL: о ней отдельно сообщается как о недостоверной проверке.
+    """
+    try:
+        try:
+            _pos_resp = await bybit_call(
+                session.get_positions, category="linear", settleCoin="USDT"
+            )
+            positions, unproven = classify_protection_snapshot(_pos_resp)
+        except _SnapshotUnknown as unknown:
+            # UNKNOWN != protected: снимок целиком недостоверен.
+            await _watchdog_report_unknown(context, [str(unknown)])
+            return
+
+        now = time.time()
+        unprotected: list = []
+        for pos in positions:
+            identity = (pos["symbol"], pos["side"], pos["position_idx"])
+            state = pos["sl_state"]
+
+            if state == SL_PRESENT:
+                # Доказанное восстановление защиты снимает дедупликацию.
+                _watchdog_alerted.pop(identity, None)
+                continue
+            if state == SL_UNPROVEN:
+                # Недостоверный уровень не доказывает ни защиту, ни её отсутствие:
+                # дедупликация не сбрасывается и missing-SL не объявляется.
+                unproven.append(
+                    f"{pos['symbol']} {pos['side']} idx={pos['position_idx']}: "
+                    f"значение stopLoss недостоверно"
+                )
+                continue
+
+            last_sent = _watchdog_alerted.get(identity)
+            if last_sent is not None and (now - last_sent) < WATCHDOG_COOLDOWN_SEC:
+                continue
+            unprotected.append(pos)
+
+        if unproven:
+            await _watchdog_report_unknown(context, unproven)
+        else:
+            # Снимок доказан полностью: отсутствующая идентичность означает
+            # закрытую позицию, её состояние дедупликации больше не нужно.
+            active = {
+                (pos["symbol"], pos["side"], pos["position_idx"]) for pos in positions
+            }
+            for identity in [k for k in _watchdog_alerted if k not in active]:
+                _watchdog_alerted.pop(identity, None)
+
+        if unprotected:
+            await _watchdog_report_missing_sl(context, unprotected)
+
+    except Exception as e:
+        logging.error("Protection watchdog job error: %s", e)
+        try:
+            if classify_error(e) != TIMEOUT:  # bybit_call уже отправил алерт для таймаутов
+                await send_alert(
+                    context.bot, ALLOWED_ID, "WARNING", WARNING,
+                    f"Protection watchdog job error: {str(e)[:100]}",
+                    dedup_key="job_watchdog_error",
+                )
+        except Exception:
+            pass
+
+
+# Первый прогон отложен, чтобы не совпасть со стартовой сверкой и не читать
+# биржу раньше, чем поднимется остальная часть планировщика.
+WATCHDOG_FIRST_RUN_SEC = 90
+
+
+def register_protection_watchdog(job_queue) -> bool:
+    """Регистрирует watchdog защиты только при включённом WATCHDOG_ENABLED.
+
+    При выключенном флаге задача не создаётся вовсе: отключённый watchdog не
+    читает биржу и не шлёт алертов. Возвращает True, если задача поставлена.
+    """
+    if not WATCHDOG_ENABLED:
+        logging.info("Protection watchdog отключён (WATCHDOG_ENABLED=0)")
+        return False
+
+    job_queue.run_repeating(
+        protection_watchdog_job,
+        interval=WATCHDOG_INTERVAL_SEC,
+        first=WATCHDOG_FIRST_RUN_SEC,
+    )
+    logging.info(
+        "Protection watchdog включён: интервал %s с, кулдаун %s с",
+        WATCHDOG_INTERVAL_SEC, WATCHDOG_COOLDOWN_SEC,
+    )
+    return True

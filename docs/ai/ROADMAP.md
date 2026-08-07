@@ -11,7 +11,7 @@ This roadmap prioritizes future work; it is not authorization to combine items i
 5. Percentage-based SL in a signal — done at commit `fa78f93`.
 6. Verification of actual state after Bybit writes — active.
 7. Production incident: missing Stop Loss orders — active, safety-critical, READY FOR QA.
-8. Protection watchdog for open positions — not started.
+8. Protection watchdog for open positions — active, READY FOR QA.
 9. Durable trade audit trail — not started.
 10. Telegram transport observability — not started.
 
@@ -121,7 +121,7 @@ correlation are confirmed; the production journal lacks a full callback audit tr
 
 **Status:** READY FOR QA.
 
-### HIGH-8 — Protection watchdog for open positions (not started)
+### HIGH-8 — Protection watchdog for open positions (active, READY FOR QA)
 
 **Goal:** periodic alert-only check of open positions; critical notification on
 missing/zero SL; dedupe/cooldown; no automatic repair.
@@ -135,13 +135,54 @@ cooldown (e.g., 30 minutes) to prevent spam. Watchdog does not attempt to set or
 restore SL — operator must investigate and act manually. Watchdog does not touch
 lifecycle or journal; it is observability only.
 
-Deliverables: periodic job (e.g., every 5 minutes); alert dedup/cooldown;
-Telegram critical message; configuration flags (`WATCHDOG_ENABLED`,
-`WATCHDOG_INTERVAL_SEC`, `WATCHDOG_COOLDOWN_SEC`); focused tests proving: job
-runs; missing SL triggers alert; zero SL triggers alert; dedup works; cooldown
-honored; no write attempted.
+**Solution implemented (READY FOR QA):**
 
-**Not authorized for current HIGH-7 pass.**
+- Periodic job `protection_watchdog_job` performs one authoritative read per run
+  (`get_positions(category="linear", settleCoin="USDT")` via `bybit_call`) and
+  classifies every row of that single snapshot. It runs independently of
+  `is_trading_enabled()`: `/stop` does not disable protection monitoring.
+- Fail-closed classification. A position is considered only when `symbol`,
+  `side`, `positionIdx`, and `size` are all proven; `size == 0` is a closed
+  position and is skipped before identity is required, so flat one-way rows do
+  not pollute the result. `stopLoss` state is `MISSING` (absent key, `None`,
+  empty/blank string, proven zero), `PRESENT` (proven finite positive level), or
+  `UNPROVEN` (bool, `NaN`, `Infinity`, negative, non-numeric).
+- Unknown is never safe and never a false alarm. An unproven row is reported
+  separately as "protection check unreliable" and never becomes a missing-SL
+  alert for that position; an unproven envelope (`retCode`, `result`, `list`)
+  aborts the whole run into the same fail-closed report. Neither path performs
+  any exchange write.
+- Missing-SL alert is a critical Telegram card with `symbol`, `side` (and
+  Long/Short), `positionIdx`, `size`, entry price when `avgPrice` is proven and
+  `UNKNOWN` otherwise, a UTC timestamp, and an explicit requirement to check and
+  restore the Stop Loss manually. It states that no automatic restoration is
+  performed.
+- Dedupe by `(symbol, side, positionIdx)` with `WATCHDOG_COOLDOWN_SEC`. The
+  cooldown stamp is written only after Telegram delivery actually succeeded, so
+  a failed send is not counted as a delivered alert and the next run retries
+  immediately. Proven SL restoration pops the identity, so a subsequent new SL
+  loss alerts at once; an `UNPROVEN` level never resets dedupe. Identities absent
+  from a fully proven snapshot are pruned as closed; nothing is pruned while any
+  row is unproven.
+- No write path: no `set_trading_stop`, `amend`, `cancel`, `place_order`, no
+  repair, no lifecycle change, no journal event. Observability only.
+- Configuration `WATCHDOG_ENABLED` (default on; only an explicit
+  `0/false/no/off` disables it), `WATCHDOG_INTERVAL_SEC` (default 300),
+  `WATCHDOG_COOLDOWN_SEC` (default 1800). The job is registered by
+  `register_protection_watchdog()` only when `WATCHDOG_ENABLED` is on; a
+  disabled watchdog creates no job and therefore never reads the exchange.
+
+**Affected code:**
+
+- `app/jobs.py` — watchdog section: `classify_protection_snapshot`, stop-loss and
+  identity classification helpers, `protection_watchdog_job`,
+  `register_protection_watchdog`.
+- `core/config.py` — `WATCHDOG_ENABLED`, `WATCHDOG_INTERVAL_SEC`,
+  `WATCHDOG_COOLDOWN_SEC`.
+- `main.py` — job 9 registration via `register_protection_watchdog(jq)`.
+- `tests/test_high8_protection_watchdog.py` — 10 focused tests (38 cases).
+
+**Status:** READY FOR QA.
 
 ### HIGH-9 — Durable trade audit trail (not started)
 

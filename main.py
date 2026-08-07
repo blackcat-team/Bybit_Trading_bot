@@ -26,6 +26,7 @@ from app.jobs import (
     daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job,
     heartbeat_job, time_management_job,
     reconcile_journal_job, weekly_source_report_job,
+    register_protection_watchdog,
     _next_monday_9utc_secs,
 )
 from core.notifier import configure_alerts
@@ -244,6 +245,10 @@ if __name__ == '__main__':
     # 8. Еженедельный отчёт по источникам (каждый понедельник 09:00 UTC)
     #    run_once + самоперепланирование внутри задачи — без PTBUserWarning.
     jq.run_once(weekly_source_report_job, _next_monday_9utc_secs())
+
+    # 9. Watchdog защиты открытых позиций (только наблюдение, без записей)
+    #    Регистрируется лишь при WATCHDOG_ENABLED; период — WATCHDOG_INTERVAL_SEC.
+    register_protection_watchdog(jq)
 
     print("✅ Background jobs started...")
 
