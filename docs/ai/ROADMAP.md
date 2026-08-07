@@ -10,7 +10,10 @@ This roadmap prioritizes future work; it is not authorization to combine items i
 4. SL/TP changes from `/pos` — done at commit `cb179a4`.
 5. Percentage-based SL in a signal — done at commit `fa78f93`.
 6. Verification of actual state after Bybit writes — active.
-7. Production incident: missing Stop Loss orders — urgent, safety-critical, not started.
+7. Production incident: missing Stop Loss orders — active, safety-critical, READY FOR QA.
+8. Protection watchdog for open positions — not started.
+9. Durable trade audit trail — not started.
+10. Telegram transport observability — not started.
 
 ### HIGH-6 — Authoritative readback after Bybit writes (active)
 
@@ -24,42 +27,171 @@ API acknowledgement is not `VERIFIED`. Unknown is never presented as success, an
 a readback failure never becomes `MISMATCH`. The readback is read-only and
 bounded; it never repairs, re-sends, or retries the write.
 
-### HIGH-7 — Production incident: missing Stop Loss orders (urgent, safety-critical)
+### HIGH-7 — Production incident: missing Stop Loss orders (active, safety-critical)
 
-Incident: positions were observed in production without the Stop Loss that the
-bot had reported as set. Live funds stay exposed for as long as the cause is
-unknown.
+**Root cause confirmed with high confidence:** the Telegram button "⛔ Отменить все"
+called `cancel_all_orders(category="linear", settleCoin="USDT")` without
+`orderFilter`, which cancels not only ordinary limit orders but also conditional
+and protective TP/SL orders. The user confirmed they probably pressed this button
+before their Stop Loss disappeared. The destructive code path and temporal
+correlation are confirmed; the production journal lacks a full callback audit trail.
 
-Goal: prove the root cause from production evidence before any code is changed.
+**Solution implemented (READY FOR QA):**
 
-Evidence chain to collect (Human Operator, production side):
+- Global `cancel_all_orders` completely removed from the Telegram flow. All
+  cancellations performed individually via exact `orderId` and `symbol`.
+- Fail-closed order classification: only proven ordinary `Limit` non-reduce-only
+  entries may be cancelled. TP, SL, conditional, trailing, and ambiguous orders
+  are skipped. Missing/malformed fields → skip, not cancel. Invalid `retCode` →
+  no cancellation at all. The protective discriminators `stopOrderType`,
+  `orderFilter`, `createType`, and `orderStatus` must be *present* and proven:
+  an absent key is not evidence of safety and is never coerced to an empty
+  string. String `"false"`/`"False"`/`"0"` are not proven booleans.
+- Button renamed: "⛔ Отменить лимитные входы".
+- Preview → explicit confirmation → execution contract preserved. Preview shows:
+  count of ordinary limit entries; symbols; side; price; qty; `orderId` shortened;
+  count of skipped protective/ambiguous orders. Confirmation snapshot: bound to
+  Telegram user; one-time; TTL 120s; canonical unit is the exact
+  `(symbol, orderId)` pair; consumed only when the operation actually starts, so
+  a foreign or expired callback cannot destroy a still-valid owner confirmation;
+  repeat callback does not repeat cancellation.
+- On confirmation: new authoritative read, cancel only the intersection of
+  preview exact pairs ∩ current exact pairs ∩ re-proven ordinary Limit entries.
+  Matching by `orderId` alone is forbidden: the same `orderId` on another symbol
+  is never cancelled. New order after preview not cancelled. Order whose
+  classification changed or became ambiguous skipped.
+- Individual cancellation: one `orderId` → at most one `cancel_order` with exact
+  `category`, `symbol`, `orderId`. No bulk. Transport/timeout → no automatic retry.
+  Outcome classification is strict: `CANCELLED` only when `retCode` is `int` 0;
+  `REJECTED` only on a proven structural business code (HIGH-6 contract, not
+  weakened); everything else — missing `retCode`, `"0"`, `0.0`, `False`, `True`,
+  malformed payload, unknown code, timeout — is `UNVERIFIED`.
+  Results: `CANCELLED`, `REJECTED`, `UNVERIFIED`, `SKIPPED_CHANGED`,
+  `SKIPPED_PROTECTED`. One order's error does not abort batch.
+- Protection snapshot before and after: all open positions for operation's symbols
+  (`symbol`, `side`, `positionIdx`, `size`, `stopLoss`, `takeProfit`,
+  `trailingStop`). A snapshot is proven only when every potentially relevant row
+  is fully proven; an unproven row raises `ambiguous` instead of being silently
+  skipped, so `VERIFIED` cannot be derived from an incomplete snapshot.
+  After cancellation: bounded readback (`READBACK_ATTEMPTS = 3`).
+  Check: existing SL did not disappear, existing TP did not disappear, trailing
+  protection did not disappear, position identity not ambiguous. Comparison is
+  gated on identical identity (`symbol`, `side`, `positionIdx`) *and* unchanged
+  `size`; a changed size or a disappeared position is `UNVERIFIED`, never
+  `CRITICAL_MISMATCH`. HIGH-7 does not automatically restore protection.
+  Unavailable post-readback → `UNVERIFIED` + critical warning + manual check
+  required. Proven protection loss → status `CRITICAL_MISMATCH` + immediate
+  critical Telegram warning + forbidden claim of successful safe operation +
+  no repair write.
+- Durable journal: additive lifecycle-neutral `ORDER_CANCEL_BATCH` event (not in
+  `TERMINAL_EVENTS`). Contains: actor Telegram user id; callback/request id
+  (sanitized); operation; outcome; previewed pairs; confirmed pairs; attempted
+  pairs; cancelled pairs; rejected pairs; unverified pairs; skipped protected
+  pairs; skipped changed pairs; symbols; counts; protection snapshot before;
+  protection snapshot after; protection verification status; attempts;
+  authoritative source; reason; timestamp. Does not log: API key; secret; wallet
+  response; full Telegram update; full Bybit payload. Every consumed confirmation
+  token leaves exactly one such event — including an unproven authoritative read,
+  an empty cancel list after re-check, and an exception. The `append_event`
+  return value is checked: an unconfirmed durable write degrades the outcome to a
+  critical observability failure, the operator is told the audit trail is missing
+  and must check manually, and neither the journal write nor the batch is
+  retried automatically.
+- Telegram UX: preview «Найдены обычные лимитные входы: N»; «Защитные и
+  неоднозначные ордера пропущены: M»; separate confirmation; separate cancel.
+  After execution: cancelled; rejected by Bybit; outcome unknown; skipped as
+  protective; skipped due to change; SL/TP preservation check. Forbidden false
+  claims: «Все ордера отменены» without full proof; «SL сохранены» when
+  post-readback unavailable; «Ордер не существовал» on ambiguous outcome. On
+  `UNVERIFIED` mandatory statement: state may have changed; check orders and SL/TP
+  manually; do not repeat bulk operation before checking.
 
-- the operator-visible bot message for each affected entry, with its timestamp;
-- the bot log records for the same entries, including the write request and the
-  post-write verification record;
-- the trade journal entries for the same symbols and order identifiers;
-- the actual Bybit state for those positions and orders (order history,
-  conditional/stop orders, position `stopLoss`), read at a known time;
-- the account mode and `positionIdx` in force for the affected symbols.
+**Affected code:**
 
-Cause classes, all unproven until the evidence decides:
+- `handlers/cancel_orders.py` — NEW, ~600 lines, complete safe bulk cancellation
+  flow with fail-closed classification, preview/confirm/one-time-token, individual
+  writes, protection snapshots, durable journal.
+- `handlers/buttons.py` — routing: both `cancel_all_orders` and `cancel_limit_entries`
+  callbacks lead to safe `preview_cancel_orders`; old buttons already sent do not
+  execute destructive bulk cancel.
+- `handlers/views_orders.py` — button renamed to "⛔ Отменить лимитные входы".
+- `core/journal.py` — `ORDER_CANCEL_BATCH` event added; not in `TERMINAL_EVENTS`.
+- `tests/test_high7_safe_cancel.py` — 29 focused tests proving all 22 contract
+  points from §12.
 
-- the SL was never accepted by Bybit (request rejected or silently dropped);
-- the SL was accepted and later removed (external action, exchange-side action,
-  or an unrelated write that broke the TP/SL pair);
-- the SL was attached to a different position or `positionIdx` than the one the
-  operator saw;
-- the position was closed and reopened, so the SL belonged to a previous
-  position;
-- the bot reported success from the request payload instead of exchange truth.
+**Status:** READY FOR QA.
 
-Rule for this stage: do not write a code fix before a confirmed root cause. A
-plausible explanation is not a proven one, and a fix built on a hypothesis hides
-the real defect.
+### HIGH-8 — Protection watchdog for open positions (not started)
 
-Deliverables: a written root-cause statement with the evidence that proves it,
-the affected code path named exactly, and a proposed remediation scope for the
-Architect to authorise as its own unit of work.
+**Goal:** periodic alert-only check of open positions; critical notification on
+missing/zero SL; dedupe/cooldown; no automatic repair.
+
+Periodic job reads all open positions. For each position with `size > 0`: checks
+`stopLoss` field is present, non-empty, and non-zero; checks `positionIdx` is
+consistent; checks symbol is valid. Missing or zero SL → immediate critical
+Telegram alert with symbol, side, `positionIdx`, current size, entry price, and
+timestamp. Alert is deduped by `(symbol, side, positionIdx)` with configurable
+cooldown (e.g., 30 minutes) to prevent spam. Watchdog does not attempt to set or
+restore SL — operator must investigate and act manually. Watchdog does not touch
+lifecycle or journal; it is observability only.
+
+Deliverables: periodic job (e.g., every 5 minutes); alert dedup/cooldown;
+Telegram critical message; configuration flags (`WATCHDOG_ENABLED`,
+`WATCHDOG_INTERVAL_SEC`, `WATCHDOG_COOLDOWN_SEC`); focused tests proving: job
+runs; missing SL triggers alert; zero SL triggers alert; dedup works; cooldown
+honored; no write attempted.
+
+**Not authorized for current HIGH-7 pass.**
+
+### HIGH-9 — Durable trade audit trail (not started)
+
+**Goal:** recoverable trade timeline with `orderId`/`orderLinkId`/`positionIdx`;
+SL/TP changes; cancel events; position closures; outcomes.
+
+Extend journal schema to capture: exact order identifiers from placement response
+(HIGH-1 already records them in `ENTRY_PLACED`); SL/TP write attempts with before/
+after snapshots (HIGH-6 `PROTECTION_WRITE` is lifecycle-neutral, expand it or add
+`PROTECTION_CHANGE`); order cancellations (HIGH-7 `ORDER_CANCEL_BATCH` is durable
+proof, but individual cancel per lifecycle may need a separate event); position
+closures with close reason, close price, PnL, and authoritative proof. All events
+timestamped, linked by `symbol` + optional `order_id`/`order_link_id` +
+`positionIdx`. Recoverable: given a symbol and time window, operator can
+reconstruct full timeline: entry attempt → fill proof → SL/TP set → SL/TP changed
+→ order cancelled → position closed. Journal is append-only; old events are never
+edited. Rotation/archival policy if file grows large.
+
+Deliverables: extended journal event schemas; helper to read timeline for symbol;
+Telegram command (e.g., `/timeline BTCUSDT`) showing recent events; focused tests
+proving: events append; timeline reconstructs correctly; SL/TP changes recorded;
+cancel recorded; closure recorded; no event overwrites old ones.
+
+**Not authorized for current HIGH-7 pass.**
+
+### HIGH-10 — Telegram transport observability (not started)
+
+**Goal:** normalization of `httpx.ReadError` and Bad Gateway; rate-limited
+logging; counters/health status; alert only on real impact on command processing.
+
+PTB error handler currently sends every unhandled PTB error as `ERROR` level alert
+with 300s cooldown. Transport noise (`httpx.ReadError`, `httpcore.ConnectError`,
+HTTP 502/503/504 from Telegram gateway) triggers critical alerts even when the bot
+auto-retries and the command eventually succeeds. Operator sees alert spam;
+real errors (e.g., invalid `ALLOWED_ID`, broken handler logic) are buried.
+
+Solution: classify PTB errors into transport (WARNING, dedup `ptb_polling_neterr`,
+cooldown 1800s) vs logic (ERROR, dedup `ptb_unhandled`, cooldown 300s). Transport:
+`telegram.error.NetworkError`, `httpx.ReadError`, `httpcore.ConnectError`,
+`httpcore.ReadTimeout`, `httpx.PoolTimeout`. Logic: everything else. Add health
+counters: `polling_errors_last_hour`, `commands_processed_last_hour`,
+`commands_failed_last_hour`. Telegram command `/health` shows counters. Alert
+only when command processing is provably broken (e.g., 5 consecutive handler
+failures), not on transient transport retry.
+
+Deliverables: error classifier; dedup/cooldown for transport class; health
+counters; `/health` command; focused tests proving: transport → WARNING; logic →
+ERROR; dedup works; counters increment; `/health` renders.
+
+**Not authorized for current HIGH-7 pass.**
 
 ## Release policy
 

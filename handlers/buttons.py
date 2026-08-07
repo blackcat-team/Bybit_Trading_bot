@@ -49,6 +49,11 @@ from handlers.ui import (
     format_warning_message,
     h,
 )
+from handlers.cancel_orders import (
+    preview_cancel_orders,
+    confirm_cancel_orders,
+    cancel_cancel_batch,
+)
 
 
 # Хранилище меток времени превью: sym → эпоха нажатия "PREVIEW TRADE".
@@ -330,14 +335,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await view_orders(update, context)
 
-        elif data == "cancel_all_orders":
-            await bybit_call(session.cancel_all_orders, category="linear", settleCoin="USDT")
-            await query.edit_message_text(
-                f"{format_header('✅', 'ORDERS CANCELLED')}\n\n"
-                f"Все лимитные ордера отменены.\n\n"
-                f"{format_action('проверьте открытые ордера через /orders')}",
-                parse_mode='HTML',
-            )
+        elif data in ("cancel_limit_entries", "cancel_all_orders"):
+            # HIGH-7: глобальный cancel_all_orders удалён. Оба callback ведут в
+            # безопасный preview — уже отправленные старые кнопки не должны
+            # выполнять массовую отмену защитных ордеров.
+            await preview_cancel_orders(update, context)
+
+        elif data.startswith("confirm_cancel_batch|"):
+            await confirm_cancel_orders(update, context, data.split("|", 1)[1])
+
+        elif data == "cancel_cancel_batch":
+            await cancel_cancel_batch(update, context)
 
         elif data == "refresh_orders":
             await view_orders(update, context)

@@ -17,6 +17,10 @@
   FAIL              — попытка сделки заблокирована или провалилась
   PROTECTION_WRITE  — доказательство authoritative-проверки записи SL/TP из /pos.
                       Lifecycle не меняет и терминальным не является.
+  ORDER_CANCEL_BATCH — durable-доказательство операторской пакетной отмены обычных
+                      лимитных входов (preview → confirm → индивидуальные cancel по
+                      точному orderId) вместе со снимками защиты до и после.
+                      Lifecycle не меняет и терминальным не является.
 
 Lifecycle по символу (порядок строк в JSONL, не timestamp):
   ENTRY_PLACED → PENDING; POSITION_CONFIRMED → CONFIRMED;
@@ -54,6 +58,11 @@ FAIL               = "FAIL"
 # факт проверки: lifecycle оно не меняет и терминальным не является, поэтому
 # build_lifecycles его намеренно не обрабатывает.
 PROTECTION_WRITE   = "PROTECTION_WRITE"
+# Durable-аудит операторской пакетной отмены лимитных входов. Как и
+# PROTECTION_WRITE, событие только фиксирует доказательства операции:
+# позицию оно не открывает, не закрывает и в TERMINAL_EVENTS не входит,
+# поэтому get_position_lifecycles его намеренно не обрабатывает.
+ORDER_CANCEL_BATCH = "ORDER_CANCEL_BATCH"
 
 # Терминальные события: после любого из них символ больше не отслеживается,
 # пока не появится новое ENTRY_PLACED.

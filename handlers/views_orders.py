@@ -65,7 +65,9 @@ async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(btn_text, callback_data=cb_data)])
 
         keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data="refresh_orders")])
-        keyboard.append([InlineKeyboardButton("⛔ Отменить все", callback_data="cancel_all_orders")])
+        keyboard.append([InlineKeyboardButton(
+            "⛔ Отменить лимитные входы", callback_data="cancel_limit_entries"
+        )])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
 
