@@ -250,6 +250,8 @@ def runtime():
             "timeline_command",
             "health_command",
             "alert_command_degradation",
+            "info_command",
+            "price_command",
         )
     }
     jobs = {
@@ -571,6 +573,8 @@ def test_runtime_preserves_handlers_and_background_job_schedules(runtime):
         "status",
         "timeline",
         "health",
+        "info",
+        "price",
     ]
     assert sum(h.kind == "CallbackQueryHandler" for h in runtime.app.handlers) == 1
 

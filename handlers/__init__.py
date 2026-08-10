@@ -26,6 +26,10 @@ from .timeline import timeline_command
 
 from .health import health_command, alert_command_degradation
 
+from .info import info_command
+
+from .price import price_command
+
 from .preflight import (
     _safe_float, get_available_usd, floor_qty,
     validate_qty, clip_qty,

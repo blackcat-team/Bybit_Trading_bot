@@ -13,8 +13,8 @@ This roadmap prioritizes future work; it is not authorization to combine items i
 7. Production incident: missing Stop Loss orders — safety-critical, done at commit `b8b73e6`.
 8. Protection watchdog for open positions — done at commit `a3dae8f`.
 9. Durable trade audit trail — done at commit `bbd9aa2`.
-10. Telegram transport observability — active, READY FOR QA.
-11. Telegram utility commands — not started.
+10. Telegram transport observability — done at commit `b0a7951`.
+11. Telegram utility commands — active, READY FOR QA.
 
 ### HIGH-6 — Authoritative readback after Bybit writes (done at `77e2f41`)
 
@@ -269,7 +269,7 @@ journal; the existing lifecycle is not rewritten.
 
 **Status:** done at `bbd9aa2`.
 
-### HIGH-10 — Telegram transport observability (active, READY FOR QA)
+### HIGH-10 — Telegram transport observability (done)
 
 **Goal:** normalization of `httpx.ReadError` and Bad Gateway; rate-limited
 logging; counters/health status; alert only on real impact on command processing.
@@ -280,7 +280,7 @@ HTTP 502/503/504 from Telegram gateway) triggered critical alerts even when the 
 auto-retries and the command eventually succeeds. Operator saw alert spam;
 real errors (e.g., invalid `ALLOWED_ID`, broken handler logic) were buried.
 
-**Solution implemented (READY FOR QA):**
+**Solution implemented:**
 
 - Fail-closed classification in `core/telegram_health.py`. `classify_ptb_error()`
   returns `TRANSPORT` only for a proven transport class
@@ -355,9 +355,9 @@ real errors (e.g., invalid `ALLOWED_ID`, broken handler logic) were buried.
 - `tests/test_main_prod_sync.py` — `/health` registration and health-state reset
   only.
 
-**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+**Status:** done at `b0a7951`.
 
-### HIGH-11 — Telegram utility commands (not started)
+### HIGH-11 — Telegram utility commands (active, READY FOR QA)
 
 **Goal:** two read-only operator conveniences that never touch trading state.
 
@@ -370,12 +370,57 @@ real errors (e.g., invalid `ALLOWED_ID`, broken handler logic) were buried.
   reported as unknown, never as a price and never as zero.
 - No trading writes of any kind.
 
-**Status:** not started. Not authorized for the HIGH-10 pass.
+**Solution implemented (READY FOR QA):**
+
+- `/info` builds its help text only from the actual production contract: the
+  twelve commands really registered in `main.py` (`/start /stop /status /risk
+  /orders /pos /report /note /timeline /health /info /price`), the signal
+  grammar really accepted by `handlers/signal_parser.py` (field form with
+  `COIN:`/`STOP LOSS:`/`ENTRY:`, the lazy `COIN PRICE STOP` form, and percentage
+  stop loss with an explicit side), and the real `/pos` SL/TP-change flow. A
+  focused test binds the help list to the actual `_command(...)` registrations
+  in `main.py` and runs every example through the real `parse_signal`, so the
+  help cannot silently drift from the bot. `/info` performs zero Bybit calls,
+  zero writes, and no journal or lifecycle access; it is `ALLOWED_ID`-only and
+  renders safe HTML for Telegram parse mode.
+- `/price` accepts one argument in `BTC`, `$BTC` or `BTCUSDT` form, normalizes
+  it to a Bybit symbol (trim, one optional `$`, uppercase, append `USDT` once)
+  and performs exactly one Bybit Linear ticker read via the existing read path
+  `await bybit_call(session.get_tickers, category="linear", symbol=...)` — no
+  spot fallback, no cache, no orderbook or trades. Malformed, empty or
+  multi-argument input answers with usage and makes zero API calls.
+- Fail-closed response validation: a price is shown only when the envelope
+  proves `retCode` is an `int` equal to 0, the result list contains exactly one
+  row whose `symbol` matches the requested symbol, and `lastPrice` is a finite
+  value > 0. `markPrice` is shown on a separate line only when it is separately
+  proven finite > 0. The exchange's original price string is preserved
+  verbatim (no forced 2-decimal rounding, no float distortion).
+- Unknown instrument, Bybit `retCode != 0`, transport/API exception and
+  malformed response are each answered truthfully with no price and no
+  cached/zero fallback; the expected market-data failure never escapes as an
+  unhandled handler error, and no raw API payload, traceback or secret reaches
+  the user.
+- Both commands pass through the HIGH-10 `instrument_command` path unchanged;
+  HIGH-10 counters and semantics are untouched. No trading side effects:
+  parsing, callbacks, risk, SL/TP, watchdog, timeline, journal, lifecycle and
+  the Bybit write API are untouched.
+
+**Affected code:**
+
+- `handlers/info.py` — NEW, `/info` help rendering.
+- `handlers/price.py` — NEW, `/price` normalization, ticker read and
+  fail-closed validation.
+- `handlers/__init__.py`, `main.py` — registration of `info_command` and
+  `price_command` via the existing instrumented command path.
+- `tests/test_high11_telegram_utilities.py` — 11 focused tests (70 cases).
+- `tests/test_main_prod_sync.py` — `/info` and `/price` registration only.
+
+**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
 
 ## Release policy
 
 - The production server is not updated after every HIGH commit. Merging is not deploying.
-- HIGH-4 through HIGH-11 are batched into one production release and reviewed together in a release QA pass. Until HIGH-11 is complete there is no intermediate deploy.
+- HIGH-4 through HIGH-11 are batched into one production release and reviewed together in a release QA pass. With HIGH-11 implemented (READY FOR QA), the next step is the joint Release QA of the whole batch; production deploy happens only after Release QA GREEN.
 - After the joint release QA passes, the Human Operator performs one deployment, then a runtime smoke check, then a period of observation.
 - The Architect sets the order of commit, merge, release QA, deploy, and runtime verification; no agent verdict authorises any of them.
 

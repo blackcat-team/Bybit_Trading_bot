@@ -22,6 +22,7 @@ from handlers import (
     parse_and_trade, set_risk_command, view_orders, on_startup_check,
     status_command, handle_protection_input, timeline_command,
     health_command, alert_command_degradation,
+    info_command, price_command,
 )
 from app.jobs import (
     daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job,
@@ -177,6 +178,10 @@ if __name__ == '__main__':
     _command("timeline", timeline_command)
     # /health — read-only счётчики наблюдаемости из памяти процесса, без Bybit.
     _command("health", health_command)
+    # /info — read-only справка по фактическому контракту бота, без Bybit.
+    _command("info", info_command)
+    # /price TOKEN — read-only чтение тикера Bybit Linear, без записей.
+    _command("price", price_command)
 
     app.add_handler(CallbackQueryHandler(button_handler))
     # Группа -1: перехватывает текст только когда ожидается значение SL/TP из /pos.
