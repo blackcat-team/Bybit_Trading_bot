@@ -32,6 +32,28 @@
 Строковые ``"false"``, ``"0"``, ``"False"`` доказательством не считаются —
 разбор строго типизированный. Payload запроса типом ордера не является.
 
+Узкое исключение — ордер с ДОКАЗАННЫМ владением бота (LIVE-FIX1). Bybit V5
+отдаёт обычный parent Limit-вход с прикреплённым SL как ``stopOrderType`` со
+значением ``"UNKNOWN"`` и не обязан присылать все discriminator fields, поэтому
+собственный вход бота выпадал из preview целиком. Владение доказывается только
+точной идентичностью текущего durable ``ENTRY_PLACED``: тот же ``symbol`` и
+побайтно тот же ``orderId``, а когда обе стороны его знают — ещё и тот же
+``orderLinkId``. Корреляция по символу, времени, цене или количеству владением
+не является, поэтому карта владения адресуется самой парой
+``(symbol, orderId)``. Для такого — и только для такого — ордера дополнительно
+допускаются:
+
+- ``stopOrderType == "UNKNOWN"`` (обычный ордер без утверждения о защите);
+- отсутствие ключей ``stopOrderType``, ``orderFilter``, ``createType``.
+
+Владение не переопределяет ни один фактический признак: ``reduceOnly=True``,
+``closeOnTrigger=True``, ненулевой ``triggerPrice``, известный защитный
+``stopOrderType``, ``orderFilter == "StopOrder"``, не-пользовательский
+``createType``, conditional ``orderStatus`` и malformed-значение запрещают
+отмену и у собственного ордера бота. Недоказанный журнал владения не
+доказывает: любая аномалия строгого scan даёт пустую карту, и поток тогда
+полностью работает по строгому пути.
+
 Preview-снимок привязан к Telegram-пользователю, одноразовый и с коротким TTL.
 Канонической единицей снимка является точная пара ``(symbol, orderId)``:
 сопоставление по одному ``orderId`` позволило бы отменить чужую строку на другом
@@ -67,7 +89,7 @@ import time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from core.config import ALLOWED_ID
-from core.journal import append_event, ORDER_CANCEL_BATCH
+from core.journal import append_event, get_bot_entry_identities, ORDER_CANCEL_BATCH
 from core.trading_core import session
 from core.write_verify import (
     MALFORMED,
@@ -118,6 +140,15 @@ _ALLOWED_ORDER_STATUS = frozenset({"New", "PartiallyFilled"})
 # Допустимые значения orderFilter / createType для обычного входа.
 _ALLOWED_ORDER_FILTER = frozenset({"", "Order"})
 _ALLOWED_CREATE_TYPE = frozenset({"", "CreateByUser"})
+
+# Значение stopOrderType, которым Bybit обозначает отсутствие защитного типа у
+# обычного ордера. Принимается только для ордера с доказанным владением бота:
+# для чужой строки «UNKNOWN» остаётся неоднозначностью, а не разрешением.
+_OWNED_NEUTRAL_STOP_ORDER_TYPE = frozenset({"UNKNOWN"})
+
+# Причины допуска к отмене (попадают в диагностический лог, не в payload).
+REASON_ORDINARY_ENTRY = "ordinary_limit_entry"
+REASON_ORDINARY_ENTRY_OWNED = "ordinary_limit_entry_bot_owned"
 
 # Ожидающие подтверждения снимки: token → snapshot.
 _PENDING_CANCEL: dict = {}
@@ -228,12 +259,64 @@ def classify_cancel_response(resp, exc=None) -> str:
     return UNVERIFIED
 
 
-def classify_cancellable(order) -> tuple:
+def is_bot_owned_entry(order, owned_entries) -> bool:
+    """True только при доказанном точном совпадении с текущим ENTRY_PLACED.
+
+    Доказательством считается durable-идентичность из журнала: строгий scan
+    ``ENTRY_PLACED`` даёт карту, ключом которой является точная пара
+    ``(symbol, orderId)``. Когда обе стороны знают ``orderLinkId``, он обязан
+    совпасть — расхождение доказывает, что это другая строка, а
+    malformed-значение доказательством не является и владение снимает.
+
+    Совпадение по символу, времени, цене или количеству владением НЕ является:
+    на том же символе может стоять чужой, ручной или защитный ордер. Отсутствие
+    журнала, отсутствие записи по точной паре и пустой ``order_id`` (старые
+    события) дают False — недоказанное владение никогда не «почти доказано».
+    """
+    if not isinstance(order, dict) or not isinstance(owned_entries, dict):
+        return False
+
+    symbol = _read_text(order, "symbol")
+    order_id = _read_text(order, "orderId")
+    if not symbol or not order_id:
+        return False
+
+    # Ключ карты владения — сама точная пара: искать по одному символу здесь
+    # нечем, поэтому склеить два lifecycle одного инструмента невозможно.
+    record = owned_entries.get((symbol, order_id))
+    if not isinstance(record, dict):
+        return False
+
+    raw_owned_id = record.get("order_id")
+    owned_id = raw_owned_id.strip() if isinstance(raw_owned_id, str) else ""
+    if not owned_id or owned_id != order_id:
+        return False
+
+    raw_owned_link = record.get("order_link_id")
+    owned_link = raw_owned_link.strip() if isinstance(raw_owned_link, str) else ""
+    if owned_link:
+        row_link = _read_text(order, "orderLinkId")
+        if row_link is None:
+            return False
+        if row_link and row_link != owned_link:
+            return False
+    return True
+
+
+def classify_cancellable(order, owned_entries=None) -> tuple:
     """Классифицирует ордер fail-closed: ``(allowed: bool, reason: str)``.
 
     ``allowed=True`` только если ордер доказанно является обычным активным
-    лимитным входом. ``reason`` — короткий машинный код причины отказа, он
-    попадает в durable-журнал и не содержит payload биржи.
+    лимитным входом. ``reason`` — короткий машинный код причины, он попадает в
+    durable-журнал и диагностический лог и не содержит payload биржи.
+
+    ``owned_entries`` — карта ``{(symbol, order_id): {"order_id",
+    "order_link_id"}}`` из строгого scan durable ``ENTRY_PLACED``. Она
+    разрешает ровно два факта представления Bybit
+    для собственного входа бота: ``stopOrderType == "UNKNOWN"`` и отсутствие
+    необязательных discriminator-ключей. Ни один присутствующий защитный или
+    conditional признак владением не переопределяется, а без карты (значение по
+    умолчанию) действует прежний строгий контракт целиком.
     """
     if not isinstance(order, dict):
         return False, "not_a_row"
@@ -258,47 +341,101 @@ def classify_cancellable(order) -> tuple:
     if trigger is not None:
         return False, "trigger_price_present_or_malformed"
 
+    # Владение доказывается только durable-идентичностью собственного входа.
+    # Прикреплённые к parent-входу stopLoss/takeProfit защитным ордером его не
+    # делают и в классификации не участвуют вовсе.
+    owned = is_bot_owned_entry(order, owned_entries)
+
     # Protective discriminator fields. Отсутствие ключа доказательством
     # безопасности НЕ является: без утверждения биржи о типе ордера обычный
     # вход от защитного отличить нельзя. Пустая строка — это утверждение
-    # «признака нет», отсутствие ключа — отсутствие утверждения.
+    # «признака нет», отсутствие ключа — отсутствие утверждения. Отсутствие
+    # принимается только у доказанного собственного входа бота.
     if "stopOrderType" not in order:
-        return False, "stop_order_type_missing"
-    stop_order_type = _read_proven_text(order, "stopOrderType")
-    if stop_order_type is None:
-        return False, "stop_order_type_malformed"
-    if stop_order_type:
-        # Любое непустое значение — защитный или conditional признак.
-        return False, "stop_order_type_protective"
+        if not owned:
+            return False, "stop_order_type_missing"
+    else:
+        stop_order_type = _read_proven_text(order, "stopOrderType")
+        if stop_order_type is None:
+            return False, "stop_order_type_malformed"
+        if stop_order_type:
+            # Непустое значение — защитный или conditional признак. Исключение
+            # ровно одно: нейтральное «UNKNOWN» у собственного входа бота.
+            if not owned or stop_order_type not in _OWNED_NEUTRAL_STOP_ORDER_TYPE:
+                return False, "stop_order_type_protective"
 
     if "orderFilter" not in order:
-        return False, "order_filter_missing"
-    order_filter = _read_proven_text(order, "orderFilter")
-    if order_filter is None:
-        return False, "order_filter_malformed"
-    if order_filter not in _ALLOWED_ORDER_FILTER:
-        return False, "order_filter_not_ordinary"
+        if not owned:
+            return False, "order_filter_missing"
+    else:
+        order_filter = _read_proven_text(order, "orderFilter")
+        if order_filter is None:
+            return False, "order_filter_malformed"
+        if order_filter not in _ALLOWED_ORDER_FILTER:
+            return False, "order_filter_not_ordinary"
 
     if "createType" not in order:
-        return False, "create_type_missing"
-    create_type = _read_proven_text(order, "createType")
-    if create_type is None:
-        return False, "create_type_malformed"
-    if create_type not in _ALLOWED_CREATE_TYPE:
-        return False, "create_type_not_user"
+        if not owned:
+            return False, "create_type_missing"
+    else:
+        create_type = _read_proven_text(order, "createType")
+        if create_type is None:
+            return False, "create_type_malformed"
+        if create_type not in _ALLOWED_CREATE_TYPE:
+            return False, "create_type_not_user"
 
+    # orderStatus обязателен и для собственного входа: именно он отделяет
+    # активный лимитный вход от conditional «Untriggered» и от уже неактивной
+    # строки, и подменять это утверждение владением нечем.
     if "orderStatus" not in order:
         return False, "order_status_missing"
     status = _read_proven_text(order, "orderStatus")
     if status is None or status not in _ALLOWED_ORDER_STATUS:
         return False, "order_status_not_cancellable"
 
-    return True, "ordinary_limit_entry"
+    return True, REASON_ORDINARY_ENTRY_OWNED if owned else REASON_ORDINARY_ENTRY
 
 
-def _is_ordinary_limit_entry(order) -> bool:
+def _is_ordinary_limit_entry(order, owned_entries=None) -> bool:
     """Булев фасад :func:`classify_cancellable` для читаемости вызовов."""
-    return classify_cancellable(order)[0]
+    return classify_cancellable(order, owned_entries)[0]
+
+
+async def read_bot_owned_entries() -> dict:
+    """Идентичности текущих входных ордеров бота из durable-журнала.
+
+    Чтение read-only и fail-closed: недоступный, пустой или повреждённый журнал
+    даёт пустую карту, а значит поток целиком работает по строгому пути. Ложное
+    владение опаснее пропущенного своего ордера, поэтому исключение здесь
+    гасится в пользу более строгой классификации, а не наоборот.
+    """
+    try:
+        owned = await asyncio.to_thread(get_bot_entry_identities)
+    except Exception as exc:
+        logging.warning(
+            "cancel_batch: durable-владение ордерами не прочитано: %s", exc
+        )
+        return {}
+    return owned if isinstance(owned, dict) else {}
+
+
+def log_classification(stage: str, total: int, allow_reasons: dict,
+                       skip_reasons: dict) -> None:
+    """Агрегированный диагностический лог классификации.
+
+    В лог попадают только машинные коды причин и их количества: ни payload
+    биржи, ни идентификаторы ордеров, ни ключи и токены. Этого достаточно,
+    чтобы по production-логу установить, почему живой ордер не попал в preview.
+    """
+    def _fmt(counts: dict) -> str:
+        return " ".join(f"{name}={n}" for name, n in sorted(counts.items())) or "none"
+
+    logging.info(
+        "cancel_batch classify: stage=%s rows=%s allowed=%s skipped=%s "
+        "allowed_reasons=[%s] skip_reasons=[%s]",
+        stage, total, sum(allow_reasons.values()), sum(skip_reasons.values()),
+        _fmt(allow_reasons), _fmt(skip_reasons),
+    )
 
 
 def read_open_orders(resp):
@@ -604,14 +741,20 @@ async def preview_cancel_orders(update, context):
             return
 
         # Fail-closed классификация: allowed только с полным доказательством.
+        # Владение читается один раз на весь список: карта durable-идентичностей
+        # не должна меняться между строками одного preview.
+        owned_entries = await read_bot_owned_entries()
         allowed: list = []
+        allow_reasons: dict = {}
         skip_reasons: dict = {}
         for o in orders:
-            ok, reason = classify_cancellable(o)
+            ok, reason = classify_cancellable(o, owned_entries)
             if ok:
                 allowed.append(o)
+                allow_reasons[reason] = allow_reasons.get(reason, 0) + 1
             else:
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+        log_classification("preview", len(orders), allow_reasons, skip_reasons)
 
         if not allowed:
             total_skipped = sum(skip_reasons.values())
@@ -889,20 +1032,31 @@ async def confirm_cancel_orders(update, context, token: str):
 
         # Повторная fail-closed классификация каждого ордера.
         # Сопоставление строго по (symbol, orderId), не только по orderId.
+        # Владение перечитывается вместе с ордерами: подтверждение обязано
+        # опираться на текущее durable-состояние, а не на снимок preview.
+        owned_entries = await read_bot_owned_entries()
         current_allowed: dict = {}
         skipped_protected: list = []
+        allow_reasons: dict = {}
+        skip_reasons: dict = {}
         for o in current_orders:
             sym = _read_text(o, "symbol")
             oid = _read_text(o, "orderId")
             if not sym or not oid:
                 continue
             pair = (sym, oid)
-            ok, reason = classify_cancellable(o)
+            ok, reason = classify_cancellable(o, owned_entries)
             if ok:
                 current_allowed[pair] = o
-            elif pair in preview_pairs:
-                # Был в preview, но больше не классифицируется как обычный вход.
-                skipped_protected.append(pair)
+                allow_reasons[reason] = allow_reasons.get(reason, 0) + 1
+            else:
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                if pair in preview_pairs:
+                    # Был в preview, но больше не классифицируется как обычный вход.
+                    skipped_protected.append(pair)
+        log_classification(
+            "confirm", len(current_orders), allow_reasons, skip_reasons
+        )
 
         # Пересечение: отменяются только exact pairs, прошедшие оба строгих теста.
         to_cancel: list = []

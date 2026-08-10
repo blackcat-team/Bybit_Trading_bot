@@ -417,6 +417,84 @@ real errors (e.g., invalid `ALLOWED_ID`, broken handler logic) were buried.
 
 **Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
 
+### LIVE-FIX1 — bot-created Limit entry unreachable by safe cancellation (active, READY FOR QA)
+
+**Production evidence:** an ETHUSDT Limit LONG really created by the bot
+(`WRITE_VERIFY path=limit_entry status=VERIFIED source=get_open_orders`,
+attached `SL=1803.23`) was immediately reported by the safe-cancel preview as
+«Обычных лимитных ордеров на вход не найдено. Защитные и неоднозначные ордера
+пропущены: 3». No `cancel_order` appears in the log: the operation was blocked at
+preview classification, not at the write.
+
+**Root cause confirmed from code:** Bybit V5 represents an ordinary Linear Limit
+parent entry with an attached SL as `stopOrderType="UNKNOWN"`, and a response row
+is not required to carry every discriminator field. HIGH-7 `classify_cancellable`
+treated any non-empty `stopOrderType` as protective and required
+`stopOrderType`/`orderFilter`/`createType` to be *present*, so the bot's own entry
+could never pass. The attached `stopLoss` was never itself a rejection reason —
+the classifier does not read it.
+
+**Solution implemented (READY FOR QA):**
+
+- The strict HIGH-7 path is unchanged and remains the default. A second, narrow
+  path is gated on *proven durable bot ownership*: the same `symbol` and byte-exact
+  `orderId` of the current `ENTRY_PLACED`, plus a matching `orderLinkId` when both
+  sides know it. No correlation by symbol, time, price or qty; a terminal or
+  identifier-less lifecycle proves nothing.
+- In that path only, two Bybit representation facts are accepted:
+  `stopOrderType == "UNKNOWN"`, and an absent `stopOrderType`/`orderFilter`/
+  `createType` key. `orderStatus` stays mandatory even for an owned row — it is
+  the only thing separating an active entry from a conditional `Untriggered` one.
+- Ownership never overrides a fact. `reduceOnly=true`, `closeOnTrigger=true`, a
+  non-zero `triggerPrice`, a known protective `stopOrderType`, `orderFilter =
+  StopOrder`, a non-user `createType`, a conditional/non-cancellable
+  `orderStatus` and any malformed value keep forbidding cancellation on the bot's
+  own order too. `stopLoss`/`takeProfit` attached to a parent entry never make it
+  protective.
+- Ownership is read read-only from the durable journal by
+  `get_bot_entry_identities()`, a separate strict scan of `trade_journal.jsonl`.
+  It does not use the tolerant `read_events()` and does not use
+  `get_position_lifecycles()`: for ownership a skipped bad line is not
+  tolerable, because one lost terminal event would keep a cancelled or closed
+  entry "active", and symbol-only lifecycle state is not identity at all.
+- The ownership map is keyed by the exact `(symbol, orderId)` pair. An
+  `ENTRY_PLACED` becomes a candidate only with a proven symbol and a proven
+  exact `order_id`; `orderLinkId` is stored as additional identity evidence. A
+  terminal event removes a candidate only on an exact pair match — and, when
+  both sides prove `orderLinkId`, only when those match too. A terminal event
+  carrying only the same symbol changes nothing, so two lifecycles of one symbol
+  are never merged.
+- The scan is fail-closed as a whole: an open/read error, an invalid JSON line,
+  a top-level value that is not an object, a blank or unterminated (truncated)
+  line, or a malformed field in an event needed for the decision makes the
+  *entire* result unproven and returns an empty map. A partial prefix is never
+  returned. The journal is only read — never rewritten, repaired or migrated.
+- Ownership is read once per preview and once again per confirmation, so the
+  re-check uses current durable state. An empty map — including an unproven or
+  unreadable journal — degrades the flow to the strict path and therefore to
+  zero `cancel_order`: a false ownership is worse than a missed own order.
+- Aggregated diagnostic logging (`cancel_batch classify: stage=… allowed_reasons=[…]
+  skip_reasons=[…]`) makes a live rejection establishable from the log. It carries
+  only machine reason codes and counts — no order payload, identifiers, symbols or
+  secrets.
+- Unchanged: `cancel_all_orders` still absent from the flow; individual
+  `cancel_order(category, symbol, orderId)` at most once per exact pair;
+  preview → confirm token contract; protection snapshot before/after and bounded
+  readback; `ORDER_CANCEL_BATCH` durable audit.
+
+**Affected code:**
+
+- `handlers/cancel_orders.py` — `is_bot_owned_entry()`, `read_bot_owned_entries()`,
+  `log_classification()`, ownership-aware `classify_cancellable(order, owned_entries)`
+  and both call sites (preview and confirm).
+- `core/journal.py` — `get_bot_entry_identities()`, the strict read-only
+  exact-identity ownership scan. The tolerant `read_events()` and
+  `get_position_lifecycles()` are unchanged and keep their HIGH-9 semantics.
+- `tests/test_high7_safe_cancel.py` — LIVE-FIX1 tests (production-like ETH row,
+  ownership proof, protective-signal precedence, preview/confirm flow, log hygiene).
+
+**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+
 ## Release policy
 
 - The production server is not updated after every HIGH commit. Merging is not deploying.

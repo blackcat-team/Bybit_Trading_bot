@@ -35,6 +35,16 @@ Lifecycle по символу (порядок строк в JSONL, не timestam
   ENTRY_PLACED → PENDING; POSITION_CONFIRMED → CONFIRMED;
   CLOSED / RECONCILED → TERMINAL; новый ENTRY_PLACED после TERMINAL → новый PENDING.
 
+Точное владение входным ордером бота — get_bot_entry_identities(): строгий
+read-only просмотр trade_journal.jsonl, дающий ``{(symbol, order_id):
+{"order_link_id": ...}}`` только для ENTRY_PLACED с доказанной точной
+идентичностью. Единицей владения является точная пара (symbol, order_id):
+корреляция по символу, времени, цене или количеству владением не является, а
+два lifecycle одного символа не склеиваются. Любая аномалия журнала (битая
+строка, не-dict JSON, оборванная строка, ошибка чтения, malformed-поле в
+событии, необходимом для решения) делает ВЕСЬ результат недоказанным и
+возвращает {}.
+
 Статистика источников рассчитывается из событий CLOSED по запросу.
 Автокарантин отключает источник для новых сигналов при превышении порогов.
 
@@ -410,6 +420,138 @@ def get_position_lifecycles(events: list | None = None) -> dict:
             current["terminal_ts"] = ts
 
     return lifecycles
+
+
+class _OwnershipUnproven(Exception):
+    """Внутренний сигнал: доказательство владения нарушено (fail-closed).
+
+    Наружу не пробрасывается: сканер владения переводит его в пустую карту.
+    """
+
+
+def _ownership_text(ev: dict, field: str) -> str:
+    """Строковое поле события, участвующее в решении о владении.
+
+    Отсутствие ключа и ``None`` дают ``""`` — «утверждения нет»: у старых
+    ENTRY_PLACED точных идентификаторов действительно не было, и такая запись
+    просто не создаёт владения. Значение неверного типа (``int``, ``bool``,
+    список) — уже malformed evidence в событии, необходимом для решения, и
+    делает недоказанным весь результат.
+    """
+    if field not in ev:
+        return ""
+    raw = ev.get(field)
+    if raw is None:
+        return ""
+    if isinstance(raw, bool) or not isinstance(raw, str):
+        raise _OwnershipUnproven(f"поле {field} malformed")
+    return raw.strip()
+
+
+def _ownership_identity(ev: dict) -> tuple:
+    """``(symbol, order_id, order_link_id)`` события в строгом разборе."""
+    symbol = _ownership_text(ev, "symbol").upper()
+    order_id = _ownership_text(ev, "order_id")
+    order_link_id = _ownership_text(ev, "order_link_id")
+    return symbol, order_id, order_link_id
+
+
+def get_bot_entry_identities() -> dict:
+    """
+    Точные идентичности входных ордеров бота — строгий read-only scan журнала.
+
+    Возвращает ``{(symbol, order_id): {"order_id": str, "order_link_id": str}}``.
+    Ключом является точная пара: один только символ (как и время, сторона, цена
+    или количество) владением не является — на том же инструменте может стоять
+    чужой, ручной или защитный ордер, а два lifecycle одного символа обязаны
+    остаться разными записями.
+
+    Собственный tolerant-разбор вместо read_events()/get_position_lifecycles():
+    для владения пропуск повреждённой строки недопустим. Пропущенное
+    терминальное событие оставило бы отменённый или закрытый вход «активным»,
+    поэтому ЛЮБАЯ аномалия делает весь результат недоказанным и возвращает
+    пустую карту: ошибка открытия или чтения, невалидный JSON, JSON-значение не
+    объект, пустая или не терминированная ``\\n`` (оборванная) строка, malformed
+    поле в ENTRY_PLACED или терминальном событии. Частичный префикс не
+    возвращается никогда.
+
+    ENTRY_PLACED создаёт кандидата только при доказанных символе и точном
+    ``order_id``; ``order_link_id`` сохраняется как дополнительное evidence.
+    CLOSED / RECONCILED снимают кандидата только при точном совпадении пары, а
+    если ``order_link_id`` доказан обеими сторонами — при его совпадении тоже.
+    Терминальное событие без точного ``order_id`` кандидата не трогает: угадывать
+    связь по символу здесь запрещено.
+
+    Владение само по себе отмену не разрешает: путь отмены обязан ещё раз точно
+    сопоставить пару с текущим открытым ордером Bybit и пройти все защитные
+    discriminator-проверки. Журнал только читается: он не переписывается, не
+    исправляется и не мигрируется.
+    """
+    candidates: dict = {}
+    try:
+        if not JOURNAL_FILE.exists():
+            # Журнала ещё нет: доказательств владения нет, но и аномалии нет.
+            return {}
+        # newline="" отключает universal newlines: единственная строка без
+        # завершающего "\n" — это физически оборванный конец файла.
+        with open(JOURNAL_FILE, "r", encoding="utf-8", newline="") as f:
+            for raw_line in f:
+                if not raw_line.endswith("\n"):
+                    raise _OwnershipUnproven("последняя строка не терминирована")
+                line = raw_line.strip()
+                if not line:
+                    raise _OwnershipUnproven("пустая строка")
+                try:
+                    ev = json.loads(line)
+                except ValueError as exc:
+                    raise _OwnershipUnproven(f"невалидный JSON: {exc}") from exc
+                if not isinstance(ev, dict):
+                    raise _OwnershipUnproven("JSON-значение не является объектом")
+
+                event_type = _ownership_text(ev, "event")
+                if not event_type:
+                    # Без доказанного типа нельзя утверждать ни что это вход,
+                    # ни что это терминальное событие: пропуск такой строки мог
+                    # бы сохранить владение закрытым ордером.
+                    raise _OwnershipUnproven("событие без доказанного типа")
+                if event_type == ENTRY_PLACED:
+                    symbol, order_id, order_link_id = _ownership_identity(ev)
+                    if not symbol or not order_id:
+                        # Старое событие без точной идентичности владения не
+                        # доказывает, но и порчей журнала не является.
+                        continue
+                    candidates[(symbol, order_id)] = {
+                        "order_link_id": order_link_id,
+                    }
+                elif event_type in TERMINAL_EVENTS:
+                    symbol, order_id, order_link_id = _ownership_identity(ev)
+                    if not symbol or not order_id:
+                        continue
+                    known = candidates.get((symbol, order_id))
+                    if known is None:
+                        continue
+                    known_link = known.get("order_link_id", "")
+                    if known_link and order_link_id and known_link != order_link_id:
+                        # Совпала пара, но доказанные orderLinkId разные — это
+                        # другая строка, и снимать владение ею нельзя.
+                        continue
+                    del candidates[(symbol, order_id)]
+    except _OwnershipUnproven as exc:
+        logging.warning(
+            "journal ownership scan: владение не доказано (%s) — карта пуста", exc
+        )
+        return {}
+    except Exception as exc:
+        logging.error("journal ownership scan failed: %s", exc)
+        return {}
+
+    return {
+        (symbol, order_id): {
+            "order_id": order_id,
+            "order_link_id": info.get("order_link_id", ""),
+        }
+        for (symbol, order_id), info in candidates.items()
+    }
 
 
 # ---------------------------------------------------------------------------
