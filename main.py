@@ -21,6 +21,7 @@ from handlers import (
     send_report, add_note_handler, button_handler,
     parse_and_trade, set_risk_command, view_orders, on_startup_check,
     status_command, handle_protection_input, timeline_command,
+    health_command, alert_command_degradation,
 )
 from app.jobs import (
     daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job,
@@ -30,6 +31,11 @@ from app.jobs import (
     _next_monday_9utc_secs,
 )
 from core.notifier import configure_alerts
+from core.telegram_health import (
+    instrument_command,
+    is_polling_transport_error,
+    log_polling_transport_error,
+)
 
 # Инициализация цветов
 init(autoreset=True)
@@ -146,16 +152,31 @@ if __name__ == '__main__':
     # ---------------------------------------------
 
     # Регистрируем команды
-    app.add_handler(CommandHandler("start", start_trading))
-    app.add_handler(CommandHandler("stop", stop_trading))
-    app.add_handler(CommandHandler("orders", view_orders))
-    app.add_handler(CommandHandler("pos", check_positions))
-    app.add_handler(CommandHandler("report", send_report))
-    app.add_handler(CommandHandler("note", add_note_handler))
-    app.add_handler(CommandHandler("risk", set_risk_command))
-    app.add_handler(CommandHandler("status", status_command))
+    def _command(name, callback):
+        """Регистрирует команду вместе с учётом фактической обработки.
+
+        Инструментирование общее и прозрачное: бизнес-логика обработчиков не
+        меняется, исключения не проглатываются, счётчики не копируются в
+        каждый handler вручную.
+        """
+        app.add_handler(
+            CommandHandler(
+                name, instrument_command(callback, alert_command_degradation)
+            )
+        )
+
+    _command("start", start_trading)
+    _command("stop", stop_trading)
+    _command("orders", view_orders)
+    _command("pos", check_positions)
+    _command("report", send_report)
+    _command("note", add_note_handler)
+    _command("risk", set_risk_command)
+    _command("status", status_command)
     # /timeline SYMBOL — read-only хронология из локального журнала, без Bybit.
-    app.add_handler(CommandHandler("timeline", timeline_command))
+    _command("timeline", timeline_command)
+    # /health — read-only счётчики наблюдаемости из памяти процесса, без Bybit.
+    _command("health", health_command)
 
     app.add_handler(CallbackQueryHandler(button_handler))
     # Группа -1: перехватывает текст только когда ожидается значение SL/TP из /pos.
@@ -167,41 +188,16 @@ if __name__ == '__main__':
     )
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), parse_and_trade))
 
-    def _has_updater_polling_traceback(exc) -> bool:
-        """Проверяет происхождение traceback из getUpdates loop PTB 20.8."""
-        traceback = exc.__traceback__
-        while traceback is not None:
-            frame = traceback.tb_frame
-            module = frame.f_globals.get("__name__", "")
-            filename = frame.f_code.co_filename.replace("\\", "/")
-            if (
-                (module == "telegram.ext._updater" or filename.endswith("/telegram/ext/_updater.py"))
-                and frame.f_code.co_name == "polling_action_cb"
-            ):
-                return True
-            traceback = traceback.tb_next
-        return False
-
-    def _is_polling_error(update, context) -> bool:
-        """Возвращает True только для подтверждённых ошибок getUpdates polling."""
-        if (
-            update is not None
-            or getattr(context, "job", None) is not None
-            or getattr(context, "coroutine", None) is not None
-        ):
-            return False
-        exc = context.error
-        try:
-            from telegram.error import NetworkError
-        except ImportError:
-            return False
-        return isinstance(exc, NetworkError) and _has_updater_polling_traceback(exc)
-
     async def _ptb_error_handler(update, context):
+        """Единственная точка классификации и учёта исключений PTB.
+
+        Доказанный transport-сбой polling — предупреждение с rate limit и без
+        алерта. Всё остальное остаётся реальной ошибкой уровня ERROR.
+        """
         import html as _html
         exc = context.error
-        if _is_polling_error(update, context):
-            logging.warning("PTB polling transport error: %s", exc)
+        if is_polling_transport_error(update, context, exc):
+            log_polling_transport_error(exc)
             return
         logging.error("Unhandled PTB exception: %s", exc, exc_info=exc)
         try:

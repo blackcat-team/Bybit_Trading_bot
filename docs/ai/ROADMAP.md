@@ -12,8 +12,9 @@ This roadmap prioritizes future work; it is not authorization to combine items i
 6. Verification of actual state after Bybit writes — done at commit `77e2f41`.
 7. Production incident: missing Stop Loss orders — safety-critical, done at commit `b8b73e6`.
 8. Protection watchdog for open positions — done at commit `a3dae8f`.
-9. Durable trade audit trail — active, READY FOR QA.
-10. Telegram transport observability — not started.
+9. Durable trade audit trail — done at commit `bbd9aa2`.
+10. Telegram transport observability — active, READY FOR QA.
+11. Telegram utility commands — not started.
 
 ### HIGH-6 — Authoritative readback after Bybit writes (done at `77e2f41`)
 
@@ -184,7 +185,7 @@ lifecycle or journal; it is observability only.
 
 **Status:** done at `a3dae8f`.
 
-### HIGH-9 — Durable trade audit trail (active, READY FOR QA)
+### HIGH-9 — Durable trade audit trail (done at `bbd9aa2`)
 
 **Goal:** recoverable trade timeline with `orderId`/`orderLinkId`/`positionIdx`;
 SL/TP changes; cancel events; position closures; outcomes. The local append-only
@@ -266,38 +267,115 @@ journal; the existing lifecycle is not rewritten.
 - `tests/test_high9_trade_audit.py` — 20 focused tests.
 - `tests/test_main_prod_sync.py` — `/timeline` registration only.
 
-**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+**Status:** done at `bbd9aa2`.
 
-### HIGH-10 — Telegram transport observability (not started)
+### HIGH-10 — Telegram transport observability (active, READY FOR QA)
 
 **Goal:** normalization of `httpx.ReadError` and Bad Gateway; rate-limited
 logging; counters/health status; alert only on real impact on command processing.
 
-PTB error handler currently sends every unhandled PTB error as `ERROR` level alert
+PTB error handler previously sent every unhandled PTB error as `ERROR` level alert
 with 300s cooldown. Transport noise (`httpx.ReadError`, `httpcore.ConnectError`,
-HTTP 502/503/504 from Telegram gateway) triggers critical alerts even when the bot
-auto-retries and the command eventually succeeds. Operator sees alert spam;
-real errors (e.g., invalid `ALLOWED_ID`, broken handler logic) are buried.
+HTTP 502/503/504 from Telegram gateway) triggered critical alerts even when the bot
+auto-retries and the command eventually succeeds. Operator saw alert spam;
+real errors (e.g., invalid `ALLOWED_ID`, broken handler logic) were buried.
 
-Solution: classify PTB errors into transport (WARNING, dedup `ptb_polling_neterr`,
-cooldown 1800s) vs logic (ERROR, dedup `ptb_unhandled`, cooldown 300s). Transport:
-`telegram.error.NetworkError`, `httpx.ReadError`, `httpcore.ConnectError`,
-`httpcore.ReadTimeout`, `httpx.PoolTimeout`. Logic: everything else. Add health
-counters: `polling_errors_last_hour`, `commands_processed_last_hour`,
-`commands_failed_last_hour`. Telegram command `/health` shows counters. Alert
-only when command processing is provably broken (e.g., 5 consecutive handler
-failures), not on transient transport retry.
+**Solution implemented (READY FOR QA):**
 
-Deliverables: error classifier; dedup/cooldown for transport class; health
-counters; `/health` command; focused tests proving: transport → WARNING; logic →
-ERROR; dedup works; counters increment; `/health` renders.
+- Fail-closed classification in `core/telegram_health.py`. `classify_ptb_error()`
+  returns `TRANSPORT` only for a proven transport class
+  (`telegram.error.NetworkError`, `httpx.ReadError`/`ConnectError`/`ReadTimeout`/
+  `PoolTimeout`, the same `httpcore` classes) or a proven integer HTTP gateway
+  status 502/503/504 on the exception or its `response`. Everything else —
+  including unknown, malformed and non-exception input — is `LOGIC`. Exception
+  text is never evidence: a message containing "network", "timeout" or "502"
+  changes nothing. `"502"`, `502.0`, `True` and a foreign code are not a proven
+  status. Transport classes are resolved lazily through `sys.modules` and a
+  candidate is accepted only when it is a real `BaseException` subclass, so a
+  missing library or a stubbed module degrades to `LOGIC` rather than to a false
+  `TRANSPORT`.
+- Proven `__cause__`/`__context__` chain is walked (bounded depth, cycle-safe by
+  object identity), so the transport error PTB wraps in its own exception is
+  recognized without text-only guessing.
+- One classifier, one accounting. The two competing helpers in `main.py`
+  (`_has_updater_polling_traceback`, `_is_polling_error`) were replaced by
+  `is_polling_transport_error(update, context, exc)`, which is the single decision
+  point: `update is None`, no `job`, no `coroutine`, proven `TRANSPORT`, and a
+  proven `polling_action_cb` frame of `telegram/ext/_updater.py` in the traceback.
+  A PTB exception is classified and counted exactly once.
+- Confirmed polling transport error → `logging.WARNING` without traceback and
+  without any Telegram alert. `log_polling_transport_error()` always increments
+  `polling_errors_last_hour` and only then asks the log rate limit, so dedup can
+  never hide the counter.
+- Log rate limit is separate from the notifier cooldown: a process-local
+  `TRANSPORT_LOG_COOLDOWN_SEC = 1800` window under identity
+  `ptb_polling_neterr`. Suppression is never permanent — after the window the
+  next warning is allowed again and truthfully reports how many observations
+  were suppressed meanwhile.
+- Real handler/logic errors keep the existing `ERROR` path and the
+  `ptb_unhandled` alert with 300s cooldown, unchanged.
+- Command accounting is one shared wrapper, `instrument_command(callback,
+  on_degraded)`, applied centrally at registration. It counts a command when its
+  actual processing starts, counts a failure only when the command ends with an
+  unhandled `Exception`, re-raises the original exception unchanged, preserves
+  the return value and the callback identity, and copies no counters into any
+  handler. Existing handler business logic is untouched. `BaseException`
+  (cancellation) is deliberately not a processing failure.
+- Consecutive failure state: a proven successful user handler execution resets
+  `consecutive_handler_failures` to zero. A single failure never produces a
+  "bot broken" alert. Only at `DEGRADED_THRESHOLD = 5` does
+  `alert_command_degradation()` fire, with dedup key `ptb_command_degraded`
+  (separate from transport) and cooldown 300s. It carries only the failure count
+  and a 200-char escaped exception text — no Update, no context, no traceback.
+  A failure of the alert itself is logged and never replaces the handler's
+  original exception.
+- Health counters are process-local, in-memory, and genuinely rolling: each
+  observation is a monotonic timestamp in a `deque` and everything older than
+  `WINDOW_SEC = 3600` is evicted before every read and every write. Restart
+  naturally resets the state. No DB or journal persistence.
+- `/health` is read-only and `ALLOWED_ID`-only. It reads the in-memory snapshot
+  only: zero Bybit calls, zero exchange writes, no journal access. It shows
+  polling errors, commands processed and commands failed for the last 60
+  minutes, current consecutive failures, the degradation threshold, and status
+  `OK` (`consecutive_handler_failures < 5`) or `DEGRADED` (`>= 5`). Output is
+  numbers and static text; no secrets, raw Update/context or traceback.
+- No trading side effects: signal parsing, callbacks, Bybit reads/writes, risk,
+  SL/TP, reconciliation, watchdog and journal/lifecycle are untouched, and
+  `HTTPXRequest` timeout/pool settings are unchanged. An observability failure
+  never triggers an exchange action.
 
-**Not authorized for current HIGH-7 pass.**
+**Affected code:**
+
+- `core/telegram_health.py` — NEW, stdlib-only: classification, polling gate,
+  rolling counters, log rate limit, `instrument_command`.
+- `handlers/health.py` — NEW, `/health` rendering and `alert_command_degradation`.
+- `handlers/__init__.py`, `main.py` — registration of `health_command`, central
+  command instrumentation, single PTB error classifier.
+- `tests/test_high10_telegram_observability.py` — 14 focused tests (30 cases).
+- `tests/test_main_prod_sync.py` — `/health` registration and health-state reset
+  only.
+
+**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+
+### HIGH-11 — Telegram utility commands (not started)
+
+**Goal:** two read-only operator conveniences that never touch trading state.
+
+- `/info` — read-only usage instructions: how commands and signals are formed
+  correctly, without executing anything.
+- `/price TOKEN` — read-only current Bybit price for one instrument.
+- Convenient input: `BTC`, `$BTC` and `BTCUSDT` all resolve to the same
+  instrument.
+- Truthful handling of an unknown instrument or an API failure: unknown is
+  reported as unknown, never as a price and never as zero.
+- No trading writes of any kind.
+
+**Status:** not started. Not authorized for the HIGH-10 pass.
 
 ## Release policy
 
 - The production server is not updated after every HIGH commit. Merging is not deploying.
-- HIGH-4 through HIGH-10 are batched into one production release and reviewed together in a release QA pass. Until HIGH-10 is complete there is no intermediate deploy.
+- HIGH-4 through HIGH-11 are batched into one production release and reviewed together in a release QA pass. Until HIGH-11 is complete there is no intermediate deploy.
 - After the joint release QA passes, the Human Operator performs one deployment, then a runtime smoke check, then a period of observation.
 - The Architect sets the order of commit, merge, release QA, deploy, and runtime verification; no agent verdict authorises any of them.
 

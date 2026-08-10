@@ -15,6 +15,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from core import telegram_health
+
 
 MAIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
 _MISSING = object()
@@ -246,6 +248,8 @@ def runtime():
             "status_command",
             "handle_protection_input",
             "timeline_command",
+            "health_command",
+            "alert_command_degradation",
         )
     }
     jobs = {
@@ -302,6 +306,9 @@ def runtime():
             init_db=init_db,
         ),
         "core.trading_core": _module("core.trading_core", session=Session()),
+        # Наблюдаемость транспорта проверяется на реальном модуле: подмена
+        # классификатора заглушкой спрятала бы настоящий production-контракт.
+        "core.telegram_health": telegram_health,
         "core.notifier": _module(
             "core.notifier",
             configure_alerts=lambda *args: None,
@@ -322,6 +329,8 @@ def runtime():
     saved_modules = {name: sys.modules.get(name, _MISSING) for name in stubs}
     stdout = io.StringIO()
 
+    # Health-состояние процесс-локальное: каждый прогон стартует с нуля.
+    telegram_health.reset_health_state()
     sys.modules.update(stubs)
     try:
         try:
@@ -348,6 +357,7 @@ def runtime():
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = previous
+        telegram_health.reset_health_state()
 
 
 def test_runtime_wires_separate_http11_transports_and_exact_timeouts(runtime):
@@ -560,6 +570,7 @@ def test_runtime_preserves_handlers_and_background_job_schedules(runtime):
         "risk",
         "status",
         "timeline",
+        "health",
     ]
     assert sum(h.kind == "CallbackQueryHandler" for h in runtime.app.handlers) == 1
 
