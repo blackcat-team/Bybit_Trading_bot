@@ -21,6 +21,15 @@
                       лимитных входов (preview → confirm → индивидуальные cancel по
                       точному orderId) вместе со снимками защиты до и после.
                       Lifecycle не меняет и терминальным не является.
+  PROTECTION_CHANGE — durable-аудит реального автоматического переноса SL
+                      (Auto-BE / Risk Cut): сторона, доказанный position_idx, SL до
+                      записи, запрошенный SL и исход записи. Фактический SL после
+                      записи как факт биржи не утверждается: без authoritative-
+                      чтения запрошенный уровень остаётся именно запросом.
+                      Lifecycle не меняет и терминальным не является.
+
+Чтение хронологии по инструменту — get_trade_timeline(): read-only, порядок
+физических строк JSONL, недоказанное evidence отображается как UNKNOWN.
 
 Lifecycle по символу (порядок строк в JSONL, не timestamp):
   ENTRY_PLACED → PENDING; POSITION_CONFIRMED → CONFIRMED;
@@ -39,11 +48,16 @@ import json
 import logging
 import os
 import time
+from decimal import Decimal, InvalidOperation
 
 from core.config import (
     DATA_DIR, JOURNAL_FILE, DISABLED_SOURCES_FILE,
     QUARANTINE_LOSS_STREAK, QUARANTINE_DAILY_PNL_USDT, QUARANTINE_WEEKLY_PNL_USDT,
 )
+# Строгий разбор positionIdx берётся из общего контракта доказательств (HIGH-6):
+# второй, ослабленный вариант той же проверки создал бы расхождение в том, что
+# считается доказанной идентичностью позиции. Модуль чистый (stdlib + Decimal).
+from core.write_verify import read_position_idx
 
 # ---------------------------------------------------------------------------
 # Константы типов событий журнала
@@ -63,6 +77,16 @@ PROTECTION_WRITE   = "PROTECTION_WRITE"
 # позицию оно не открывает, не закрывает и в TERMINAL_EVENTS не входит,
 # поэтому get_position_lifecycles его намеренно не обрабатывает.
 ORDER_CANCEL_BATCH = "ORDER_CANCEL_BATCH"
+# Durable-аудит реального автоматического переноса SL (Auto-BE / Risk Cut).
+# Как PROTECTION_WRITE и ORDER_CANCEL_BATCH, событие только фиксирует
+# доказательства записи защиты: позицию оно не открывает и не закрывает,
+# в TERMINAL_EVENTS не входит и в get_position_lifecycles не обрабатывается.
+PROTECTION_CHANGE  = "PROTECTION_CHANGE"
+
+# Источники автоматического изменения защиты (канонические значения поля
+# protection_source события PROTECTION_CHANGE).
+PROTECTION_SOURCE_AUTO_BE  = "AUTO_BE"
+PROTECTION_SOURCE_RISK_CUT = "RISK_CUT"
 
 # Терминальные события: после любого из них символ больше не отслеживается,
 # пока не появится новое ENTRY_PLACED.
@@ -75,6 +99,23 @@ TERMINAL  = "TERMINAL"    # закрыта или сверена
 
 # Truthful-причины для RECONCILED. Ничего не утверждают о способе закрытия.
 POSITION_NOT_FOUND_ON_EXCHANGE = "POSITION_NOT_FOUND_ON_EXCHANGE"
+
+# ---------------------------------------------------------------------------
+# Канонические значения представления timeline
+# ---------------------------------------------------------------------------
+
+# Единственное обозначение недоказанного evidence. Ноль, пустая строка и
+# отсутствие ключа фактом не являются и в timeline попадают как UNKNOWN:
+# «цена выхода 0» и «цена выхода не доказана» — разные утверждения.
+UNKNOWN = "UNKNOWN"
+
+# Сколько последних relevant-событий отдаёт timeline по умолчанию.
+TIMELINE_DEFAULT_LIMIT = 20
+
+# Доказательство терминального состояния RECONCILED: успешный authoritative-
+# снимок позиций доказал отсутствие ранее подтверждённой позиции. Способ
+# закрытия, цена выхода и PnL этим НЕ доказываются.
+CLOSE_PROOF_POSITION_RECONCILIATION = "authoritative position reconciliation"
 
 
 def normalize_symbol(raw) -> str:
@@ -231,7 +272,14 @@ def read_events(
     """
     Читает события журнала с опциональной фильтрацией по типу, времени и символу.
 
-    Повреждённые строки пропускаются без ошибок.
+    Повреждённые строки пропускаются без ошибок. Повреждённой считается и
+    синтаксически корректная строка, чей JSON не является объектом (``null``,
+    список, число, строка): событием журнала она не является и до фильтров по
+    ts/event/symbol не допускается. Пропуск обязан произойти раньше первого
+    ``ev.get(...)``: иначе одна legacy-строка обрывала бы чтение всего
+    оставшегося файла и скрывала последующие корректные события.
+
+    Журнал read-only/append-only: битые строки не исправляются и не удаляются.
     """
     events = []
     if not JOURNAL_FILE.exists():
@@ -245,6 +293,8 @@ def read_events(
                 try:
                     ev = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if not isinstance(ev, dict):
                     continue
                 if since_ts and ev.get("ts", 0) < since_ts:
                     continue
@@ -287,9 +337,13 @@ def get_position_lifecycles(events: list | None = None) -> dict:
                          "source_tag": str, "planned_risk_usdt": float,
                          "qty": float, "entry": float, "stop": float,
                          "order_type": str, "entry_event_ts": float,
-                         "order_id": str, "order_link_id": str}}.
+                         "order_id": str, "order_link_id": str,
+                         "position_idx": int | None}}.
     order_id / order_link_id нужны для точной корреляции исполнения; у старых
     событий их нет, и такой lifecycle остаётся PENDING.
+    position_idx появляется только из доказанного authoritative-evidence
+    POSITION_CONFIRMED и остаётся None, пока он не доказан: выдуманный
+    positionIdx=0 связал бы разные позиции одного символа.
     Повреждённые строки уже отфильтрованы read_events(); записи без символа
     пропускаются.
     """
@@ -329,6 +383,9 @@ def get_position_lifecycles(events: list | None = None) -> dict:
                 # Отсутствуют у старых событий → lifecycle останется PENDING.
                 "order_id": ev.get("order_id", ""),
                 "order_link_id": ev.get("order_link_id", ""),
+                # Идентичность позиции ENTRY_PLACED не доказывает: она
+                # появляется только из authoritative fill evidence.
+                "position_idx": None,
             }
         elif event_type == POSITION_CONFIRMED:
             current = lifecycles.get(symbol)
@@ -338,6 +395,13 @@ def get_position_lifecycles(events: list | None = None) -> dict:
                 continue
             current["state"] = CONFIRMED
             current["confirmed_ts"] = ts
+            # Доказанный positionIdx переносится в lifecycle, чтобы дальнейшие
+            # события этого же lifecycle могли ссылаться на ту же идентичность.
+            # Недоказанный (отсутствующий, malformed) не затирает уже доказанный
+            # и сам выдуманным значением не подменяется.
+            proven_idx = read_position_idx(ev.get("position_idx"))
+            if proven_idx is not None:
+                current["position_idx"] = proven_idx
         elif event_type in TERMINAL_EVENTS:
             current = lifecycles.get(symbol)
             if current is None:
@@ -346,6 +410,392 @@ def get_position_lifecycles(events: list | None = None) -> dict:
             current["terminal_ts"] = ts
 
     return lifecycles
+
+
+# ---------------------------------------------------------------------------
+# Хронология событий по инструменту (read-only)
+# ---------------------------------------------------------------------------
+
+def _text_or_unknown(raw) -> str:
+    """Непустой текст либо :data:`UNKNOWN`.
+
+    Пустая строка, None, не-строка и legacy-заглушка ``—`` фактом не являются:
+    отсутствие доказательства обязано быть видно как UNKNOWN.
+    """
+    if not isinstance(raw, str):
+        return UNKNOWN
+    text = raw.strip()
+    if not text or text == "—":
+        return UNKNOWN
+    return text
+
+
+def _number_or_unknown(raw) -> str:
+    """Доказанное конечное число как текст либо :data:`UNKNOWN`.
+
+    bool отклоняется (``True`` не должен стать 1), как и NaN, Infinity, пустая
+    строка и нечисловое значение. Ноль сохраняется: он доказан, если записан.
+
+    Разбор и печать идут через Decimal: float-форматирование теряет точность
+    низкоценовых инструментов, а показанная в аудите цена обязана совпадать с
+    записанной.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return UNKNOWN
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text or text == "—":
+            return UNKNOWN
+        source = text
+    elif isinstance(raw, (int, float)):
+        source = str(raw)
+    else:
+        return UNKNOWN
+    try:
+        value = Decimal(source)
+    except (InvalidOperation, TypeError, ValueError):
+        return UNKNOWN
+    if not value.is_finite():
+        return UNKNOWN
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _idx_or_unknown(raw):
+    """Доказанный ``positionIdx`` (0/1/2) либо :data:`UNKNOWN`."""
+    idx = read_position_idx(raw)
+    return UNKNOWN if idx is None else idx
+
+
+def _ts_or_unknown(raw):
+    """Возвращает (float | None, текст UTC | UNKNOWN) для метки времени."""
+    if isinstance(raw, bool) or raw is None:
+        return None, UNKNOWN
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None, UNKNOWN
+    if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+        return None, UNKNOWN
+    try:
+        text = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(value))
+    except (OSError, OverflowError, ValueError):
+        return value, UNKNOWN
+    return value, text
+
+
+# Списки точных пар ``SYMBOL:orderId`` события ORDER_CANCEL_BATCH.
+_CANCEL_PAIR_FIELDS = (
+    "previewed_ids", "confirmed_ids", "attempted_ids", "cancelled_ids",
+    "rejected_ids", "unverified_ids", "skipped_changed_ids",
+    "skipped_protected_ids",
+)
+
+
+def _cancel_pairs_for_symbol(raw, symbol: str) -> list:
+    """Оставляет только метки пар запрошенного инструмента.
+
+    Канонической единицей HIGH-7 является пара ``(symbol, orderId)``, поэтому
+    метка без разделителя или без orderId парой не считается. Ордера других
+    инструментов того же батча в timeline символа не попадают.
+    """
+    if not isinstance(raw, list):
+        return []
+    pairs = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        head, sep, tail = item.partition(":")
+        if not sep or not tail.strip():
+            continue
+        if normalize_symbol(head) == symbol:
+            pairs.append(item.strip())
+    return pairs
+
+
+def _cancel_batch_symbols(ev: dict) -> set:
+    """Множество нормализованных символов из ``event.symbols``."""
+    raw = ev.get("symbols")
+    if not isinstance(raw, list):
+        return set()
+    return {normalize_symbol(item) for item in raw} - {""}
+
+
+def _snapshot_level(raw) -> str:
+    """Уровень из снимка защиты HIGH-7 с сохранением трёх разных «нет».
+
+    ``MISSING`` (ключа не было) и ``MALFORMED`` (значение не разбирается)
+    доказательством не являются и дают :data:`UNKNOWN`. ``none`` — доказанное
+    утверждение биржи «уровня нет»; подменять его на UNKNOWN нельзя, иначе
+    доказанная пропажа защиты выглядела бы как отсутствие данных.
+    """
+    if isinstance(raw, str) and raw.strip() == "none":
+        return "none"
+    return _number_or_unknown(raw)
+
+
+def _cancel_snapshot_for_symbol(raw, symbol: str) -> list:
+    """Строки снимка защиты только запрошенного инструмента."""
+    if not isinstance(raw, list):
+        return []
+    rows = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        if normalize_symbol(row.get("symbol")) != symbol:
+            continue
+        rows.append({
+            "side": _text_or_unknown(row.get("side")),
+            "position_idx": _idx_or_unknown(row.get("position_idx")),
+            "size": _snapshot_level(row.get("size")),
+            "stop_loss": _snapshot_level(row.get("stopLoss")),
+            "take_profit": _snapshot_level(row.get("takeProfit")),
+            "trailing_stop": _snapshot_level(row.get("trailingStop")),
+        })
+    return rows
+
+
+def _timeline_entry_placed(ev: dict, entry: dict) -> None:
+    """Попытка входа: план сделки и точные идентификаторы ордера."""
+    entry["details"] = {
+        "side": _text_or_unknown(ev.get("side")),
+        "order_type": _text_or_unknown(ev.get("order_type")),
+        "qty": _number_or_unknown(ev.get("qty")),
+        "entry": _number_or_unknown(ev.get("entry")),
+        "stop": _number_or_unknown(ev.get("stop")),
+        "planned_risk_usdt": _number_or_unknown(ev.get("planned_risk_usdt")),
+        "source_tag": _text_or_unknown(ev.get("source_tag")),
+        # Идентичность позиции ENTRY_PLACED не доказывает: до исполнения
+        # positionIdx не существует.
+        "position_idx": UNKNOWN,
+        "write_outcome": _text_or_unknown(ev.get("write_outcome")),
+        "sl_verify_status": _text_or_unknown(ev.get("sl_verify_status")),
+        "sl_requested": _number_or_unknown(ev.get("sl_requested")),
+        "sl_on_exchange": _number_or_unknown(ev.get("sl_on_exchange")),
+    }
+
+
+def _timeline_position_confirmed(ev: dict, entry: dict) -> None:
+    """Подтверждение исполнения СВОЕГО ордера authoritative-чтением."""
+    entry["details"] = {
+        "side": _text_or_unknown(ev.get("side")),
+        "cum_exec_qty": _number_or_unknown(ev.get("cum_exec_qty")),
+        "position_idx": _idx_or_unknown(ev.get("position_idx")),
+        "source_tag": _text_or_unknown(ev.get("source_tag")),
+        "entry_event_ts": _ts_or_unknown(ev.get("entry_event_ts"))[1],
+    }
+
+
+def _timeline_terminal(ev: dict, entry: dict) -> None:
+    """Терминальное событие lifecycle с truthful closure evidence.
+
+    Цена выхода и PnL печатаются только когда они действительно записаны в
+    событии. RECONCILED их не доказывает, и подстановка «ближайшей» или
+    «последней» строки closed-PnL здесь запрещена: корреляция только по символу
+    или по времени способна приписать сделке чужой результат.
+    """
+    event_type = ev.get("event")
+    if event_type == RECONCILED:
+        close_status = RECONCILED
+        close_proof = CLOSE_PROOF_POSITION_RECONCILIATION
+    else:
+        close_status = _text_or_unknown(event_type)
+        close_proof = _text_or_unknown(ev.get("close_proof_source"))
+    entry["details"] = {
+        "side": _text_or_unknown(ev.get("side")),
+        "position_idx": _idx_or_unknown(ev.get("position_idx")),
+        "close_status": close_status,
+        "close_reason": _text_or_unknown(ev.get("reason")),
+        "close_price": _number_or_unknown(ev.get("close_price")),
+        "pnl_usdt": _number_or_unknown(ev.get("pnl_usdt")),
+        "close_proof_source": close_proof,
+        "source_tag": _text_or_unknown(ev.get("source_tag")),
+        "planned_risk_usdt": _number_or_unknown(ev.get("planned_risk_usdt")),
+        "entry_event_ts": _ts_or_unknown(ev.get("entry_event_ts"))[1],
+    }
+
+
+def _timeline_protection_write(ev: dict, entry: dict) -> None:
+    """Доказательство записи защиты (HIGH-6): запрошенное и наблюдённое раздельно."""
+    entry["details"] = {
+        "side": _text_or_unknown(ev.get("side")),
+        "protection_kind": _text_or_unknown(ev.get("protection_kind")),
+        "protection_path": _text_or_unknown(ev.get("sl_verify_path")),
+        "position_idx": _idx_or_unknown(ev.get("sl_verify_position_idx")),
+        "sl_requested": _number_or_unknown(ev.get("sl_requested")),
+        "sl_on_exchange": _number_or_unknown(ev.get("sl_on_exchange")),
+        "tp_requested": _number_or_unknown(ev.get("tp_requested")),
+        "tp_on_exchange": _number_or_unknown(ev.get("tp_on_exchange")),
+        "write_outcome": _text_or_unknown(ev.get("write_outcome")),
+        "verify_status": _text_or_unknown(ev.get("sl_verify_status")),
+        "verify_source": _text_or_unknown(ev.get("sl_verify_source")),
+        "verify_reason": _text_or_unknown(ev.get("sl_verify_reason")),
+    }
+
+
+def _timeline_protection_change(ev: dict, entry: dict) -> None:
+    """Автоматический перенос SL (Auto-BE / Risk Cut).
+
+    ``stop_loss_after`` намеренно отсутствует: без authoritative-чтения после
+    записи фактический уровень биржи не доказан, а запрошенный уровень фактом
+    не является.
+    """
+    entry["details"] = {
+        "side": _text_or_unknown(ev.get("side")),
+        "protection_source": _text_or_unknown(ev.get("protection_source")),
+        "position_idx": _idx_or_unknown(ev.get("position_idx")),
+        "stop_loss_before": _number_or_unknown(ev.get("stop_loss_before")),
+        "stop_loss_requested": _number_or_unknown(ev.get("stop_loss_requested")),
+        "write_outcome": _text_or_unknown(ev.get("write_outcome")),
+    }
+
+
+def _timeline_cancel_batch(ev: dict, entry: dict, symbol: str) -> None:
+    """Пакетная отмена HIGH-7, суженная до запрошенного инструмента."""
+    entry["details"] = {
+        "operation": _text_or_unknown(ev.get("operation")),
+        "outcome": _text_or_unknown(ev.get("outcome")),
+        "previewed_ids": _cancel_pairs_for_symbol(ev.get("previewed_ids"), symbol),
+        "cancelled_ids": _cancel_pairs_for_symbol(ev.get("cancelled_ids"), symbol),
+        "rejected_ids": _cancel_pairs_for_symbol(ev.get("rejected_ids"), symbol),
+        "unverified_ids": _cancel_pairs_for_symbol(ev.get("unverified_ids"), symbol),
+        "skipped_changed_ids": _cancel_pairs_for_symbol(
+            ev.get("skipped_changed_ids"), symbol
+        ),
+        "skipped_protected_ids": _cancel_pairs_for_symbol(
+            ev.get("skipped_protected_ids"), symbol
+        ),
+        "protection_status": _text_or_unknown(ev.get("protection_status")),
+        "protection_before": _cancel_snapshot_for_symbol(
+            ev.get("protection_before"), symbol
+        ),
+        "protection_after": _cancel_snapshot_for_symbol(
+            ev.get("protection_after"), symbol
+        ),
+    }
+
+
+def _timeline_generic(ev: dict, entry: dict) -> None:
+    """Прочие события символа (FAIL и legacy-типы) — минимальное общее evidence."""
+    entry["details"] = {
+        "side": _text_or_unknown(ev.get("side")),
+        "source_tag": _text_or_unknown(ev.get("source_tag")),
+        "reason": _text_or_unknown(ev.get("reason")),
+    }
+
+
+def _cancel_batch_relevant(ev: dict, symbol: str) -> bool:
+    """True, если пакетная отмена реально относится к *symbol*.
+
+    Доказательством считается либо присутствие символа в ``event.symbols``,
+    либо точная пара ``SYMBOL:orderId`` в списках идентификаторов батча.
+    Совпадение одного лишь ``orderId`` доказательством не является.
+    """
+    if symbol in _cancel_batch_symbols(ev):
+        return True
+    return any(
+        _cancel_pairs_for_symbol(ev.get(field), symbol)
+        for field in _CANCEL_PAIR_FIELDS
+    )
+
+
+def get_trade_timeline(symbol, limit: int = TIMELINE_DEFAULT_LIMIT) -> list:
+    """Возвращает хронологию событий журнала по одному инструменту.
+
+    Read-only: журнал не изменяется, не сортируется и не переписывается.
+    Порядок результата — физический порядок строк JSONL: timestamp остаётся
+    метаданными и может быть недостоверным, поэтому переставлять по нему
+    события нельзя. Повреждённые строки пропускаются так же, как в
+    :func:`read_events`.
+
+    В результат попадают события с этим символом плюс ``ORDER_CANCEL_BATCH``,
+    доказанно относящиеся к нему (символ в ``symbols`` либо точная пара
+    ``SYMBOL:orderId``); идентификаторы других инструментов того же батча
+    отбрасываются.
+
+    Каждое событие нормализуется в
+    ``{"ts", "ts_text", "event", "symbol", "details"}``. Недоказанное evidence
+    отображается как :data:`UNKNOWN`, а не как ноль или пустая строка: старое
+    событие без новых полей остаётся читаемым и ничего ложного не утверждает.
+    Lifecycle здесь не выводится — печатается только то, что доказано самим
+    событием.
+
+    ``limit`` применяется к ПОСЛЕДНИМ relevant-событиям; ``limit <= 0`` даёт
+    пустой результат, некорректное значение — умолчание.
+    """
+    normalized = normalize_symbol(symbol)
+    if not normalized:
+        return []
+
+    try:
+        max_events = int(limit)
+    except (TypeError, ValueError):
+        max_events = TIMELINE_DEFAULT_LIMIT
+    if isinstance(limit, bool):
+        max_events = TIMELINE_DEFAULT_LIMIT
+    if max_events <= 0:
+        return []
+
+    timeline: list = []
+    for ev in read_events():
+        if not isinstance(ev, dict):
+            continue
+        event_type = ev.get("event")
+        ev_symbol = normalize_symbol(ev.get("symbol"))
+
+        if event_type == ORDER_CANCEL_BATCH:
+            # У батча нет собственного поля symbol: относимость доказывается
+            # списком symbols или точной парой SYMBOL:orderId.
+            if not _cancel_batch_relevant(ev, normalized):
+                continue
+        elif ev_symbol != normalized:
+            continue
+
+        ts_value, ts_text = _ts_or_unknown(ev.get("ts"))
+        entry = {
+            "ts": ts_value,
+            "ts_text": ts_text,
+            "event": _text_or_unknown(event_type),
+            "symbol": normalized,
+            "details": {},
+        }
+
+        if event_type == ENTRY_PLACED:
+            _timeline_entry_placed(ev, entry)
+        elif event_type == POSITION_CONFIRMED:
+            _timeline_position_confirmed(ev, entry)
+        elif event_type in TERMINAL_EVENTS:
+            _timeline_terminal(ev, entry)
+        elif event_type == PROTECTION_WRITE:
+            _timeline_protection_write(ev, entry)
+        elif event_type == PROTECTION_CHANGE:
+            _timeline_protection_change(ev, entry)
+        elif event_type == ORDER_CANCEL_BATCH:
+            _timeline_cancel_batch(ev, entry, normalized)
+        else:
+            _timeline_generic(ev, entry)
+
+        # Точные идентификаторы ордера доступны у большинства событий и
+        # выводятся единообразно; у ORDER_CANCEL_BATCH их нет — там единицей
+        # является пара SYMBOL:orderId.
+        if event_type != ORDER_CANCEL_BATCH:
+            details = entry["details"]
+            details.setdefault(
+                "order_id",
+                _text_or_unknown(ev.get("order_id") or ev.get("sl_verify_order_id")),
+            )
+            details.setdefault(
+                "order_link_id",
+                _text_or_unknown(
+                    ev.get("order_link_id") or ev.get("sl_verify_order_link_id")
+                ),
+            )
+
+        timeline.append(entry)
+
+    return timeline[-max_events:]
 
 
 # ---------------------------------------------------------------------------

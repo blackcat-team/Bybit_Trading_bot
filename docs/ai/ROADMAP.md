@@ -9,13 +9,13 @@ This roadmap prioritizes future work; it is not authorization to combine items i
 3. Reconciliation of manual/external position closure — done.
 4. SL/TP changes from `/pos` — done at commit `cb179a4`.
 5. Percentage-based SL in a signal — done at commit `fa78f93`.
-6. Verification of actual state after Bybit writes — active.
-7. Production incident: missing Stop Loss orders — active, safety-critical, READY FOR QA.
-8. Protection watchdog for open positions — active, READY FOR QA.
-9. Durable trade audit trail — not started.
+6. Verification of actual state after Bybit writes — done at commit `77e2f41`.
+7. Production incident: missing Stop Loss orders — safety-critical, done at commit `b8b73e6`.
+8. Protection watchdog for open positions — done at commit `a3dae8f`.
+9. Durable trade audit trail — active, READY FOR QA.
 10. Telegram transport observability — not started.
 
-### HIGH-6 — Authoritative readback after Bybit writes (active)
+### HIGH-6 — Authoritative readback after Bybit writes (done at `77e2f41`)
 
 Goal: after a safety-critical live write, the operator-visible result must state
 what the exchange actually holds, not what the request intended. An API
@@ -27,7 +27,7 @@ API acknowledgement is not `VERIFIED`. Unknown is never presented as success, an
 a readback failure never becomes `MISMATCH`. The readback is read-only and
 bounded; it never repairs, re-sends, or retries the write.
 
-### HIGH-7 — Production incident: missing Stop Loss orders (active, safety-critical)
+### HIGH-7 — Production incident: missing Stop Loss orders (safety-critical, done at `b8b73e6`)
 
 **Root cause confirmed with high confidence:** the Telegram button "⛔ Отменить все"
 called `cancel_all_orders(category="linear", settleCoin="USDT")` without
@@ -119,9 +119,9 @@ correlation are confirmed; the production journal lacks a full callback audit tr
 - `tests/test_high7_safe_cancel.py` — 29 focused tests proving all 22 contract
   points from §12.
 
-**Status:** READY FOR QA.
+**Status:** done at `b8b73e6`.
 
-### HIGH-8 — Protection watchdog for open positions (active, READY FOR QA)
+### HIGH-8 — Protection watchdog for open positions (done at `a3dae8f`)
 
 **Goal:** periodic alert-only check of open positions; critical notification on
 missing/zero SL; dedupe/cooldown; no automatic repair.
@@ -182,31 +182,91 @@ lifecycle or journal; it is observability only.
 - `main.py` — job 9 registration via `register_protection_watchdog(jq)`.
 - `tests/test_high8_protection_watchdog.py` — 10 focused tests (38 cases).
 
-**Status:** READY FOR QA.
+**Status:** done at `a3dae8f`.
 
-### HIGH-9 — Durable trade audit trail (not started)
+### HIGH-9 — Durable trade audit trail (active, READY FOR QA)
 
 **Goal:** recoverable trade timeline with `orderId`/`orderLinkId`/`positionIdx`;
-SL/TP changes; cancel events; position closures; outcomes.
+SL/TP changes; cancel events; position closures; outcomes. The local append-only
+`trade_journal.jsonl` must be sufficient to reconstruct the per-instrument
+sequence: entry attempt/placement → fill confirmation → protection
+writes/changes → order cancellation → terminal reconciliation/closure evidence.
+A read-only Telegram command `/timeline BTCUSDT` shows recent events from the
+local durable journal, with no Bybit calls and no state change. No second
+journal; the existing lifecycle is not rewritten.
 
-Extend journal schema to capture: exact order identifiers from placement response
-(HIGH-1 already records them in `ENTRY_PLACED`); SL/TP write attempts with before/
-after snapshots (HIGH-6 `PROTECTION_WRITE` is lifecycle-neutral, expand it or add
-`PROTECTION_CHANGE`); order cancellations (HIGH-7 `ORDER_CANCEL_BATCH` is durable
-proof, but individual cancel per lifecycle may need a separate event); position
-closures with close reason, close price, PnL, and authoritative proof. All events
-timestamped, linked by `symbol` + optional `order_id`/`order_link_id` +
-`positionIdx`. Recoverable: given a symbol and time window, operator can
-reconstruct full timeline: entry attempt → fill proof → SL/TP set → SL/TP changed
-→ order cancelled → position closed. Journal is append-only; old events are never
-edited. Rotation/archival policy if file grows large.
+**Solution implemented (READY FOR QA):**
 
-Deliverables: extended journal event schemas; helper to read timeline for symbol;
-Telegram command (e.g., `/timeline BTCUSDT`) showing recent events; focused tests
-proving: events append; timeline reconstructs correctly; SL/TP changes recorded;
-cancel recorded; closure recorded; no event overwrites old ones.
+- Existing journal is source of truth. New fields and events are
+  additive/backward-compatible; old records without them stay readable; no
+  editing, backfill, or migration of old JSONL lines.
+- No false correlation. Events are linked only by proven evidence: `symbol`,
+  `entry_event_ts`, `order_id`, `order_link_id`, `position_idx` — in the
+  combinations the specific event actually proves. No invented `positionIdx=0`,
+  no request data substituted for exchange evidence, no cross-lifecycle linking
+  by symbol alone. Repeated lifecycles of one symbol are never glued together.
+- `POSITION_CONFIRMED` stores canonical `position_idx` only when the
+  identifier-matched authoritative fill row really proves it. A
+  missing/malformed/ambiguous `positionIdx` is left absent, and the confirmation
+  contract is not weakened. `get_position_lifecycles` carries the proven
+  `position_idx` forward to later events of that lifecycle.
+- `RECONCILED` additively preserves the available durable identifiers of the
+  confirmed lifecycle (`order_id`, `order_link_id`, `position_idx`,
+  `entry_event_ts`). Terminal semantics unchanged: it still means only proven
+  absence of a previously confirmed position in a successful authoritative
+  snapshot. Truthful terminal evidence: `close_status = RECONCILED`,
+  `close_reason = POSITION_NOT_FOUND_ON_EXCHANGE`, `close_price = UNKNOWN`,
+  `pnl_usdt = UNKNOWN`, `close_proof_source = authoritative position
+  reconciliation`. No symbol-only or time-only closed-PnL correlation, and no
+  nearest/latest/only-row heuristic: unprovable correlation stays `UNKNOWN`.
+- Protection history. Existing `PROTECTION_WRITE` from `/pos` appears in the
+  timeline with its HIGH-6 evidence and never substitutes requested → observed.
+  Real automatic SL changes from Auto-BE / Risk Cut now leave a durable
+  lifecycle-neutral `PROTECTION_CHANGE` event (`symbol`, `side`, proven
+  `position_idx`, `protection_source` = `AUTO_BE` / `RISK_CUT`,
+  `stop_loss_before`, `stop_loss_requested`, `write_outcome`, timestamp).
+  `stop_loss_after` is never asserted as an exchange fact: without an
+  authoritative readback the requested level stays a request. The audit is
+  written before the Telegram notification, and an audit failure only logs — it
+  never repeats the exchange write. Auto-BE / Risk Cut math and trigger
+  thresholds are unchanged.
+- Cancellation history. HIGH-7 `ORDER_CANCEL_BATCH` is the durable proof and is
+  not duplicated. A symbol's timeline includes the batch when the symbol is in
+  `event.symbols` or its exact pair is present in the batch evidence, showing
+  only the identifiers relevant to the requested symbol.
+- Timeline reader. `get_trade_timeline(symbol, limit=...)` in `core/journal.py`:
+  normalizes the symbol, reads the append-only journal, preserves physical JSONL
+  order (never sorts by `ts`), safely skips malformed lines as `read_events`
+  does, includes ordinary symbol events and relevant `ORDER_CANCEL_BATCH`,
+  renders missing evidence as `UNKNOWN` rather than zero or an empty fact,
+  applies `limit` to the last relevant events, and never modifies the journal.
+  No lifecycle inference beyond what the evidence proves.
+- `/timeline SYMBOL` command: `ALLOWED_ID` only; a valid symbol is required
+  (usage hint otherwise, no exception); local journal only; no Bybit calls; no
+  writes; last 20 relevant events in append-only chronology; timestamp, event
+  type and available identity/evidence/outcome; `UNKNOWN` shown explicitly;
+  HTML and user data escaped; output bounded to the Telegram message size with
+  truncation announced. No query language, pagination, or buttons. An empty
+  timeline is reported truthfully.
+- Append-only / size policy: HIGH-9 deletes and rotates nothing automatically;
+  forensic history outranks cleanup; only the timeline output is bounded. No
+  archival/rotation policy without a separate stage.
 
-**Not authorized for current HIGH-7 pass.**
+**Affected code:**
+
+- `core/journal.py` — `PROTECTION_CHANGE` event (not in `TERMINAL_EVENTS`),
+  `position_idx` propagation in `get_position_lifecycles`, canonical
+  normalization helpers, cancel-batch narrowing, `get_trade_timeline()`.
+- `app/jobs.py` — `_journal_protection_change()` audit of real Auto-BE / Risk
+  Cut SL moves; `_fetch_fill_evidence()` proves the `position_idx` of the
+  identifier-matched row; `_reconcile_missing_position()` preserves lifecycle
+  identifiers.
+- `handlers/timeline.py` — NEW, `/timeline` command and message rendering.
+- `handlers/__init__.py`, `main.py` — registration of `timeline_command`.
+- `tests/test_high9_trade_audit.py` — 20 focused tests.
+- `tests/test_main_prod_sync.py` — `/timeline` registration only.
+
+**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
 
 ### HIGH-10 — Telegram transport observability (not started)
 
@@ -237,8 +297,8 @@ ERROR; dedup works; counters increment; `/health` renders.
 ## Release policy
 
 - The production server is not updated after every HIGH commit. Merging is not deploying.
-- HIGH-4, HIGH-5, and HIGH-6 are batched into one release and reviewed together in a release QA pass.
-- After release QA passes, the Human Operator performs one deployment, then a runtime smoke check, then a period of observation.
+- HIGH-4 through HIGH-10 are batched into one production release and reviewed together in a release QA pass. Until HIGH-10 is complete there is no intermediate deploy.
+- After the joint release QA passes, the Human Operator performs one deployment, then a runtime smoke check, then a period of observation.
 - The Architect sets the order of commit, merge, release QA, deploy, and runtime verification; no agent verdict authorises any of them.
 
 ## MID

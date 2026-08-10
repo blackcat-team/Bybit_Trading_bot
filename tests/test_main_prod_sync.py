@@ -245,6 +245,7 @@ def runtime():
             "on_startup_check",
             "status_command",
             "handle_protection_input",
+            "timeline_command",
         )
     }
     jobs = {
@@ -558,6 +559,7 @@ def test_runtime_preserves_handlers_and_background_job_schedules(runtime):
         "note",
         "risk",
         "status",
+        "timeline",
     ]
     assert sum(h.kind == "CallbackQueryHandler" for h in runtime.app.handlers) == 1
 

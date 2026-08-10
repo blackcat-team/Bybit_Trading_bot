@@ -38,11 +38,18 @@ from core.journal import (
     append_event, RECONCILED, POSITION_CONFIRMED,
     POSITION_NOT_FOUND_ON_EXCHANGE,
     PENDING, CONFIRMED,
+    PROTECTION_CHANGE,
+    PROTECTION_SOURCE_AUTO_BE,
+    PROTECTION_SOURCE_RISK_CUT,
     get_position_lifecycles,
     normalize_symbol,
     check_and_quarantine_sources,
     get_disabled_sources,
 )
+# Строгий разбор positionIdx и канонический write_outcome берутся из общего
+# контракта доказательств (HIGH-6): идентичность позиции в журнале обязана
+# совпадать с тем, что читатель timeline считает доказанным.
+from core.write_verify import WRITE_ACCEPTED, read_position_idx
 from core.utils import safe_float
 from handlers.ui import (
     format_action,
@@ -229,6 +236,69 @@ async def _set_auto_be_stop(symbol: str, target_sl: float) -> tuple[bool, bool]:
     return True, True
 
 
+# Канонический источник автоматического сдвига стопа для audit-записи.
+# Ключи — те же action_tag, что уже показываются оператору.
+_PROTECTION_SOURCES = {
+    "AUTO-BE (2R)": PROTECTION_SOURCE_AUTO_BE,
+    "Risk Cut (-0.3R)": PROTECTION_SOURCE_RISK_CUT,
+}
+
+
+def _exchange_level_repr(raw, parsed: float):
+    """Уровень защиты для audit-записи: сырое значение биржи, если оно есть.
+
+    Строка биржи сохраняет точность низкоценовых инструментов лучше, чем
+    float после разбора, поэтому она предпочтительнее. Разобранное значение
+    используется только как fallback.
+    """
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return parsed
+
+
+async def _journal_protection_change(
+    row: dict, action_tag: str, stop_before: float, stop_requested: float
+) -> None:
+    """Durable audit реального автоматического сдвига SL (Auto-BE / Risk Cut).
+
+    Событие lifecycle-neutral: оно не входит в TERMINAL_EVENTS, не подтверждает
+    и не закрывает позицию, а только фиксирует факт записи защиты.
+
+    stop_loss_before берётся из authoritative position row, stop_loss_requested —
+    это ровно то значение, которое было отправлено на биржу. stop_loss_after не
+    записывается: без отдельного authoritative readback он не факт, а readback
+    здесь не выполняется, потому что повторять set_trading_stop нельзя.
+
+    Сбой записи только логируется: аудит не повторяет запись на биржу и не
+    меняет уже существующее поведение Auto-BE / Risk Cut.
+    """
+    event = {
+        "event": PROTECTION_CHANGE,
+        "symbol": normalize_symbol(row.get("symbol")) or row.get("symbol", ""),
+        "side": row.get("side", ""),
+        "protection_source": _PROTECTION_SOURCES.get(action_tag, action_tag),
+        "stop_loss_before": _exchange_level_repr(row.get("stopLoss"), stop_before),
+        "stop_loss_requested": str(stop_requested),
+        "write_outcome": WRITE_ACCEPTED,
+    }
+    # Идентичность позиции пишется только когда она доказана текущей
+    # authoritative-строкой: выдуманный positionIdx склеил бы разные позиции.
+    position_idx = read_position_idx(row.get("positionIdx"))
+    if position_idx is not None:
+        event["position_idx"] = position_idx
+
+    try:
+        written = await asyncio.to_thread(append_event, event)
+    except Exception as exc:
+        logging.error("Auto-BE: audit PROTECTION_CHANGE не записан: %s", exc)
+        return
+    if not written:
+        logging.error(
+            "Auto-BE: audit PROTECTION_CHANGE не записан для %s (source=%s)",
+            event["symbol"], event["protection_source"],
+        )
+
+
 # --- 1. Heartbeat (Проверка пульса) ---
 async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
     """Пишет аптайм и текущий PnL по всем позам."""
@@ -349,6 +419,9 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
                     if not changed:
                         continue
                     logging.info(f"♻️ {action_tag}: {sym} SL moved to {new_sl}")
+                    # Durable audit доказанного изменения защиты — до
+                    # уведомления: сбой Telegram не должен стирать след записи.
+                    await _journal_protection_change(p, action_tag, current_sl, new_sl)
                     await context.bot.send_message(
                         chat_id=ALLOWED_ID,
                         text=(
@@ -647,12 +720,19 @@ def _lifecycle_order_ids(info: dict) -> tuple[str, str]:
     return _clean(info.get("order_id")), _clean(info.get("order_link_id"))
 
 
-async def _fetch_fill_evidence(sym: str, order_id: str, order_link_id: str) -> Decimal:
-    """Возвращает доказанный исполненный объём именно этого ордера.
+async def _fetch_fill_evidence(
+    sym: str, order_id: str, order_link_id: str
+) -> tuple[Decimal, int | None]:
+    """Возвращает доказанный исполненный объём именно этого ордера и его positionIdx.
 
     Read-only запрос get_order_history по точному orderId/orderLinkId.
     Ответ проходит тот же строгий контракт, что и снимок позиций. Доказательством
     считается только строка с точным совпадением идентификатора и cumExecQty > 0.
+
+    Вторым элементом возвращается positionIdx из той же самой точно совпавшей
+    строки, если он там доказан, иначе None. Отдельного запроса ради него не
+    делается, и он никогда не додумывается: неизвестный positionIdx обязан
+    остаться неизвестным, иначе разные позиции одного символа склеятся.
 
     Поднимает _SnapshotUnknown при timeout/exception, malformed ответе,
     невалидном retCode, отсутствии ордера, несовпадении идентификатора и
@@ -693,11 +773,14 @@ async def _fetch_fill_evidence(sym: str, order_id: str, order_link_id: str) -> D
             raise _SnapshotUnknown(
                 f"get_order_history: у ордера {order_id or order_link_id} нет cumExecQty"
             )
-        return _parse_decimal_qty(
+        exec_qty = _parse_decimal_qty(
             row.get("cumExecQty"),
             f"get_order_history cumExecQty {sym}",
             allow_zero=True,
         )
+        # Malformed positionIdx не делает исполнение недоказанным: контракт
+        # подтверждения от него не зависит, поэтому он просто остаётся None.
+        return exec_qty, read_position_idx(row.get("positionIdx"))
 
     raise _SnapshotUnknown(
         f"get_order_history: ордер {order_id or order_link_id} по {sym} не найден"
@@ -717,6 +800,10 @@ async def _confirm_position(sym: str, info: dict) -> None:
     negative предпочтительнее ложного ownership. POSITION_CONFIRMED пишется
     только отсюда, никогда placement-хендлерами, и не содержит PnL, цены
     выхода или причины закрытия.
+
+    Доказанный positionIdx из той же самой fill evidence сохраняется в событии
+    как канонический идентификатор позиции. Недоказанный не записывается вовсе:
+    контракт подтверждения от него не зависит и не ослабляется.
     """
     order_id, order_link_id = _lifecycle_order_ids(info)
     if not order_id and not order_link_id:
@@ -728,7 +815,9 @@ async def _confirm_position(sym: str, info: dict) -> None:
         return
 
     try:
-        exec_qty = await _fetch_fill_evidence(sym, order_id, order_link_id)
+        exec_qty, position_idx = await _fetch_fill_evidence(
+            sym, order_id, order_link_id
+        )
     except _SnapshotUnknown as unknown:
         # Проблема order evidence не превращается в close/reconciliation.
         logging.warning(
@@ -756,6 +845,8 @@ async def _confirm_position(sym: str, info: dict) -> None:
         event["order_id"] = order_id
     if order_link_id:
         event["order_link_id"] = order_link_id
+    if position_idx is not None:
+        event["position_idx"] = position_idx
 
     written = await asyncio.to_thread(append_event, event)
     if not written:
@@ -783,6 +874,12 @@ async def _reconcile_missing_position(
 
     Durable-запись выполняется до уведомления: сбой Telegram не возвращает
     позицию в active state и не вызывает повторную сверку.
+
+    Аддитивно сохраняются durable-идентификаторы именно этого подтверждённого
+    lifecycle (orderId, orderLinkId, positionIdx, entry_event_ts), чтобы
+    терминальное событие можно было связать со своим входом, а не с любым
+    прошлым lifecycle того же символа. Недоказанный идентификатор не пишется:
+    терминальная семантика RECONCILED от него не зависит и не меняется.
     """
     tracked_side = info.get("side", "")
     event = {
@@ -794,6 +891,15 @@ async def _reconcile_missing_position(
         "reason": POSITION_NOT_FOUND_ON_EXCHANGE,
         "entry_event_ts": info.get("entry_event_ts", 0.0),
     }
+
+    order_id, order_link_id = _lifecycle_order_ids(info)
+    if order_id:
+        event["order_id"] = order_id
+    if order_link_id:
+        event["order_link_id"] = order_link_id
+    position_idx = read_position_idx(info.get("position_idx"))
+    if position_idx is not None:
+        event["position_idx"] = position_idx
 
     written = await asyncio.to_thread(append_event, event)
     if not written:

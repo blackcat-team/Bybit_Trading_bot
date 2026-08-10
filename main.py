@@ -20,7 +20,7 @@ from handlers import (
     start_trading, stop_trading, check_positions,
     send_report, add_note_handler, button_handler,
     parse_and_trade, set_risk_command, view_orders, on_startup_check,
-    status_command, handle_protection_input,
+    status_command, handle_protection_input, timeline_command,
 )
 from app.jobs import (
     daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job,
@@ -154,6 +154,8 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("note", add_note_handler))
     app.add_handler(CommandHandler("risk", set_risk_command))
     app.add_handler(CommandHandler("status", status_command))
+    # /timeline SYMBOL — read-only хронология из локального журнала, без Bybit.
+    app.add_handler(CommandHandler("timeline", timeline_command))
 
     app.add_handler(CallbackQueryHandler(button_handler))
     # Группа -1: перехватывает текст только когда ожидается значение SL/TP из /pos.

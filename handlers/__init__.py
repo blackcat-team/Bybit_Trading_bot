@@ -22,6 +22,8 @@ from .reporting import send_report
 
 from .startup import on_startup_check
 
+from .timeline import timeline_command
+
 from .preflight import (
     _safe_float, get_available_usd, floor_qty,
     validate_qty, clip_qty,
