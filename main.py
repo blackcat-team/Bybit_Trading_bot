@@ -29,6 +29,7 @@ from app.jobs import (
     heartbeat_job, time_management_job,
     reconcile_journal_job, weekly_source_report_job,
     register_protection_watchdog,
+    register_exit_binding,
     _next_monday_9utc_secs,
 )
 from core.notifier import configure_alerts
@@ -252,6 +253,11 @@ if __name__ == '__main__':
     # 9. Watchdog защиты открытых позиций (только наблюдение, без записей)
     #    Регистрируется лишь при WATCHDOG_ENABLED; период — WATCHDOG_INTERVAL_SEC.
     register_protection_watchdog(jq)
+
+    # 10. Связывание защитного ордера выхода с риском своего входа.
+    #     Только чтение биржи и append-only журнал; работает независимо от
+    #     /start /stop, потому что связь обязана появиться до срабатывания SL/TP.
+    register_exit_binding(jq)
 
     print("✅ Background jobs started...")
 

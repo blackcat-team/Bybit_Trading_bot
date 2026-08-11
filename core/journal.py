@@ -27,6 +27,12 @@
                       записи как факт биржи не утверждается: без authoritative-
                       чтения запрошенный уровень остаётся именно запросом.
                       Lifecycle не меняет и терминальным не является.
+  EXIT_ORDER_BOUND  — durable-связь точного защитного ордера выхода (SL или TP)
+                      с доказанным planned_risk_usdt конкретного входа бота.
+                      Пишется ДО закрытия позиции по authoritative-снимкам
+                      get_positions и get_open_orders, потому что после закрытия
+                      связи между closed-PnL orderId и входом уже нет.
+                      Lifecycle не меняет и терминальным не является.
 
 Чтение хронологии по инструменту — get_trade_timeline(): read-only, порядок
 физических строк JSONL, недоказанное evidence отображается как UNKNOWN.
@@ -44,6 +50,12 @@ read-only просмотр trade_journal.jsonl, дающий ``{(symbol, order_i
 строка, не-dict JSON, оборванная строка, ошибка чтения, malformed-поле в
 событии, необходимом для решения) делает ВЕСЬ результат недоказанным и
 возвращает {}.
+
+Кандидаты на связывание выхода — get_exit_binding_candidates(): такой же
+строгий scan, но требующий полного плана сделки (точный order_id, side, qty,
+положительный planned_risk_usdt). Доказанный риск выхода —
+get_exit_order_risk_evidence(): ``{(symbol, exit_order_id): risk_usdt}`` только
+из EXIT_ORDER_BOUND, с fail-closed исключением противоречивых ключей.
 
 Статистика источников рассчитывается из событий CLOSED по запросу.
 Автокарантин отключает источник для новых сигналов при превышении порогов.
@@ -93,6 +105,20 @@ ORDER_CANCEL_BATCH = "ORDER_CANCEL_BATCH"
 # доказательства записи защиты: позицию оно не открывает и не закрывает,
 # в TERMINAL_EVENTS не входит и в get_position_lifecycles не обрабатывается.
 PROTECTION_CHANGE  = "PROTECTION_CHANGE"
+# Durable-связь точного защитного ордера выхода с доказанным риском входа.
+# Как и предыдущие аудиторские события, позицию не открывает и не закрывает,
+# в TERMINAL_EVENTS не входит и в get_position_lifecycles не обрабатывается:
+# это только evidence о том, какой ордер биржи закроет уже открытую позицию.
+EXIT_ORDER_BOUND   = "EXIT_ORDER_BOUND"
+
+# Канонические виды защитного ордера выхода (поле exit_kind).
+EXIT_KIND_SL = "sl"
+EXIT_KIND_TP = "tp"
+
+# Единственный допустимый источник доказательства защитного ордера: точный
+# снимок открытых ордеров биржи. Post-close реконструкция источником не
+# является и в binding_source появиться не может.
+EXIT_BINDING_SOURCE_OPEN_ORDERS = "get_open_orders"
 
 # Источники автоматического изменения защиты (канонические значения поля
 # protection_source события PROTECTION_CHANGE).
@@ -556,6 +582,158 @@ def get_bot_entry_identities() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Кандидаты на связывание защитного выхода (строгий read-only scan)
+# ---------------------------------------------------------------------------
+
+def _iter_strict_events():
+    """Построчный строгий разбор журнала: ``(event_type, event)``.
+
+    Отличается от tolerant-чтения :func:`read_events` направлением ошибки:
+    пропущенная строка здесь способна не убрать доказательство, а исказить
+    вывод (оставить кандидатом старый вход, скрыть противоречие evidence),
+    поэтому ЛЮБАЯ аномалия — невалидный JSON, JSON-значение не объект, пустая
+    или не терминированная ``\\n`` (оборванная) строка, событие без
+    доказанного типа — поднимает :class:`_OwnershipUnproven`. Отсутствие файла
+    аномалией не является: доказательств нет, но и журнал не повреждён.
+    """
+    if not JOURNAL_FILE.exists():
+        return
+    # newline="" отключает universal newlines: единственная строка без
+    # завершающего "\n" — это физически оборванный конец файла.
+    with open(JOURNAL_FILE, "r", encoding="utf-8", newline="") as f:
+        for raw_line in f:
+            if not raw_line.endswith("\n"):
+                raise _OwnershipUnproven("последняя строка не терминирована")
+            line = raw_line.strip()
+            if not line:
+                raise _OwnershipUnproven("пустая строка")
+            try:
+                ev = json.loads(line)
+            except ValueError as exc:
+                raise _OwnershipUnproven(f"невалидный JSON: {exc}") from exc
+            if not isinstance(ev, dict):
+                raise _OwnershipUnproven("JSON-значение не является объектом")
+            event_type = _ownership_text(ev, "event")
+            if not event_type:
+                raise _OwnershipUnproven("событие без доказанного типа")
+            yield event_type, ev
+
+
+def _strict_journal_events(event_type: str) -> list:
+    """Строгий read-only список событий одного типа (см. :func:`_iter_strict_events`)."""
+    return [ev for actual, ev in _iter_strict_events() if actual == event_type]
+
+
+def _proven_positive_amount(raw):
+    """Доказанное положительное конечное количество (qty) либо None.
+
+    Тот же доказательный контракт, что и у :func:`_proven_risk_usdt`: bool,
+    None, пустая строка, ``—``, NaN, Infinity и нечисловое значение
+    доказательством не являются. Количество входа нужно для сверки с
+    исполненным объёмом: без него нельзя доказать, что позиция на бирже —
+    это именно этот вход.
+    """
+    return _proven_risk_usdt(raw)
+
+
+def get_exit_binding_candidates() -> dict:
+    """
+    Полные планы входов бота, пригодные для связывания защитного выхода.
+
+    Возвращает ``{symbol: {"order_id": str, "order_link_id": str, "side": str,
+    "qty": float, "planned_risk_usdt": float}}`` для каждого символа, у
+    которого есть ENTRY_PLACED с полным доказанным планом: точный ``order_id``,
+    доказанная сторона, конечное положительное ``qty`` и конечный
+    положительный ``planned_risk_usdt``. ``order_link_id`` сохраняется как
+    дополнительное evidence, если доказан.
+
+    В отличие от владения (:func:`get_bot_entry_identities`) терминальные
+    события пару (symbol, order_id) здесь не снимают: связывание всё равно
+    возможно только против реально существующей позиции, а кандидатом символа
+    остаётся последний ENTRY_PLACED. Этот же факт делает пропуск строки
+    недопустимым: новый ENTRY_PLACED, пропущенный из-за повреждения журнала,
+    оставил бы кандидатом предыдущий вход и позволил бы приписать его риск
+    чужой позиции. Поэтому любая аномалия журнала (см.
+    :func:`_iter_strict_events`), а также ENTRY_PLACED с точным ``order_id``,
+    но без доказанной стороны, количества или риска, делает весь результат
+    недоказанным и возвращает {}. Частичный префикс не возвращается никогда.
+
+    Журнал только читается: не переписывается, не исправляется и не
+    мигрируется. Пригодность кандидата к конкретному снимку биржи решает
+    вызывающий код по точной идентичности (symbol, side, positionIdx, size,
+    avgPrice) — журнал её не заменяет.
+    """
+    candidates: dict = {}
+    try:
+        for event_type, ev in _iter_strict_events():
+            if event_type != ENTRY_PLACED:
+                continue
+            symbol, order_id, order_link_id = _ownership_identity(ev)
+            if not symbol or not order_id:
+                # Старый вход без точного order_id план не доказывает, но
+                # порчей журнала не является.
+                continue
+            side = _ownership_text(ev, "side")
+            if not side:
+                raise _OwnershipUnproven(
+                    f"ENTRY_PLACED {symbol} без доказанной стороны"
+                )
+            qty = _proven_positive_amount(ev.get("qty"))
+            if qty is None:
+                raise _OwnershipUnproven(
+                    f"ENTRY_PLACED {symbol} без доказанного количества"
+                )
+            risk = _proven_risk_usdt(ev.get("planned_risk_usdt"))
+            if risk is None:
+                raise _OwnershipUnproven(
+                    f"ENTRY_PLACED {symbol} без доказанного риска"
+                )
+            candidates[symbol] = {
+                "order_id": order_id,
+                "order_link_id": order_link_id,
+                "side": side,
+                "qty": qty,
+                "planned_risk_usdt": risk,
+            }
+    except _OwnershipUnproven as exc:
+        logging.warning(
+            "journal binding scan: кандидаты не доказаны (%s) — карта пуста", exc
+        )
+        return {}
+    except Exception as exc:
+        logging.error("journal binding scan failed: %s", exc)
+        return {}
+
+    return candidates
+
+
+def get_exit_binding_events() -> list | None:
+    """
+    Строгий список уже записанных ``EXIT_ORDER_BOUND`` либо ``None``.
+
+    Нужен наблюдателю для дедупликации: связь, уже сохранённую durable, второй
+    раз писать незачем. ``None`` означает «журнал не доказан» и обязано
+    трактоваться fail-closed — не как «связей ещё нет». Пропуск повреждённой
+    строки здесь недопустим: пропущенная запись выглядела бы отсутствующей и
+    наблюдатель дописывал бы дубликат каждые 30 секунд.
+
+    Журнал только читается: не исправляется и не мигрируется.
+    """
+    try:
+        return _strict_journal_events(EXIT_ORDER_BOUND)
+    except _OwnershipUnproven as exc:
+        logging.warning(
+            "journal exit binding events: журнал не доказан (%s) — связывание "
+            "пропущено",
+            exc,
+        )
+        return None
+    except Exception as exc:
+        logging.error("journal exit binding events failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Доказанный риск конкретного входа (исторический R отчёта)
 # ---------------------------------------------------------------------------
 
@@ -654,60 +832,71 @@ def get_entry_risk_evidence(events: list | None = None) -> dict:
     return evidence
 
 
-def get_entry_link_risk_evidence(events: list | None = None) -> dict:
+def get_exit_order_risk_evidence(events: list | None = None) -> dict:
     """
-    Доказанный риск входов бота по link-идентичности: ``{(symbol, order_link_id):
-    risk_usdt}``.
+    Доказанный риск защитных ордеров выхода: ``{(symbol, exit_order_id): risk_usdt}``.
 
-    Тот же доказательный контракт, что и у :func:`get_entry_risk_evidence`, но
-    ключом является точная пара ``(symbol, order_link_id)``. Она нужна там, где
-    позицию закрыл не сам ордер входа, а его дочерний защитный ордер: биржа
-    связывает такой ордер с родителем именно через ``orderLinkId``, и это
-    единственная authoritative-связь, доступная без догадок. Символ входит в ключ
-    обязательно: один и тот же ``orderLinkId`` на другом инструменте той же
-    сделкой не является.
+    Единица — точная пара ``(symbol, exit_order_id)``: closed-PnL строка с
+    точным ``orderId`` получает риск только когда в журнале есть
+    ``EXIT_ORDER_BOUND`` с точно таким же символом и точно таким же
+    ``exit_order_id``. Корреляция по символу, времени, цене, количеству или
+    текущему глобальному риску здесь запрещена. Запись появляется только из
+    ``EXIT_ORDER_BOUND`` с доказанным символом, доказанным непустым строковым
+    ``exit_order_id`` и доказанным положительным ``planned_risk_usdt``.
+    ``exit_kind`` на evidence не влияет: закрыл позицию SL или TP — риск входа
+    тот же, и именно он остаётся знаменателем.
 
-    Запись появляется только из ``ENTRY_PLACED`` с доказанным символом,
-    доказанным непустым строковым ``order_link_id`` и доказанным положительным
-    ``planned_risk_usdt``. Старое событие без ``order_link_id`` evidence не
-    создаёт и остаётся legacy-сделкой без R — это правда, а не потеря данных.
+    Повтор ключа fail-closed: если один и тот же ``(symbol, exit_order_id)``
+    соответствует РАЗНЫМ доказанным значениям риска, evidence противоречиво, и
+    ключ убирается целиком. Выбор «последнего», «наибольшего» или «первого» из
+    противоречивых значений был бы догадкой о том, к какой сделке относится
+    знаменатель. Повтор одного и того же значения противоречием не является.
 
-    В отличие от ``order_id`` повтор ключа здесь fail-closed: если один и тот же
-    ``(symbol, order_link_id)`` соответствует РАЗНЫМ доказанным значениям риска,
-    evidence противоречиво, и ключ убирается целиком. Выбор «последнего» или
-    «наибольшего» из противоречивых значений был бы догадкой о том, к какой
-    сделке относится знаменатель. Повтор одного и того же значения
-    противоречием не является.
+    Чтение строгое, а не tolerant как в :func:`get_entry_risk_evidence`: именно
+    правило противоречия делает пропуск строки опасным. Пропущенная вторая,
+    противоречивая запись оставила бы ключ в карте с одним значением, и
+    недоказанный знаменатель стал бы «доказанным». Поэтому любая аномалия
+    (ошибка открытия или чтения, невалидный JSON, JSON-значение не объект,
+    пустая или оборванная строка) делает всю карту недоказанной и возвращает
+    {}: частичная authoritative-карта исторического R не выдаётся никогда.
 
-    Чтение read-only и tolerant (:func:`read_events`) по той же причине, что и в
-    :func:`get_entry_risk_evidence`: пропуск повреждённой строки способен только
-    убрать доказательство и превратить R в UNKNOWN, но не подставить чужой
-    знаменатель, потому что ключом остаётся точный идентификатор ордера.
-    Журнал не исправляется, не мигрируется и не достраивается.
+    Готовый список событий (*events*) читается как есть — источником доказанности
+    в этом случае является вызывающий код. Журнал только читается: не
+    исправляется, не мигрируется и не достраивается.
     """
     if events is None:
-        events = read_events(event_type=ENTRY_PLACED)
+        try:
+            events = _strict_journal_events(EXIT_ORDER_BOUND)
+        except _OwnershipUnproven as exc:
+            logging.warning(
+                "journal exit risk evidence: журнал не доказан (%s) — карта пуста",
+                exc,
+            )
+            return {}
+        except Exception as exc:
+            logging.error("journal exit risk evidence failed: %s", exc)
+            return {}
 
     evidence: dict = {}
     conflicting: set = set()
     for ev in events:
         if not isinstance(ev, dict):
             continue
-        if ev.get("event") != ENTRY_PLACED:
+        if ev.get("event") != EXIT_ORDER_BOUND:
             continue
         symbol = normalize_symbol(ev.get("symbol"))
         if not symbol:
             continue
-        raw_link_id = ev.get("order_link_id")
-        if not isinstance(raw_link_id, str):
+        raw_exit_id = ev.get("exit_order_id")
+        if not isinstance(raw_exit_id, str):
             continue
-        link_id = raw_link_id.strip()
-        if not link_id:
+        exit_order_id = raw_exit_id.strip()
+        if not exit_order_id:
             continue
         risk = _proven_risk_usdt(ev.get("planned_risk_usdt"))
         if risk is None:
             continue
-        key = (symbol, link_id)
+        key = (symbol, exit_order_id)
         if key in conflicting:
             continue
         known = evidence.get(key)
@@ -985,6 +1174,28 @@ def _timeline_cancel_batch(ev: dict, entry: dict, symbol: str) -> None:
     }
 
 
+def _timeline_exit_order_bound(ev: dict, entry: dict) -> None:
+    """Durable-связь защитного ордера выхода с доказанным риском входа.
+
+    Оператор должен видеть минимум, заданный контрактом: вид выхода (sl/tp),
+    точный exit_order_id, точный входной order_id, positionIdx, доказанный
+    риск, trigger-цену и источник доказательства. Поля, которые событие не
+    доказало, печатаются как UNKNOWN — подстановка «ближайшего» значения здесь
+    запрещена.
+    """
+    entry["details"] = {
+        "exit_kind": _text_or_unknown(ev.get("exit_kind")),
+        "exit_order_id": _text_or_unknown(ev.get("exit_order_id")),
+        "entry_order_id": _text_or_unknown(ev.get("entry_order_id")),
+        "entry_order_link_id": _text_or_unknown(ev.get("entry_order_link_id")),
+        "side": _text_or_unknown(ev.get("side")),
+        "position_idx": _idx_or_unknown(ev.get("position_idx")),
+        "planned_risk_usdt": _number_or_unknown(ev.get("planned_risk_usdt")),
+        "trigger_price": _number_or_unknown(ev.get("trigger_price")),
+        "binding_source": _text_or_unknown(ev.get("binding_source")),
+    }
+
+
 def _timeline_generic(ev: dict, entry: dict) -> None:
     """Прочие события символа (FAIL и legacy-типы) — минимальное общее evidence."""
     entry["details"] = {
@@ -1080,15 +1291,19 @@ def get_trade_timeline(symbol, limit: int = TIMELINE_DEFAULT_LIMIT) -> list:
             _timeline_protection_write(ev, entry)
         elif event_type == PROTECTION_CHANGE:
             _timeline_protection_change(ev, entry)
+        elif event_type == EXIT_ORDER_BOUND:
+            _timeline_exit_order_bound(ev, entry)
         elif event_type == ORDER_CANCEL_BATCH:
             _timeline_cancel_batch(ev, entry, normalized)
         else:
             _timeline_generic(ev, entry)
 
         # Точные идентификаторы ордера доступны у большинства событий и
-        # выводятся единообразно; у ORDER_CANCEL_BATCH их нет — там единицей
-        # является пара SYMBOL:orderId.
-        if event_type != ORDER_CANCEL_BATCH:
+        # выводятся единообразно. Исключения: у ORDER_CANCEL_BATCH их нет —
+        # там единицей является пара SYMBOL:orderId, а у EXIT_ORDER_BOUND
+        # точных идентификаторов два (входной и защитный), и оба уже
+        # напечатаны своими именами.
+        if event_type not in (ORDER_CANCEL_BATCH, EXIT_ORDER_BOUND):
             details = entry["details"]
             details.setdefault(
                 "order_id",

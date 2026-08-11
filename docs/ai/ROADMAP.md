@@ -556,7 +556,7 @@ is reported, not touched.
 **Status:** production verified — R no longer follows the current `/risk`. The
 residual coverage gap above is taken over by LIVE-FIX3.
 
-### LIVE-FIX3 — historical R correlation through exact Bybit close-order ancestry (active, READY FOR QA)
+### LIVE-FIX3 — historical R correlation through exact Bybit close-order ancestry (superseded by LIVE-FIX4)
 
 **Production evidence:** after LIVE-FIX2 the displayed R stopped following the
 current `/risk`, but proven coverage stayed at 0%. Even fresh production-test
@@ -630,12 +630,149 @@ not touched.
 - `tests/test_report_historical_r.py` — LIVE-FIX3 tests added next to the
   LIVE-FIX2 ones, which stay GREEN.
 
+**Status:** superseded by LIVE-FIX4. The ancestry hypothesis was deployed and
+then disproven in production: the bot's own protective children report
+`orderLinkId = ""` and `parentOrderLinkId = ""`, so the second path was
+fail-closed but resolved nothing. Its runtime — the monthly Order History sweep,
+`close_parents`, and `get_entry_link_risk_evidence()` — was removed by LIVE-FIX4.
+Only the ancestry path was removed; the LIVE-FIX2 direct path is untouched.
+
+### LIVE-FIX4 — durable protective exit-order → historical risk binding (active, READY FOR QA)
+
+**Production evidence:** the LIVE-FIX3 chain `closed-PnL orderId` → Order History
+`parentOrderLinkId` → `ENTRY_PLACED order_link_id` → `planned_risk_usdt` gave zero
+coverage on the bot's actual TP/SL contour. Three real ETHUSDT closures —
+`2bab3015-165a-41f6-bf58-472d02b8c4e1` (`stopOrderType=StopLoss`,
+`createType=CreateByStopLoss`), `bbc8b733-8c19-452f-b6c7-db2b0ff0fe24`
+(`TakeProfit` / `CreateByTakeProfit`) and
+`830f175d-5e4a-403a-a8d6-eef3a902e0a9` (`StopLoss` / `CreateByStopLoss`) — all
+carry `reduceOnly=True`, `closeOnTrigger=True`, `orderLinkId=""` and
+`parentOrderLinkId=""`.
+
+**Root cause confirmed from the API contract:** for position-attached TP/SL Bybit
+V5 does not expose the parent link on the child order at all. After the exit has
+executed there is nothing left on the exchange that ties a closed-PnL row to the
+entry that defined the risk, so *no* post-close reconstruction can work — not
+ancestry, and not any correlation by symbol, time, price, size, side or
+proximity. The denominator of the historical R must therefore be persisted
+*before* the exit fires, while the protective order is still visible in open
+orders.
+
+**Solution implemented (READY FOR QA):**
+
+- A new lifecycle-neutral journal event `EXIT_ORDER_BOUND` durably stores the
+  exact protective `exit_order_id` together with the `planned_risk_usdt` proven
+  for that specific entry, plus `symbol`, `side`, `position_idx`,
+  `entry_order_id`, `entry_order_link_id` (only when proven), `exit_kind`
+  (`sl`/`tp`), `trigger_price` and `binding_source = get_open_orders`. It never
+  opens, confirms or closes a lifecycle, so `get_position_lifecycles()`,
+  ownership, reconciliation and recovery see no new state.
+- A read-only observer `exit_binding_job` (first run ≈10 s, interval 30 s) writes
+  those bindings while the position is still open. It reads only
+  `get_positions`, `get_open_orders` and one exact `get_order_history` per
+  selected entry, and appends to the journal. It places no order, changes no
+  SL/TP, cancels nothing, closes nothing, changes neither risk nor trading state,
+  and runs independently of `/start` `/stop`: stopping new entries must not
+  strip an already open position of the proof of its own risk.
+- One shared positions snapshot and one shared open-orders snapshot serve the
+  whole cycle. Candidates are narrowed by both snapshots before any per-entry
+  request, so there is no N+1 open-orders traffic.
+- The risk never comes from the current global `/risk` or from
+  `get_risk_for_symbol()`. It comes from the durable `ENTRY_PLACED` of that exact
+  entry, through a new strict read-only helper `get_exit_binding_candidates()`.
+  Symbol-only `get_position_lifecycles()` is deliberately not used as ownership
+  proof for binding.
+- Candidate reading is strict, not tolerant: any journal anomaly (invalid JSON, a
+  non-object line, an empty line, an unterminated final line, an event without a
+  proven type) and any `ENTRY_PLACED` that has an exact `order_id` but no proven
+  side, qty or finite positive risk make the whole result fail-closed `{}`. Here a
+  skipped line could not merely remove evidence — it would leave the *previous*
+  entry as the candidate and attach its risk to a foreign position.
+- Identity is proven in three independent parts before anything is written: the
+  entry fill by an exact `get_order_history` lookup on that `orderId` (matching
+  `symbol`, exact `orderId`, finite `cumExecQty > 0`, proven `positionIdx`,
+  finite `avgPrice > 0`); the current position by exact `symbol`, `side`,
+  `positionIdx`, finite `size > 0`, `avgPrice` equal to the authoritative fill
+  price and `size` equal to the proven executed volume; and the protective order
+  itself.
+- A protective order qualifies only on strict evidence: exact same `symbol` and
+  `positionIdx`, the side that closes the position, `reduceOnly == true`,
+  `closeOnTrigger == true`, `stopOrderType` exactly `StopLoss` or `TakeProfit`, a
+  non-empty exact `orderId`, and a `triggerPrice` equal to the proven
+  `position.stopLoss` / `position.takeProfit`. A manual ordinary Limit, an entry
+  order, an unknown or malformed `stopOrderType`, a `Stop` without a proven kind,
+  another symbol/side/`positionIdx`, and more than one matching row of one kind
+  are all UNKNOWN, and UNKNOWN means no binding.
+- Proven full SL and proven full TP bind independently to the same planned risk of
+  the same confirmed entry: either of them can be the order that closes it.
+- Repeated cycles do not spam the journal: an exact binding already durable with
+  the same identity and risk is not appended again. When Bybit creates a *new*
+  protective `orderId` after an SL/TP change, the next cycle stores the new exact
+  id; the journal is append-only, so the previous binding is kept, not deleted.
+- `get_exit_order_risk_evidence()` returns `{(symbol, exit_order_id): risk}` built
+  only from `EXIT_ORDER_BOUND`. The symbol is part of the key, so the same exit id
+  on another symbol is not a match; one exact key ever bound to two different
+  proven risks is fail-closed and removed entirely — never last, highest or
+  first. A journal read anomaly yields `{}`, never a partial authoritative map.
+- `/report` resolves R by two exact paths only: **A** the existing LIVE-FIX2
+  direct `(symbol, orderId)` → `ENTRY_PLACED (symbol, order_id)`, tried first and
+  unchanged, then **B** `(symbol, orderId)` → `EXIT_ORDER_BOUND
+  (symbol, exit_order_id)`. Neither present means `UNKNOWN`. Telegram and CSV
+  render the same resolved R; PnL, winrate and trade count are unchanged.
+- The LIVE-FIX3 ancestry runtime is gone from `/report`: the monthly bulk Order
+  History sweep, the `close_parents` index, `_fetch_close_order_parents()`,
+  `_validate_history_resp()`, `_index_history_rows()` and
+  `get_entry_link_risk_evidence()` were removed after a repository search showed
+  no other consumers. No fallback re-runs that useless monthly scan.
+- `/timeline` renders `EXIT_ORDER_BOUND` truthfully — exit kind, exit `orderId`,
+  entry `orderId`, `positionIdx`, planned risk, trigger price and binding source —
+  so the operator can prove the binding is durable *before* the real exit.
+
+**Residual risk for the Architect (not fixed here):** coverage starts from the
+first binding written by the observer. Old trades are not restored and legacy
+rows keep reading `UNKNOWN` by design; no journal migration or backfill was made.
+A position closed manually, or closed before the observer's first cycle ever saw
+its protective order, has no binding and stays `UNKNOWN`. The known Closed-PnL
+pagination defect (`result["cursor"]` instead of `result["nextPageCursor"]` in
+`send_report`) is deliberately untouched and is carried by LIVE-FIX5.
+`weekly_source_report_job` in `app/jobs.py` still divides aggregated PnL by the
+current global risk; it is out of this scope, so it stays reported, not touched.
+
+**Affected code:**
+
+- `core/journal.py` — the `EXIT_ORDER_BOUND` event and its constants, the strict
+  readers `get_exit_binding_candidates()`, `get_exit_binding_events()` and
+  `get_exit_order_risk_evidence()`, the timeline renderer;
+  `get_entry_link_risk_evidence()` removed. `get_entry_risk_evidence()`,
+  lifecycle and ownership semantics unchanged.
+- `core/exit_binding.py` — NEW, pure strict binding contract: no network, no I/O,
+  no writes.
+- `app/jobs.py` — `exit_binding_job()`, its helpers and
+  `register_exit_binding()`. Existing jobs unchanged.
+- `main.py` — the observer is registered exactly once, unconditionally.
+- `handlers/reporting.py` — two-path `_historical_risk_usd()`; the ancestry sweep
+  and its validators removed.
+- `tests/test_live4_exit_binding.py` — NEW, focused binding/timeline tests.
+- `tests/test_report_historical_r.py`, `tests/test_main_prod_sync.py` — extended;
+  the LIVE-FIX2 tests stay GREEN.
+
 **Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+
+### LIVE-FIX5 — Closed-PnL pagination continuation token (planned, not started)
+
+**Finding (not fixed):** in `handlers/reporting.py` the closed-PnL page loop
+reads the continuation token from `result["cursor"]`, while Bybit V5 returns it
+as `result["nextPageCursor"]`. A period with more than one page per 7-day chunk
+is therefore under-reported. Deliberately left untouched by LIVE-FIX4 to keep
+that diff narrow; the line and its `_MAX_PAGES` guard are unchanged.
+
+**Status:** planned. Not started, not authorised for bundling into any other
+stage.
 
 ### LIVE acceptance state
 
-- Paused after stage 6. LIVE-FIX3 is the reason for the pause.
-- After LIVE-FIX3 is accepted, acceptance resumes from the remaining stages. The
+- Paused after stage 6. LIVE-FIX4 is the reason for the pause.
+- After LIVE-FIX4 is accepted, acceptance resumes from the remaining stages. The
   stages already passed are not repeated.
 
 ## Release policy

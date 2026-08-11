@@ -268,6 +268,15 @@ def runtime():
         )
     }
     jobs["_next_monday_9utc_secs"] = lambda: 1234
+    # Регистрация наблюдателя связывания фиксируется отдельно: она обязана
+    # произойти ровно один раз и не зависеть от состояния торговли.
+    binding_registrations = []
+
+    def register_exit_binding(job_queue):
+        binding_registrations.append(job_queue)
+
+    register_exit_binding.__name__ = "register_exit_binding"
+    jobs["register_exit_binding"] = register_exit_binding
 
     telegram = _module("telegram")
     telegram.__path__ = []
@@ -352,6 +361,7 @@ def runtime():
             output=stdout.getvalue(),
             requests=requests,
             send_alert=send_alert,
+            binding_registrations=binding_registrations,
         )
     finally:
         for name, previous in saved_modules.items():
@@ -616,3 +626,14 @@ def test_runtime_preserves_handlers_and_background_job_schedules(runtime):
         "on_startup_check": 5,
         "weekly_source_report_job": 1234,
     }
+
+
+def test_exit_binding_observer_registered_once_regardless_of_trading_state(runtime):
+    """Наблюдатель связывания подключается ровно один раз и безусловно.
+
+    Связь защитного ордера с риском обязана появиться до срабатывания SL/TP,
+    поэтому регистрация не зависит ни от /start /stop, ни от какого-либо флага
+    включения: остановка новых входов не должна лишать уже открытую позицию
+    доказательства её собственного риска.
+    """
+    assert runtime.binding_registrations == [runtime.app.job_queue]

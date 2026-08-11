@@ -4,8 +4,9 @@
 Включает: пульс (heartbeat), авто-трейлинг стопа (breakeven),
 очистку устаревших ордеров, утренний отчёт о балансе,
 управление по времени (5/7 дней), сверку журнала сделок,
-еженедельный отчёт по источникам сигналов и alert-only watchdog
-защиты открытых позиций.
+еженедельный отчёт по источникам сигналов, alert-only watchdog
+защиты открытых позиций и read-only наблюдатель, связывающий
+защитный ордер выхода с риском своего входа.
 """
 import asyncio
 import time
@@ -45,11 +46,27 @@ from core.journal import (
     normalize_symbol,
     check_and_quarantine_sources,
     get_disabled_sources,
+    get_exit_binding_candidates,
+    get_exit_binding_events,
 )
 # Строгий разбор positionIdx и канонический write_outcome берутся из общего
 # контракта доказательств (HIGH-6): идентичность позиции в журнале обязана
 # совпадать с тем, что читатель timeline считает доказанным.
-from core.write_verify import WRITE_ACCEPTED, read_position_idx
+from core.write_verify import WRITE_ACCEPTED, read_position_idx, to_positive_decimal
+# Чистый контракт доказательств связывания защитного выхода с риском входа
+# (LIVE-FIX4). Здесь он только применяется к уже полученным снимкам биржи:
+# сетевых вызовов и записи в нём нет.
+from core.exit_binding import (
+    EXIT_KINDS,
+    binding_key,
+    build_binding_event,
+    closing_side,
+    find_protective_exit_order_id,
+    find_proven_position_row,
+    position_protection_level,
+    proven_entry_fill,
+    read_stop_order_kind,
+)
 from core.utils import safe_float
 from handlers.ui import (
     format_action,
@@ -1397,3 +1414,262 @@ def register_protection_watchdog(job_queue) -> bool:
         WATCHDOG_INTERVAL_SEC, WATCHDOG_COOLDOWN_SEC,
     )
     return True
+
+
+# ---------------------------------------------------------------------------
+# Durable-связь защитного ордера выхода с риском входа (read-only observer)
+# ---------------------------------------------------------------------------
+
+# Первый прогон близко к старту: связь обязана быть записана ДО того, как
+# сработает SL или TP, иначе знаменатель R теряется навсегда. Дальше короткий
+# интервал: между изменением защиты и её исполнением может пройти секунды.
+EXIT_BINDING_FIRST_RUN_SEC = 10
+EXIT_BINDING_INTERVAL_SEC = 30
+
+
+def _binding_open_position_symbols(rows) -> set:
+    """Символы снимка позиций с доказанным ненулевым размером."""
+    proven = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = normalize_symbol(row.get("symbol"))
+        if not symbol:
+            continue
+        if to_positive_decimal(row.get("size")) is None:
+            continue
+        proven.add(symbol)
+    return proven
+
+
+def _binding_protected_symbols(rows) -> set:
+    """Символы, у которых в снимке открытых ордеров есть доказанный вид защиты."""
+    proven = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if read_stop_order_kind(row.get("stopOrderType")) is None:
+            continue
+        symbol = normalize_symbol(row.get("symbol"))
+        if symbol:
+            proven.add(symbol)
+    return proven
+
+
+async def _fetch_entry_fill(sym: str, order_id: str):
+    """Authoritative-исполнение точного входного ордера либо ``None``.
+
+    Один read-only ``get_order_history`` по точному ``orderId``. Ответ проходит
+    тот же строгий контракт конверта, что и остальные снимки; классификацию
+    строки делает чистый :func:`core.exit_binding.proven_entry_fill`, поэтому
+    совпадение только по символу или объёму исполнением не считается.
+
+    Поднимает :class:`_SnapshotUnknown` при недоступности вызова или
+    недостоверном конверте: недоказанное исполнение обязано отличаться от
+    доказанного отсутствия связи.
+    """
+    try:
+        resp = await bybit_call(
+            session.get_order_history,
+            category="linear",
+            symbol=sym,
+            orderId=order_id,
+            limit=50,
+        )
+    except Exception as exc:
+        raise _SnapshotUnknown(
+            f"get_order_history недоступен для {sym}: {exc}"
+        ) from None
+
+    rows = _require_result_rows(resp, "get_order_history")
+    return proven_entry_fill(rows, symbol=sym, order_id=order_id)
+
+
+async def _bind_symbol_exits(
+    sym: str, plan: dict, position_rows: list, order_rows: list, known: set
+) -> None:
+    """Записывает доказанные связи защитных выходов одного инструмента.
+
+    Доказательство собирается из трёх независимых частей: план входа из
+    журнала, authoritative-исполнение именно этого ордера и текущая позиция с
+    текущим защитным ордером. Любая недоказанная часть просто прекращает
+    связывание этого символа: несвязанная сделка честнее сделки с чужим
+    знаменателем R.
+
+    Full SL и full TP связываются независимо друг от друга и с одним и тем же
+    риском одного подтверждённого входа: закрыть позицию может любой из них.
+    """
+    entry_order_id = plan.get("order_id", "")
+    fill = await _fetch_entry_fill(sym, entry_order_id)
+    if fill is None:
+        logging.debug("Exit binding: %s пропущен — исполнение входа не доказано", sym)
+        return
+
+    position = find_proven_position_row(
+        position_rows,
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=fill["position_idx"],
+        exec_qty=fill["exec_qty"],
+        avg_price=fill["avg_price"],
+    )
+    if position is None:
+        logging.debug(
+            "Exit binding: %s пропущен — текущая позиция не доказана тем же входом",
+            sym,
+        )
+        return
+
+    closing = closing_side(plan.get("side"))
+    for exit_kind in EXIT_KINDS:
+        level = position_protection_level(position, exit_kind)
+        if level is None:
+            continue
+        exit_order_id = find_protective_exit_order_id(
+            order_rows,
+            symbol=sym,
+            exit_kind=exit_kind,
+            position_idx=fill["position_idx"],
+            closing=closing,
+            level=level,
+        )
+        if not exit_order_id:
+            continue
+
+        event = build_binding_event(
+            symbol=sym,
+            side=plan.get("side"),
+            position_idx=fill["position_idx"],
+            entry_order_id=entry_order_id,
+            entry_order_link_id=plan.get("order_link_id"),
+            exit_order_id=exit_order_id,
+            exit_kind=exit_kind,
+            planned_risk_usdt=plan.get("planned_risk_usdt"),
+            trigger_price=level,
+        )
+        if not event:
+            continue
+
+        key = binding_key(event)
+        if key is None or key in known:
+            # Уже сохранённая связь повторно не пишется: журнал append-only,
+            # и одинаковое событие каждые 30 секунд только зашумило бы аудит.
+            continue
+
+        written = await asyncio.to_thread(append_event, event)
+        if not written:
+            # Незаписанная связь не считается сохранённой: следующий прогон
+            # попробует снова, пока позиция ещё открыта.
+            logging.error(
+                "Exit binding: связь %s %s → %s не записана durable",
+                sym, exit_kind, exit_order_id,
+            )
+            continue
+
+        known.add(key)
+        logging.info(
+            "Exit binding: %s %s → %s связан с риском %s USDT",
+            sym, exit_kind, exit_order_id, event["planned_risk_usdt"],
+        )
+
+
+async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
+    """Периодически связывает защитный ордер выхода с риском своего входа.
+
+    Наблюдатель только читает: get_positions, get_open_orders, точный
+    get_order_history и append-only журнал. Отсюда не размещаются ордера, не
+    меняются SL/TP, не отменяются ордера, не закрываются позиции, не меняется
+    риск и не меняется состояние торговли.
+
+    Работает независимо от is_trading_enabled(): /stop прекращает новые входы,
+    но не сбор доказательств по уже открытой позиции. Связь обязана появиться
+    ДО исполнения защиты — после закрытия биржа не связывает строку closed-PnL
+    с входным ордером (у SL/TP-детей пустые orderLinkId и parentOrderLinkId), и
+    знаменатель исторического R восстановить нечем.
+
+    За цикл выполняется один общий снимок позиций и один общий снимок открытых
+    ордеров на все инструменты; отдельный запрос делается только по точному
+    входному ордеру уже отобранного кандидата. Недоказанный журнал, недоказанный
+    снимок и недоказанная идентичность дают отсутствие связи, а не догадку.
+    """
+    try:
+        candidates = await asyncio.to_thread(get_exit_binding_candidates)
+        if not candidates:
+            return
+
+        try:
+            _pos_resp = await bybit_call(
+                session.get_positions, category="linear", settleCoin="USDT"
+            )
+            position_rows = _require_result_rows(_pos_resp, "get_positions")
+        except _SnapshotUnknown as unknown:
+            logging.warning("Exit binding: снимок позиций недостоверен: %s", unknown)
+            return
+
+        open_symbols = _binding_open_position_symbols(position_rows)
+        pending = [sym for sym in candidates if sym in open_symbols]
+        if not pending:
+            return
+
+        try:
+            _orders_resp = await bybit_call(
+                session.get_open_orders, category="linear", settleCoin="USDT"
+            )
+            order_rows = _require_result_rows(_orders_resp, "get_open_orders")
+        except _SnapshotUnknown as unknown:
+            logging.warning(
+                "Exit binding: снимок открытых ордеров недостоверен: %s", unknown
+            )
+            return
+
+        protected = _binding_protected_symbols(order_rows)
+        pending = [sym for sym in pending if sym in protected]
+        if not pending:
+            return
+
+        recorded = await asyncio.to_thread(get_exit_binding_events)
+        if recorded is None:
+            # Недоказанный журнал не означает «связей ещё нет»: писать поверх
+            # него значило бы плодить дубликаты и портить аудит.
+            return
+        known = {
+            key for key in (binding_key(ev) for ev in recorded) if key is not None
+        }
+
+        for sym in pending:
+            try:
+                await _bind_symbol_exits(
+                    sym, candidates[sym], position_rows, order_rows, known
+                )
+            except _SnapshotUnknown as unknown:
+                # Недоказанное исполнение одного входа не отменяет связывание
+                # остальных инструментов.
+                logging.warning(
+                    "Exit binding: %s пропущен (UNKNOWN order evidence): %s",
+                    sym, unknown,
+                )
+
+    except Exception as e:
+        logging.error("Exit binding job error: %s", e)
+        try:
+            if classify_error(e) != TIMEOUT:  # bybit_call уже отправил алерт для таймаутов
+                await send_alert(
+                    context.bot, ALLOWED_ID, "WARNING", WARNING,
+                    f"Exit binding job error: {str(e)[:100]}",
+                    dedup_key="job_exit_binding_error",
+                )
+        except Exception:
+            pass
+
+
+def register_exit_binding(job_queue) -> None:
+    """Регистрирует наблюдатель связывания защитных выходов ровно один раз."""
+    job_queue.run_repeating(
+        exit_binding_job,
+        interval=EXIT_BINDING_INTERVAL_SEC,
+        first=EXIT_BINDING_FIRST_RUN_SEC,
+    )
+    logging.info(
+        "Exit binding observer включён: интервал %s с, первый прогон через %s с",
+        EXIT_BINDING_INTERVAL_SEC, EXIT_BINDING_FIRST_RUN_SEC,
+    )
