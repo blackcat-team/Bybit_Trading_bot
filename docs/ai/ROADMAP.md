@@ -495,7 +495,7 @@ the classifier does not read it.
 
 **Status:** production verified, done.
 
-### LIVE-FIX2 — historical R in `/report` recomputed from the current risk (active, READY FOR QA)
+### LIVE-FIX2 — historical R in `/report` recomputed from the current risk (production verified)
 
 **Production evidence:** during LIVE acceptance the same closed trades changed
 their displayed R after `/risk` was changed, while their PnL stayed identical. At
@@ -553,12 +553,89 @@ is reported, not touched.
   read-only exact-identity risk evidence. Existing journal semantics unchanged.
 - `tests/test_report_historical_r.py` — NEW, focused LIVE-FIX2 regression tests.
 
+**Status:** production verified — R no longer follows the current `/risk`. The
+residual coverage gap above is taken over by LIVE-FIX3.
+
+### LIVE-FIX3 — historical R correlation through exact Bybit close-order ancestry (active, READY FOR QA)
+
+**Production evidence:** after LIVE-FIX2 the displayed R stopped following the
+current `/risk`, but proven coverage stayed at 0%. Even fresh production-test
+exits read `UNKNOWN`: an ETHUSDT Market SHORT closed by a real SL and an ETHUSDT
+Limit LONG closed by a real TP, although their `ENTRY_PLACED` records carry
+`planned_risk_usdt`, `order_id`, and — for the Limit entry — a proven
+`order_link_id`.
+
+**Root cause confirmed from code and API contract:** Bybit V5 `closed-pnl`
+reports the `orderId` of the order that *closed* the position. For an SL/TP exit
+that is a protective child order, so its id never equals the entry `orderId` and
+the LIVE-FIX2 direct join `(symbol, orderId)` → `ENTRY_PLACED (symbol, order_id)`
+matches nothing. The evidence exists on the exchange, but only one hop away: for
+Futures attached TP/SL the child order carries `parentOrderLinkId` equal to the
+parent entry's `orderLinkId`.
+
+**Solution implemented (READY FOR QA):**
+
+- A second exact path was added next to the existing direct one:
+  closed-PnL `(symbol, orderId)` → the Order History row with exactly that
+  `symbol` + `orderId` → its non-empty `parentOrderLinkId` → `ENTRY_PLACED`
+  with exactly that `(symbol, order_link_id)` → `planned_risk_usdt`. Both hops
+  are exact-identity lookups; the direct path is tried first and is unchanged.
+- Nothing else may become a denominator. Symbol alone, close time,
+  `avgEntryPrice`, `avgExitPrice`, `qty`/`closedSize`, side, proximity, source
+  and `positionIdx` are never used to correlate risk, and `parentOrderLinkId`
+  is used only as an exact identifier, never as a prefix or a fuzzy match.
+- One bounded Order History sweep per report replaces any per-trade lookup:
+  `_fetch_close_order_parents()` walks the same report interval in ≤7-day
+  chunks with the same `_MAX_PAGES = 50` pagination guard as the closed-PnL
+  sweep and builds a read-only index `(symbol, orderId) → parentOrderLinkId`.
+- The index distinguishes three states: a non-empty string is a proven parent,
+  an empty string is a proven *absence* of a parent, and `None` marks a row
+  that is malformed or contradicts an earlier row for the same key. Only the
+  first state can resolve R; a poisoned key is never repaired by a later row.
+- `_validate_history_resp()` applies the same strict retCode/payload validation
+  as the closed-PnL reader. Any anomaly — non-dict response, missing `retCode`,
+  non-zero `retCode`, non-dict `result`, non-list `result.list`, a non-dict row
+  — raises and the whole index is discarded, so a partially read history can
+  never resolve an R.
+- An Order History read failure degrades to `close_parents = {}` and is logged
+  as a warning: R falls back to `UNKNOWN`, while PnL, winrate and trade count
+  keep coming from Closed PnL and never disappear.
+- `get_entry_link_risk_evidence()` in `core/journal.py` builds the link-keyed
+  risk map with the same proof rules as `get_entry_risk_evidence()`. The symbol
+  is mandatory in the key, so the same `order_link_id` on another symbol is not
+  a match, and one exact `(symbol, order_link_id)` bound to two *different*
+  proven risk values is fail-closed: the key is removed entirely and stays
+  removed.
+- Telegram and CSV render the same resolved R, the coverage line stays
+  truthful on partial proof, legacy entries without a stored `order_link_id`
+  keep reading `UNKNOWN`, and no journal backfill, lifecycle event, execution,
+  TP/SL, reconciliation or entry-persistence change was needed or made.
+
+**Residual risk for the Architect (not fixed here):** the ancestry path proves
+only exits that Bybit reports with a `parentOrderLinkId` — attached TP/SL
+children of an entry the bot placed with an `order_link_id`. A manual close, a
+conditional order created outside that ancestry, or an entry stored without a
+link id still reads `UNKNOWN`, by design. Old trades are not restored.
+`weekly_source_report_job` in `app/jobs.py` still divides aggregated PnL by the
+current global risk; `app/jobs.py` is outside this scope, so it remains reported,
+not touched.
+
+**Affected code:**
+
+- `handlers/reporting.py` — `_validate_history_resp()`, `_index_history_rows()`,
+  `_fetch_close_order_parents()`, the two-path `_historical_risk_usd()`, the
+  shared `_MAX_PAGES` bound, and the guarded history read in `send_report()`.
+- `core/journal.py` — `get_entry_link_risk_evidence()`. `get_entry_risk_evidence()`
+  and all existing journal semantics are unchanged.
+- `tests/test_report_historical_r.py` — LIVE-FIX3 tests added next to the
+  LIVE-FIX2 ones, which stay GREEN.
+
 **Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
 
 ### LIVE acceptance state
 
-- Paused after stage 6. LIVE-FIX2 is the reason for the pause.
-- After LIVE-FIX2 is accepted, acceptance resumes from the remaining stages. The
+- Paused after stage 6. LIVE-FIX3 is the reason for the pause.
+- After LIVE-FIX3 is accepted, acceptance resumes from the remaining stages. The
   stages already passed are not repeated.
 
 ## Release policy

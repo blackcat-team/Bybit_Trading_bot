@@ -654,6 +654,72 @@ def get_entry_risk_evidence(events: list | None = None) -> dict:
     return evidence
 
 
+def get_entry_link_risk_evidence(events: list | None = None) -> dict:
+    """
+    Доказанный риск входов бота по link-идентичности: ``{(symbol, order_link_id):
+    risk_usdt}``.
+
+    Тот же доказательный контракт, что и у :func:`get_entry_risk_evidence`, но
+    ключом является точная пара ``(symbol, order_link_id)``. Она нужна там, где
+    позицию закрыл не сам ордер входа, а его дочерний защитный ордер: биржа
+    связывает такой ордер с родителем именно через ``orderLinkId``, и это
+    единственная authoritative-связь, доступная без догадок. Символ входит в ключ
+    обязательно: один и тот же ``orderLinkId`` на другом инструменте той же
+    сделкой не является.
+
+    Запись появляется только из ``ENTRY_PLACED`` с доказанным символом,
+    доказанным непустым строковым ``order_link_id`` и доказанным положительным
+    ``planned_risk_usdt``. Старое событие без ``order_link_id`` evidence не
+    создаёт и остаётся legacy-сделкой без R — это правда, а не потеря данных.
+
+    В отличие от ``order_id`` повтор ключа здесь fail-closed: если один и тот же
+    ``(symbol, order_link_id)`` соответствует РАЗНЫМ доказанным значениям риска,
+    evidence противоречиво, и ключ убирается целиком. Выбор «последнего» или
+    «наибольшего» из противоречивых значений был бы догадкой о том, к какой
+    сделке относится знаменатель. Повтор одного и того же значения
+    противоречием не является.
+
+    Чтение read-only и tolerant (:func:`read_events`) по той же причине, что и в
+    :func:`get_entry_risk_evidence`: пропуск повреждённой строки способен только
+    убрать доказательство и превратить R в UNKNOWN, но не подставить чужой
+    знаменатель, потому что ключом остаётся точный идентификатор ордера.
+    Журнал не исправляется, не мигрируется и не достраивается.
+    """
+    if events is None:
+        events = read_events(event_type=ENTRY_PLACED)
+
+    evidence: dict = {}
+    conflicting: set = set()
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("event") != ENTRY_PLACED:
+            continue
+        symbol = normalize_symbol(ev.get("symbol"))
+        if not symbol:
+            continue
+        raw_link_id = ev.get("order_link_id")
+        if not isinstance(raw_link_id, str):
+            continue
+        link_id = raw_link_id.strip()
+        if not link_id:
+            continue
+        risk = _proven_risk_usdt(ev.get("planned_risk_usdt"))
+        if risk is None:
+            continue
+        key = (symbol, link_id)
+        if key in conflicting:
+            continue
+        known = evidence.get(key)
+        if known is not None and known != risk:
+            # Противоречивое evidence знаменателем быть не может.
+            del evidence[key]
+            conflicting.add(key)
+            continue
+        evidence[key] = risk
+    return evidence
+
+
 # ---------------------------------------------------------------------------
 # Хронология событий по инструменту (read-only)
 # ---------------------------------------------------------------------------
