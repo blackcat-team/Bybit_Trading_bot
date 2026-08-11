@@ -417,7 +417,7 @@ real errors (e.g., invalid `ALLOWED_ID`, broken handler logic) were buried.
 
 **Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
 
-### LIVE-FIX1 — bot-created Limit entry unreachable by safe cancellation (active, READY FOR QA)
+### LIVE-FIX1 — bot-created Limit entry unreachable by safe cancellation (production verified, done)
 
 **Production evidence:** an ETHUSDT Limit LONG really created by the bot
 (`WRITE_VERIFY path=limit_entry status=VERIFIED source=get_open_orders`,
@@ -493,7 +493,73 @@ the classifier does not read it.
 - `tests/test_high7_safe_cancel.py` — LIVE-FIX1 tests (production-like ETH row,
   ownership proof, protective-signal precedence, preview/confirm flow, log hygiene).
 
+**Status:** production verified, done.
+
+### LIVE-FIX2 — historical R in `/report` recomputed from the current risk (active, READY FOR QA)
+
+**Production evidence:** during LIVE acceptance the same closed trades changed
+their displayed R after `/risk` was changed, while their PnL stayed identical. At
+risk = 1 USDT: PUMPFUNUSDT `-4.6 USDT → -4.6R`, GRVTUSDT `-31.6 USDT → -31.6R`.
+After `/risk 5` the very same historical trades read `-0.9R` and `-6.3R`.
+
+**Root cause confirmed from code:** `send_report` read the current global risk
+once (`get_global_risk()`) and used that single number as the denominator for
+every historical trade and for the monthly total. Bybit `get_closed_pnl` rows
+carry price and PnL only — no risk — so the R column was a function of the
+*current* setting rather than of the trade. Every `/risk` change silently
+rewrote the whole R history.
+
+**Solution implemented (READY FOR QA):**
+
+- The current global risk is no longer imported by `handlers/reporting.py` at
+  all. R is computed per trade from the risk durably recorded for that trade's
+  own entry (`ENTRY_PLACED.planned_risk_usdt`), found by the exact
+  `(symbol, orderId)` pair. Symbol alone, close time, side, price, qty, current
+  config and current leverage are never used as a denominator or as identity.
+- A trade whose risk is not proven renders `UNKNOWN` — in the message and in the
+  CSV `R` column alike. Zero, negative, `bool`, `NaN`, `Infinity`, the legacy
+  `—` placeholder, a non-numeric value and a missing key are all "not proven".
+  No fabricated R, no substitution of any other risk value.
+- The monthly aggregate R sums only proven trades and states its own coverage:
+  `UNKNOWN` when nothing is proven, `+X.XXR (по N из M сделок)` on partial
+  coverage, a bare `+X.XXR` only when every trade in the period is proven.
+- PnL, winrate and trade count keep counting every trade and are byte-identical
+  to before: truthfulness of R never costs available facts.
+- `get_entry_risk_evidence()` reads the journal read-only through the tolerant
+  `read_events()`. Unlike ownership, the error direction here is safe: a skipped
+  corrupt line can only *remove* evidence and turn R into `UNKNOWN`, and it
+  cannot invent a foreign denominator because the key stays the exact order
+  identifier. No repair, no migration, no backfill with guessed historical risk.
+- New trades already persist per-trade risk: `ENTRY_PLACED` is written with
+  `planned_risk_usdt` by both entry paths, so no execution, sizing, SL/TP or
+  entry-path change was needed and none was made.
+
+**Residual risk for the Architect (not fixed here):** Bybit V5 `closed-pnl`
+identifies the order that *closed* the position, so a row's `orderId` normally
+differs from the bot's entry `orderId`. Where that is the case the join finds no
+evidence and R truthfully reads `UNKNOWN` instead of a fabricated number.
+Restoring proven R *coverage* needs a durable close-side identity link, which is
+outside the LIVE-FIX2 scope and needs an Architect decision.
+`weekly_source_report_job` in `app/jobs.py` divides aggregated PnL by the current
+global risk in exactly the same way; `app/jobs.py` is outside this scope, so it
+is reported, not touched.
+
+**Affected code:**
+
+- `handlers/reporting.py` — per-trade `_historical_risk_usd()`, `_format_r()`,
+  `UNKNOWN` rendering for message and CSV, coverage-aware aggregate;
+  `get_global_risk` import removed.
+- `core/journal.py` — `get_entry_risk_evidence()` and `_proven_risk_usdt()`,
+  read-only exact-identity risk evidence. Existing journal semantics unchanged.
+- `tests/test_report_historical_r.py` — NEW, focused LIVE-FIX2 regression tests.
+
 **Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+
+### LIVE acceptance state
+
+- Paused after stage 6. LIVE-FIX2 is the reason for the pause.
+- After LIVE-FIX2 is accepted, acceptance resumes from the remaining stages. The
+  stages already passed are not repeated.
 
 ## Release policy
 

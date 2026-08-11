@@ -56,6 +56,7 @@ read-only просмотр trade_journal.jsonl, дающий ``{(symbol, order_i
 
 import json
 import logging
+import math
 import os
 import time
 from decimal import Decimal, InvalidOperation
@@ -552,6 +553,105 @@ def get_bot_entry_identities() -> dict:
         }
         for (symbol, order_id), info in candidates.items()
     }
+
+
+# ---------------------------------------------------------------------------
+# Доказанный риск конкретного входа (исторический R отчёта)
+# ---------------------------------------------------------------------------
+
+def _proven_risk_usdt(raw):
+    """Доказанный положительный риск сделки в USDT либо ``None``.
+
+    Знаменатель R обязан быть доказанным числом именно этой сделки. ``bool``,
+    ``None``, пустая строка, legacy-заглушка ``—``, NaN, Infinity, нечисловое
+    значение, а также ноль и отрицательный риск доказательством не являются:
+    делить на них нельзя, а «риск 0» и «риск не записан» одинаково не дают
+    правдивого R. Разбор идёт через Decimal — как и в остальном журнале.
+
+    Проверка Decimal сама по себе недостаточна: ``Decimal`` держит экспоненту,
+    которой нет в ``float``, поэтому конечное для Decimal значение способно стать
+    ``inf`` после преобразования (``1e9999``) или схлопнуться в ``0.0``
+    (``1e-9999``). Такой знаменатель дал бы фальшивый ``0R`` либо деление на
+    ноль, поэтому итог проверяется повторно уже как float. Значение при этом не
+    зажимается, не округляется и не подменяется другим числом: недоказанный риск
+    остаётся недоказанным.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text or text == "—":
+            return None
+        source = text
+    elif isinstance(raw, (int, float)):
+        source = str(raw)
+    else:
+        return None
+    try:
+        value = Decimal(source)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not value.is_finite() or value <= 0:
+        return None
+    try:
+        result = float(value)
+    except (OverflowError, ValueError):
+        # Недостижимо на CPython: Decimal.__float__ переполняется в inf, а не
+        # исключением. Ловим ради того, чтобы отказ остался fail-closed при любой
+        # другой реализации, а не превратился в аварию отчёта.
+        return None
+    if not math.isfinite(result) or result <= 0:
+        return None
+    return result
+
+
+def get_entry_risk_evidence(events: list | None = None) -> dict:
+    """
+    Доказанный риск входов бота: ``{(symbol, order_id): risk_usdt}``.
+
+    Единица — точная пара ``(symbol, order_id)``, как и во всём остальном
+    доказательном контракте: риск конкретной сделки нельзя восстановить по
+    символу, времени, стороне, цене, объёму, текущему глобальному риску или
+    текущему конфигу. Запись появляется только из ``ENTRY_PLACED`` с доказанным
+    символом, доказанным точным ``order_id`` и доказанным положительным
+    ``planned_risk_usdt``. Событие без любого из трёх доказательств evidence не
+    создаёт — такая сделка останется без R, и это правда, а не потеря данных.
+
+    В отличие от владения (:func:`get_bot_entry_identities`) здесь допустимо
+    tolerant-чтение :func:`read_events`: пропуск повреждённой строки способен
+    только УБРАТЬ доказательство и превратить R в UNKNOWN. Выдумать чужой или
+    устаревший знаменатель он не может, потому что ключом остаётся точный
+    идентификатор ордера. Направление ошибки здесь безопасно, поэтому строгий
+    scan не нужен.
+
+    Журнал только читается. Записи не исправляются, не мигрируются и не
+    достраиваются: backfill выдуманным историческим риском запрещён.
+    """
+    if events is None:
+        events = read_events(event_type=ENTRY_PLACED)
+
+    evidence: dict = {}
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("event") != ENTRY_PLACED:
+            continue
+        symbol = normalize_symbol(ev.get("symbol"))
+        if not symbol:
+            continue
+        raw_order_id = ev.get("order_id")
+        if not isinstance(raw_order_id, str):
+            continue
+        order_id = raw_order_id.strip()
+        if not order_id:
+            continue
+        risk = _proven_risk_usdt(ev.get("planned_risk_usdt"))
+        if risk is None:
+            continue
+        # Идентификатор ордера уникален, поэтому повтор пары означает более
+        # позднюю запись того же самого ордера, а не другую сделку.
+        evidence[(symbol, order_id)] = risk
+    return evidence
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,10 @@
 """
 Отчётность — команда /report (send_report).
+
+Исторический R считается только по доказанному риску конкретной сделки из
+durable-записи её входа. Текущий глобальный риск знаменателем не является:
+изменение /risk обязано влиять на новые сделки, а не переписывать статистику уже
+закрытых. Сделка без доказанного риска получает UNKNOWN, а не выдуманный R.
 """
 
 import csv
@@ -13,7 +18,8 @@ from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID
 from core.trading_core import session
-from core.database import get_global_risk, get_source_at_time
+from core.database import get_source_at_time
+from core.journal import UNKNOWN, get_entry_risk_evidence, normalize_symbol
 from core.utils import safe_float
 from handlers.orders import bybit_call
 from handlers.ui import (
@@ -56,6 +62,46 @@ def _validate_resp(resp, current_start: int, current_end: int) -> list:
         ret_msg = resp.get("retMsg", "—")
         raise _BybitReportError(f"{chunk_info} retCode={ret_code}, retMsg={ret_msg}")
     return resp.get("result", {}).get("list", [])
+
+
+def _historical_risk_usd(trade: dict, risk_evidence: dict):
+    """
+    Доказанный исторический риск закрытой сделки в USDT либо ``None``.
+
+    Знаменатель R берётся ТОЛЬКО из durable-записи входа этой самой сделки
+    (``ENTRY_PLACED.planned_risk_usdt``) и находится по точной паре
+    ``(symbol, orderId)``. Текущий глобальный риск, текущий конфиг, символ сам по
+    себе, время закрытия, сторона, цена и объём знаменателем не являются: они
+    описывают «сейчас», а не ту сделку, и именно их использование делало
+    исторический R зависимым от последующей команды /risk.
+
+    ``None`` означает «риск этой сделки не доказан», и это правдивый ответ:
+    реконструировать его подстановкой любого другого значения запрещено.
+    """
+    if not risk_evidence or not isinstance(trade, dict):
+        return None
+    symbol = normalize_symbol(trade.get("symbol"))
+    if not symbol:
+        return None
+    raw_order_id = trade.get("orderId")
+    if not isinstance(raw_order_id, str):
+        return None
+    order_id = raw_order_id.strip()
+    if not order_id:
+        return None
+    return risk_evidence.get((symbol, order_id))
+
+
+def _format_r(value: float) -> str:
+    """R с двумя знаками и без хвостовых нулей: ``-4.6R``, ``-6.32R``, ``+4R``.
+
+    Двух знаков достаточно, чтобы результат деления на доказанный риск не
+    округлялся до неразличимости, а обрезка хвостовых нулей выполняется только в
+    дробной части — целые нули значимы (``+100.00`` обязан остаться ``+100R``).
+    """
+    whole, _, frac = f"{value:+.2f}".partition(".")
+    frac = frac.rstrip("0")
+    return f"{whole}.{frac}R" if frac else f"{whole}R"
 
 
 async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -153,7 +199,12 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         losses = 0
         csv_data = []
         report_lines = []
-        current_risk_usd = get_global_risk()
+        # Доказанный риск конкретных входов бота. Читается один раз за отчёт;
+        # запись в журнал не производится — backfill историческим риском запрещён.
+        risk_evidence = await asyncio.to_thread(get_entry_risk_evidence)
+        # Аккумуляторы R считаются ТОЛЬКО по сделкам с доказанным риском.
+        total_r = 0.0
+        r_known = 0
 
         all_trades.sort(key=lambda x: int(x['updatedTime']), reverse=True)
 
@@ -170,30 +221,50 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif pnl < 0:
                 losses += 1
 
-            r_val = pnl / current_risk_usd if current_risk_usd > 0 else 0
+            trade_risk = _historical_risk_usd(t, risk_evidence)
+            if trade_risk is None:
+                # Риск этой сделки не доказан: R недоступен. Ни ноль, ни текущий
+                # глобальный риск подстановкой быть не могут.
+                r_text = UNKNOWN
+                csv_r = UNKNOWN
+            else:
+                r_val = pnl / trade_risk
+                total_r += r_val
+                r_known += 1
+                r_text = _format_r(r_val)
+                csv_r = round(r_val, 2)
             src = get_source_at_time(symbol, ts)
 
             csv_data.append({
                 "Date": full_date, "Symbol": symbol, "Side": t['side'],
                 "Entry": t['avgEntryPrice'], "Exit": t['avgExitPrice'],
-                "PnL": round(pnl, 2), "R": round(r_val, 2), "Source": src
+                "PnL": round(pnl, 2), "R": csv_r, "Source": src
             })
 
             icon = "🟢" if pnl >= 0 else "🔴"
             line = (
                 f"{icon} {h(short_date)} · {h(symbol)} · "
-                f"{pnl:+.1f} USDT · {r_val:+.1f}R · {h(src)}"
+                f"{pnl:+.1f} USDT · {h(r_text)} · {h(src)}"
             )
             report_lines.append(line)
 
         total_trades = wins + losses
         winrate = (wins / total_trades * 100) if total_trades > 0 else 0
-        total_r = total_pnl / current_risk_usd if current_risk_usd > 0 else 0
+        # Агрегат R правдиво сообщает свою полноту: без доказанных сделок он не
+        # выводится вовсе, при частичном покрытии рядом стоит охват.
+        if r_known == 0:
+            total_r_text = UNKNOWN
+        elif r_known == len(all_trades):
+            total_r_text = f"{total_r:+.2f}R"
+        else:
+            total_r_text = (
+                f"{total_r:+.2f}R (по {r_known} из {len(all_trades)} сделок)"
+            )
 
         cmd_example = f"/report {target_date.strftime('%m.%Y')}"
         summary_block = format_value_block([
             ("PnL", f"{total_pnl:+.2f} USDT"),
-            ("R", f"{total_r:+.2f}R"),
+            ("R", total_r_text),
             ("Winrate", f"{winrate:.1f}% ({wins}W / {losses}L)"),
             ("Сделки", total_trades),
         ])
