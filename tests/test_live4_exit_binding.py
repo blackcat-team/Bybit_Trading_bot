@@ -136,13 +136,22 @@ _ABSENT = object()
 
 
 def _write_entry(mods, *, symbol=_SYMBOL, order_id=_ENTRY_ID, risk=_RISK,
-                 side="Buy", qty=_QTY, **extra) -> None:
-    """Durable ENTRY_PLACED бота с полным доказанным планом входа."""
+                 side="LONG", qty=_QTY, **extra) -> None:
+    """Durable ENTRY_PLACED бота с полным доказанным планом входа.
+
+    Сторона по умолчанию — production-контракт журнала (``LONG``/``SHORT``,
+    направление сигнала), а не сторона ордера биржи: подстановка ``Buy`` сюда
+    скрыла бы именно тот разрыв доменов, из-за которого связь не появлялась в
+    production.
+    """
     event = {
         "event": mods.journal.ENTRY_PLACED, "symbol": symbol, "side": side,
         "order_id": order_id, "order_link_id": f"{order_id}-LINK",
         "qty": qty, "planned_risk_usdt": risk,
     }
+    if side is _ABSENT:
+        # План входа без утверждения о направлении вообще.
+        event.pop("side")
     for key, value in extra.items():
         if value is _ABSENT:
             event.pop(key, None)
@@ -154,8 +163,9 @@ def _write_entry(mods, *, symbol=_SYMBOL, order_id=_ENTRY_ID, risk=_RISK,
 def _history_row(**extra) -> dict:
     """Строка get_order_history, доказывающая исполнение именно этого входа."""
     row = {
-        "symbol": _SYMBOL, "orderId": _ENTRY_ID, "cumExecQty": _QTY,
-        "avgPrice": _AVG_PRICE, "positionIdx": 0, "orderStatus": "Filled",
+        "symbol": _SYMBOL, "orderId": _ENTRY_ID, "side": "Buy",
+        "cumExecQty": _QTY, "avgPrice": _AVG_PRICE, "positionIdx": 0,
+        "orderStatus": "Filled",
     }
     return _patched(row, extra)
 
@@ -649,7 +659,7 @@ class TestUnprovenJournal:
     ):
         """Вход с точным orderId, но неполным планом делает весь результат недоказанным."""
         event = {
-            "event": mods.journal.ENTRY_PLACED, "symbol": _SYMBOL, "side": "Buy",
+            "event": mods.journal.ENTRY_PLACED, "symbol": _SYMBOL, "side": "LONG",
             "order_id": _ENTRY_ID, "qty": _QTY, "planned_risk_usdt": _RISK,
         }
         event.pop(missing)
@@ -665,7 +675,7 @@ class TestUnprovenJournal:
     async def test_unproven_risk_yields_no_binding(self, mods, monkeypatch, risk):
         """Недоказанный риск связывать нечем: знаменатель R не подставляется."""
         assert mods.journal.append_event({
-            "event": mods.journal.ENTRY_PLACED, "symbol": _SYMBOL, "side": "Buy",
+            "event": mods.journal.ENTRY_PLACED, "symbol": _SYMBOL, "side": "LONG",
             "order_id": _ENTRY_ID, "qty": _QTY, "planned_risk_usdt": risk,
         }) is True
 
@@ -803,3 +813,238 @@ class TestLifecycleAndTimeline:
         assert mods.journal.EXIT_ORDER_BOUND not in await _timeline_text(
             mods, "BTCUSDT"
         )
+
+
+# ── 8. Граница домена: сторона входа журнала → сторона позиции Bybit ──────────
+
+# Production-факт remediation: ENTRY_PLACED реального входа несёт side=LONG
+# (направление сигнала), а Bybit во всех трёх снимках отдаёт side=Buy. Пока
+# сторона журнала передавалась в контракт доказательств как есть, идентичность
+# позиции не доказывалась ни разу: normalize_side("LONG") — это ""
+# (недоказанная сторона), поэтому EXIT_ORDER_BOUND не появлялся ни за один
+# цикл наблюдателя, хотя orderId, symbol, positionIdx, объём, цена входа и
+# уровень защиты совпадали точно.
+_PROD_ENTRY_ID = "aa03e7fe-51f9-4719-adce-4aadf8191245"
+_PROD_QTY = "0.1"
+_PROD_AVG_PRICE = "1888.674"
+_PROD_SL_LEVEL = "1879.12"
+_PROD_SL_ID = "CLOSE-SL-PROD"
+
+# (сторона журнала, сторона позиции Bybit, закрывающая сторона защиты)
+_DIRECTIONS = [("LONG", "Buy", "Sell"), ("SHORT", "Sell", "Buy")]
+
+# Сторона в ENTRY_PLACED, которая канонической не является. Ни одно из этих
+# значений не имеет права получить направление: часть из них — сторона биржи в
+# поле журнала, часть обрамлена пробелами или написана в другом регистре,
+# остальные неоднозначны или malformed. Обрамлённое пробелами значение — это
+# запись вне контракта журнала, а не тот же самый LONG: оба production-пути
+# входа пишут дословные LONG/SHORT, поэтому «починка» такой записи выдала бы
+# недоказанное направление за доказанное.
+_NON_CANONICAL_JOURNAL_SIDES = {
+    "empty": "",
+    "exchange_buy": "Buy",
+    "exchange_sell": "Sell",
+    "lowercase_long": "long",
+    "lowercase_short": "short",
+    "both": "Both",
+    "unknown_text": "LONGSHORT",
+    "padded_long": " LONG ",
+    "trailing_space_long": "LONG ",
+    "leading_space_long": " LONG",
+    "tab_long": "\tLONG",
+    "newline_long": "LONG\n",
+    "padded_short": "\tSHORT\n",
+    "padded_lowercase_short": " short ",
+    "none": None,
+    "int": 1,
+    "zero": 0,
+    "bool_true": True,
+    "bool_false": False,
+    "list": ["LONG"],
+}
+
+
+class _StrSide(str):
+    """Подкласс ``str``: сравнение и хеш подменяемы, доказательством не является."""
+
+
+# Значения, недоказанные на самой границе домена, но в JSONL журнала
+# непредставимые вовсе: проверяются только прямым вызовом перевода.
+_NON_JOURNAL_SIDE_VALUES = {
+    "bytes_long": b"LONG",
+    "bytes_short": b"SHORT",
+    "str_subclass": _StrSide("LONG"),
+}
+
+
+def _prod_snapshots(position_side, closing):
+    """Снимки биржи production-сценария: точное исполнение, позиция и SL."""
+    history = [{
+        "symbol": _SYMBOL, "orderId": _PROD_ENTRY_ID, "side": position_side,
+        "positionIdx": 0, "cumExecQty": _PROD_QTY, "avgPrice": _PROD_AVG_PRICE,
+        "orderStatus": "Filled",
+    }]
+    positions = [{
+        "symbol": _SYMBOL, "side": position_side, "positionIdx": 0,
+        "size": _PROD_QTY, "avgPrice": _PROD_AVG_PRICE,
+        "stopLoss": _PROD_SL_LEVEL,
+    }]
+    orders = [{
+        "symbol": _SYMBOL, "orderId": _PROD_SL_ID, "positionIdx": 0,
+        "side": closing, "reduceOnly": True, "closeOnTrigger": True,
+        "stopOrderType": "StopLoss", "triggerPrice": _PROD_SL_LEVEL,
+        "orderLinkId": "", "parentOrderLinkId": "",
+    }]
+    return history, positions, orders
+
+
+class TestJournalEntrySideBoundary:
+
+    @pytest.mark.parametrize(
+        "journal_side, position_side, _closing", _DIRECTIONS,
+        ids=[row[0] for row in _DIRECTIONS],
+    )
+    def test_boundary_translates_exact_canonical_side(
+        self, mods, journal_side, position_side, _closing,
+    ):
+        """Дословные LONG/SHORT — единственное, что получает сторону позиции."""
+        assert mods.journal.entry_side_to_position_side(journal_side) == position_side
+
+    @pytest.mark.parametrize(
+        "raw",
+        list(_NON_CANONICAL_JOURNAL_SIDES.values())
+        + list(_NON_JOURNAL_SIDE_VALUES.values()),
+        ids=list(_NON_CANONICAL_JOURNAL_SIDES) + list(_NON_JOURNAL_SIDE_VALUES),
+    )
+    def test_boundary_does_not_normalize_journal_side(self, mods, raw):
+        """Перевод стороны не обрезает пробелы, не меняет регистр и не угадывает.
+
+        Проверяется сам контракт границы: ни ``" LONG "``, ни ``"\\tSHORT\\n"``,
+        ни ``"long"``, ни сторона биржи, ни ``bytes``, ни подкласс ``str``
+        доказанной стороной входа не являются. Нормализация здесь выдала бы
+        запись вне контракта журнала за доказанное направление сделки.
+        """
+        assert mods.journal.entry_side_to_position_side(raw) == ""
+
+    @pytest.mark.parametrize(
+        "journal_side, position_side, _closing", _DIRECTIONS,
+        ids=[row[0] for row in _DIRECTIONS],
+    )
+    def test_candidate_carries_bybit_position_side(
+        self, mods, journal_side, position_side, _closing,
+    ):
+        """Кандидат отдаёт сторону позиции Bybit, а не сторону сигнала журнала."""
+        _write_entry(mods, side=journal_side)
+
+        candidate = mods.journal.get_exit_binding_candidates()[_SYMBOL]
+
+        assert candidate["side"] == position_side
+        # Остальной план кандидата остался планом того же входа.
+        assert candidate["order_id"] == _ENTRY_ID
+        assert candidate["planned_risk_usdt"] == _RISK
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "journal_side, position_side, closing", _DIRECTIONS,
+        ids=[row[0] for row in _DIRECTIONS],
+    )
+    async def test_production_entry_side_binds_its_own_stop_loss(
+        self, mods, monkeypatch, journal_side, position_side, closing,
+    ):
+        """Production-вход журнала связывается со своим защитным SL ровно один раз.
+
+        Регрессия ровно того отказа, который наблюдался на бирже: журнал несёт
+        LONG/SHORT, биржа — Buy/Sell, и без явного перевода на границе домена
+        связи не возникало ни за один цикл.
+        """
+        _write_entry(
+            mods, order_id=_PROD_ENTRY_ID, side=journal_side, qty=_PROD_QTY,
+        )
+        history, positions, orders = _prod_snapshots(position_side, closing)
+
+        await _run_cycle(
+            mods, monkeypatch,
+            positions=positions, orders=orders, history=history,
+        )
+
+        event, = _bound(mods)
+        assert event["side"] == position_side
+        assert event["entry_order_id"] == _PROD_ENTRY_ID
+        assert event["exit_order_id"] == _PROD_SL_ID
+        assert event["exit_kind"] == mods.journal.EXIT_KIND_SL
+        assert event["planned_risk_usdt"] == _RISK
+        assert event["trigger_price"] == _PROD_SL_LEVEL
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "side", list(_NON_CANONICAL_JOURNAL_SIDES.values()),
+        ids=list(_NON_CANONICAL_JOURNAL_SIDES),
+    )
+    async def test_non_canonical_journal_side_gets_no_direction(
+        self, mods, monkeypatch, side,
+    ):
+        """Сторона входа вне контракта LONG/SHORT направления не получает.
+
+        Ни сторона биржи в поле журнала, ни другой регистр, ни обрамление
+        пробелами, ни ``Both``, ни нестроковое значение доказанной стороной
+        входа не являются: угаданное направление связало бы риск этого входа с
+        чужой позицией.
+        """
+        _write_entry(mods, side=side)
+
+        recorded = await _run_cycle(mods, monkeypatch)
+
+        assert mods.journal.get_exit_binding_candidates() == {}
+        # Кандидатов нет — значит биржа не читается вовсе, и точного запроса по
+        # входному ордеру отклонённой записи тем более не происходит.
+        assert _called(recorded, mods.jobs.session.get_order_history) == []
+        assert recorded == []
+        assert _bound(mods) == []
+
+    @pytest.mark.asyncio
+    async def test_entry_without_side_field_gets_no_direction(
+        self, mods, monkeypatch,
+    ):
+        """ENTRY_PLACED без поля side направления не получает.
+
+        Сырое чтение поля не имеет права трактовать отсутствие утверждения как
+        сторону: пропущенный ключ — это не LONG.
+        """
+        _write_entry(mods, side=_ABSENT)
+
+        recorded = await _run_cycle(mods, monkeypatch)
+
+        assert mods.journal.get_exit_binding_candidates() == {}
+        assert recorded == []
+        assert _bound(mods) == []
+
+    @pytest.mark.parametrize("journal_side", ["LONG", "SHORT"])
+    def test_exchange_side_parser_still_rejects_journal_sides(
+        self, mods, journal_side,
+    ):
+        """Общий парсер стороны биржи LONG/SHORT доказанной стороной не считает."""
+        assert mods.binding.normalize_side(journal_side) == ""
+        assert mods.binding.closing_side(journal_side) == ""
+        # Перевод остаётся односторонним: сторона биржи стороной журнала не становится.
+        assert mods.journal.entry_side_to_position_side("Buy") == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "row_side", ["LONG", "SHORT"],
+    )
+    async def test_exchange_row_with_journal_side_is_not_proven(
+        self, mods, monkeypatch, row_side,
+    ):
+        """Строка биржи со стороной журнала строгую идентичность не проходит.
+
+        Проверяются оба места: сторона позиции и закрывающая сторона защитного
+        ордера. Перевод выполнен на границе журнала и ослаблением контракта
+        биржи не является.
+        """
+        _write_entry(mods)
+
+        await _run_cycle(mods, monkeypatch, positions=[_position_row(side=row_side)])
+        assert _bound(mods) == []
+
+        await _run_cycle(mods, monkeypatch, orders=[_tp_order(side=row_side)])
+        assert _bound(mods) == []

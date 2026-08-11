@@ -637,7 +637,7 @@ fail-closed but resolved nothing. Its runtime — the monthly Order History swee
 `close_parents`, and `get_entry_link_risk_evidence()` — was removed by LIVE-FIX4.
 Only the ancestry path was removed; the LIVE-FIX2 direct path is untouched.
 
-### LIVE-FIX4 — durable protective exit-order → historical risk binding (active, READY FOR QA)
+### LIVE-FIX4 — durable protective exit-order → historical risk binding (deployed at `bb9866b`, remediation active)
 
 **Production evidence:** the LIVE-FIX3 chain `closed-PnL orderId` → Order History
 `parentOrderLinkId` → `ENTRY_PLACED order_link_id` → `planned_risk_usdt` gave zero
@@ -755,6 +755,63 @@ current global risk; it is out of this scope, so it stays reported, not touched.
 - `tests/test_live4_exit_binding.py` — NEW, focused binding/timeline tests.
 - `tests/test_report_historical_r.py`, `tests/test_main_prod_sync.py` — extended;
   the LIVE-FIX2 tests stay GREEN.
+
+**Status:** merged and deployed at `bb9866b`. In production the binding still did
+not appear, for the reason recorded in the remediation subsection below.
+
+#### LIVE-FIX4 production remediation — entry side domain boundary (READY FOR QA)
+
+**Production evidence:** the observer was registered and ran (`interval 30 s`,
+first run 10 s), the ETHUSDT entry
+`aa03e7fe-51f9-4719-adce-4aadf8191245` was journalled as `ENTRY_PLACED`
+(`side=LONG`, `qty=0.1`, `planned_risk_usdt=1`) and `POSITION_CONFIRMED` was
+written, Order History proved the exact fill (`side=Buy`, `positionIdx=0`,
+`cumExecQty=0.1`, `avgPrice=1888.674`, `Filled`) and the live position carried
+`side=Buy`, `size=0.1`, `avgPrice=1888.674`, `stopLoss=1879.12`. Still no
+`EXIT_ORDER_BOUND` appeared after several observer cycles.
+
+**Root cause proven from the repository:** both `ENTRY_PLACED` write paths — the
+Limit path in `handlers/signal_parser.py` and the Market path in
+`handlers/buttons.py` — persist the *signal direction* `LONG`/`SHORT`
+(`explicit_side` is normalised to `LONG`/`SHORT`, and the inferred side is
+`LONG`/`SHORT` too). `get_exit_binding_candidates()` passed that value through
+unchanged, while `core/exit_binding.py::normalize_side()` deliberately proves
+only the Bybit sides `Buy`/`Sell`. So `find_proven_position_row()` compared an
+unproven `""` side and the position identity of a real entry could never be
+proven.
+
+**Remediation:** the journal now converts its own canonical field at the domain
+boundary. `entry_side_to_position_side()` in `core/journal.py` maps exactly
+`LONG → Buy` and `SHORT → Sell` as an exact type and value match
+(`type(raw) is str`), with no whitespace trimming, no case folding, no substring
+matching and no truthiness, and the candidate carries the Bybit position side.
+`get_exit_binding_candidates()` reads the raw `side` field of the event instead
+of the trimming `_ownership_text()` helper, so `" LONG "` is never silently
+repaired into a proven direction; that helper itself keeps its existing
+semantics for its other consumers. Everything else is untouched: the entry
+writers still store `LONG`/`SHORT`, the exchange parser still rejects
+`LONG`/`SHORT` as malformed, and the exact orderId / symbol / `positionIdx` /
+executed qty / numeric `avgPrice` / protective-discriminator / trigger-price
+gates, the `EXIT_ORDER_BOUND` schema, the `/report` resolver, the dedupe
+semantics and the observer schedule are all unchanged.
+
+**Fail-closed direction kept:** a `side` outside the exact `LONG`/`SHORT` — `""`,
+`" LONG "`, `"LONG\n"`, `"\tSHORT\n"`, `Buy`, `Sell`, `long`, `short`, `Both`, an
+absent field, a non-string — is not a proven direction and is never guessed from
+the symbol, the stop, the price or a "not LONG ⇒ SHORT" rule. As with a missing
+side, qty or risk, it makes the whole candidate map fail-closed `{}` — a skipped
+line would leave the *previous* entry as the candidate of that symbol — so no
+Bybit read is made for the rejected entry and no `EXIT_ORDER_BOUND` is written.
+
+**Affected code:** `core/journal.py` (the entry-side constants, the new
+`entry_side_to_position_side()` and its use inside
+`get_exit_binding_candidates()`; docstrings) and
+`tests/test_live4_exit_binding.py` (the durable fixture now writes the
+production-style `LONG`/`SHORT`, plus focused LONG/SHORT boundary and
+end-to-end regressions, and the exact-match regressions for whitespace-padded,
+case-shifted, exchange-side and non-string journal sides).
+`core/exit_binding.py`, `app/jobs.py`, `main.py`, `handlers/reporting.py` and
+both entry writers are unchanged.
 
 **Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
 
