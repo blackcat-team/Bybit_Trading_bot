@@ -159,7 +159,7 @@ class TestCheckDailyLimitFailClosed:
         """Normal response, PnL above limit → (True, pnl)."""
         mock_session = MagicMock()
         mock_session.get_closed_pnl.return_value = {
-            "result": {"list": [{"closedPnl": "10.0"}]}
+            "retCode": 0, "result": {"list": [{"closedPnl": "10.0"}]}
         }
         mock_session.get_wallet_balance.return_value = {
             "result": {"list": [{"totalPerpUPL": "5.0"}]}
@@ -173,7 +173,7 @@ class TestCheckDailyLimitFailClosed:
         """Daily PnL below DAILY_LOSS_LIMIT (-50) → (False, pnl)."""
         mock_session = MagicMock()
         mock_session.get_closed_pnl.return_value = {
-            "result": {"list": [{"closedPnl": "-60.0"}]}
+            "retCode": 0, "result": {"list": [{"closedPnl": "-60.0"}]}
         }
         mock_session.get_wallet_balance.return_value = {
             "result": {"list": [{"totalPerpUPL": "0.0"}]}

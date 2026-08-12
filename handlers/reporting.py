@@ -24,6 +24,13 @@ post-close реконструкция родства невозможна в п�
 Корреляция по символу, времени, цене, объёму, стороне, источнику или близости
 записей запрещена: она способна приписать сделке чужой риск. Отсутствие обоих
 доказательств — это UNKNOWN, а не выдуманный R.
+
+Страницы закрытых сделок читаются по официальному контракту Bybit V5: токен
+продолжения приходит в ``result["nextPageCursor"]`` и уходит следующим запросом
+параметром ``cursor``. ``result["cursor"]`` токеном продолжения этого эндпоинта
+не является. Неполная выборка страниц агрегатом отчёта стать не может: занижённые
+PnL, R, winrate и число сделок выглядят как правда, поэтому любая аномалия
+пагинации — ошибка отчёта, а не «данные закончились».
 """
 
 import csv
@@ -58,6 +65,10 @@ from handlers.ui import (
 # Максимально допустимый диапазон одного запроса к Bybit (< 7 суток)
 _CHUNK_MS = 7 * 24 * 60 * 60 * 1000 - 1
 
+# Размер страницы Get Closed PnL. Официальный диапазон этого эндпоинта — 1..100;
+# лимиты других эндпоинтов (например Get Order History) сюда не переносятся.
+_PAGE_LIMIT = 100
+
 # Предел страниц пагинации на один чанк — общий safety bound отчёта: без него
 # некорректный cursor Bybit крутил бы цикл бесконечно.
 _MAX_PAGES = 50
@@ -69,11 +80,17 @@ class _BybitReportError(Exception):
 
 def _validate_resp(resp, current_start: int, current_end: int) -> list:
     """
-    Проверяет ответ одного чанка get_closed_pnl.
+    Проверяет ответ одной страницы get_closed_pnl.
 
-    Возвращает список сделок при retCode == 0.
-    При любом отклонении (не dict, отсутствует retCode, retCode != 0) — поднимает
-    _BybitReportError с деталями (включая временное окно чанка) для пользователя и лога.
+    Возвращает список сделок только при полностью доказанном успехе: ``resp`` —
+    dict, ``retCode`` — точно ``int`` со значением ``0``, ``result`` — dict, а
+    ``result["list"]`` — list. ``True``/``False`` кодом ответа не являются:
+    ``False == 0`` в Python, и без проверки типа ошибочный ответ прошёл бы как
+    успешный.
+
+    При любом отклонении поднимает _BybitReportError с деталями (включая
+    временное окно чанка) для пользователя и лога: недостоверная страница не
+    имеет права попасть в authoritative-агрегат отчёта.
     """
     chunk_info = f"[{current_start}–{current_end}]"
     if not isinstance(resp, dict):
@@ -86,10 +103,116 @@ def _validate_resp(resp, current_start: int, current_end: int) -> list:
             "возможна скрытая ошибка внутри bybit_call"
         )
     ret_code = resp["retCode"]
+    if type(ret_code) is not int:
+        raise _BybitReportError(
+            f"{chunk_info} retCode={ret_code!r}, "
+            f"retMsg=недоказанный тип retCode: {type(ret_code).__name__}"
+        )
     if ret_code != 0:
         ret_msg = resp.get("retMsg", "—")
         raise _BybitReportError(f"{chunk_info} retCode={ret_code}, retMsg={ret_msg}")
-    return resp.get("result", {}).get("list", [])
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        raise _BybitReportError(
+            f"{chunk_info} retCode=0, retMsg=нет достоверного result: "
+            f"{type(result).__name__}"
+        )
+    rows = result.get("list")
+    if not isinstance(rows, list):
+        raise _BybitReportError(
+            f"{chunk_info} retCode=0, retMsg=result.list не является списком: "
+            f"{type(rows).__name__}"
+        )
+    return rows
+
+
+def _next_page_cursor(resp: dict, chunk_info: str) -> str:
+    """
+    Токен продолжения страницы closed-PnL из ``result["nextPageCursor"]``.
+
+    Вызывается только по уже проверенному _validate_resp ответу, но собственную
+    проверку ``result`` не опускает: молча отдать ``""`` по недостоверному ответу
+    значило бы объявить выборку законченной без доказательства.
+
+    Возвращает ``""``, когда следующей страницы нет: ключ отсутствует, ``None``
+    или пустая строка. Непустой токен возвращается ровно тем значением, которое
+    прислала биржа: ни trim, ни смена регистра, ни любая другая нормализация к
+    нему не применяются — следующий запрос обязан получить именно его.
+
+    Токен непонятного типа (число, ``bool``, список) окончанием выборки не
+    является и подставлять вместо него ``""`` нельзя: это молча обрезало бы
+    отчёт. Такой ответ — ошибка.
+    """
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        raise _BybitReportError(
+            f"{chunk_info} retCode=0, retMsg=нет достоверного result: "
+            f"{type(result).__name__}"
+        )
+    raw = result.get("nextPageCursor")
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise _BybitReportError(
+            f"{chunk_info} retCode=0, retMsg=недоказанный тип nextPageCursor: "
+            f"{type(raw).__name__}"
+        )
+    return raw
+
+
+async def fetch_closed_pnl_rows(start_ms: int, end_ms: int) -> list:
+    """
+    Полная выборка строк closed-PnL одного интервала биржи (не более 7 суток).
+
+    Читает страницы по официальному контракту Bybit V5: токен продолжения —
+    ``result["nextPageCursor"]``, следующий запрос получает его параметром
+    ``cursor``. Окончание выборки доказано только пустым токеном.
+
+    Fail-closed вместо частичного результата, потому что занижённый набор строк
+    неотличим от правдивого: аномальный ответ страницы, пустая страница с
+    непустым продолжением, повторно выданный токен (иначе цикл шёл бы бесконечно)
+    и незавершённая за ``_MAX_PAGES`` страниц пагинация поднимают
+    _BybitReportError. Возвращённый список — это доказанно полный интервал.
+    """
+    chunk_info = f"[{start_ms}–{end_ms}]"
+    rows: list = []
+    cursor = ""
+    seen_cursors: set[str] = set()
+
+    for _ in range(_MAX_PAGES):
+        kw: dict = dict(
+            category="linear",
+            startTime=start_ms,
+            endTime=end_ms,
+            limit=_PAGE_LIMIT,
+        )
+        if cursor:
+            kw["cursor"] = cursor
+        resp = await bybit_call(session.get_closed_pnl, **kw)
+        page_rows = _validate_resp(resp, start_ms, end_ms)
+        next_cursor = _next_page_cursor(resp, chunk_info)
+        rows.extend(page_rows)
+
+        if not next_cursor:
+            return rows
+        if not page_rows:
+            raise _BybitReportError(
+                f"{chunk_info} retCode=0, retMsg=пустая страница с непустым "
+                "nextPageCursor: окончание выборки не доказано"
+            )
+        if next_cursor in seen_cursors:
+            raise _BybitReportError(
+                f"{chunk_info} retCode=0, retMsg=Bybit повторил уже "
+                "использованный nextPageCursor: выборка страниц не сходится"
+            )
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+        await asyncio.sleep(0.1)
+
+    raise _BybitReportError(
+        f"{chunk_info} retCode=0, retMsg=пагинация не завершилась за "
+        f"{_MAX_PAGES} стр.: интервал получен не полностью"
+    )
 
 
 def _historical_risk_usd(
@@ -206,33 +329,9 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         while current_start < end_ts:
             current_end = min(current_start + _CHUNK_MS, end_ts)
-            chunk_trades: list = []
-            cursor: str = ""
-            pages = 0
-            while True:
-                pages += 1
-                if pages > _MAX_PAGES:
-                    logging.warning(
-                        "Report: прервана пагинация (>%s стр.) для чанка %s–%s",
-                        _MAX_PAGES, current_start, current_end,
-                    )
-                    break
-                kw: dict = dict(
-                    category="linear",
-                    startTime=current_start,
-                    endTime=current_end,
-                    limit=100,
-                )
-                if cursor:
-                    kw["cursor"] = cursor
-                resp = await bybit_call(session.get_closed_pnl, **kw)
-                page_trades = _validate_resp(resp, current_start, current_end)
-                chunk_trades.extend(page_trades)
-                cursor = resp.get("result", {}).get("cursor", "")
-                if not cursor or not page_trades:
-                    break
-                await asyncio.sleep(0.1)
-            all_trades.extend(chunk_trades)
+            # Полная выборка чанка или ошибка: частичные страницы агрегатом
+            # отчёта не становятся.
+            all_trades.extend(await fetch_closed_pnl_rows(current_start, current_end))
             current_start = current_end + 1          # шаг на 1 мс — без пробелов и перекрытий
             await asyncio.sleep(0.1)
 

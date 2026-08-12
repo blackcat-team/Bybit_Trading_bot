@@ -76,11 +76,119 @@ def determine_tp_status(r_val):
 
 # --- 4. Логика Биржи (Запросы) ---
 
+# Размер страницы закрытых сделок дневного гейта. Официальный диапазон limit
+# этого эндпоинта — 1..100; лимиты других эндпоинтов сюда не переносятся.
+_DAILY_PNL_PAGE_LIMIT = 100
+
+# Предел страниц одного дня: без него некорректный cursor крутил бы цикл
+# бесконечно прямо на пути входа в сделку.
+_MAX_DAILY_PNL_PAGES = 50
+
+
+class _DailyLimitDataError(Exception):
+    """Полнота дневного realized PnL не доказана — торговлю нужно запретить."""
+
+
+def _daily_closed_pnl_rows(ts_start: int) -> list:
+    """
+    Все страницы закрытых сделок с начала дня для проверки дневного лимита.
+
+    Пагинация идёт по официальному контракту Bybit V5: токен продолжения — это
+    ``result["nextPageCursor"]``, и следующий запрос получает его параметром
+    ``cursor`` ровно тем значением, которое прислала биржа, без trim, смены
+    регистра и любой другой нормализации. ``result["cursor"]`` токеном
+    продолжения этого эндпоинта не является.
+
+    Сборщик намеренно свой, узкий и core-local: ``core`` не имеет права зависеть
+    от ``handlers``, поэтому пагинатор отчётности здесь не используется.
+
+    Любая недоказанная полнота поднимает _DailyLimitDataError вместо того, чтобы
+    вернуть уже пришедшие строки. Это гейт защиты депозита: недосчитанный убыток
+    разрешил бы новую сделку после фактического достижения DAILY_LOSS_LIMIT, то
+    есть частичный realized PnL здесь опаснее отказа. Окончание выборки доказано
+    только пустым токеном: ключ отсутствует, ``None`` или ``""``.
+    """
+    rows: list = []
+    cursor = ""
+    seen_cursors: set = set()
+
+    for _ in range(_MAX_DAILY_PNL_PAGES):
+        kw: dict = dict(
+            category="linear",
+            startTime=ts_start,
+            limit=_DAILY_PNL_PAGE_LIMIT,
+        )
+        if cursor:
+            kw["cursor"] = cursor
+        resp = session.get_closed_pnl(**kw)
+
+        if not isinstance(resp, dict):
+            raise _DailyLimitDataError(
+                f"неожиданный тип ответа: {type(resp).__name__}"
+            )
+        ret_code = resp.get("retCode")
+        # False == 0 в Python: без проверки типа ошибочный ответ прошёл бы успешным.
+        if type(ret_code) is not int:
+            raise _DailyLimitDataError(
+                f"недоказанный тип retCode: {type(ret_code).__name__}"
+            )
+        if ret_code != 0:
+            raise _DailyLimitDataError(
+                f"retCode={ret_code}, retMsg={resp.get('retMsg', '—')}"
+            )
+        result = resp.get("result")
+        if not isinstance(result, dict):
+            raise _DailyLimitDataError(
+                f"нет достоверного result: {type(result).__name__}"
+            )
+        page_rows = result.get("list")
+        if not isinstance(page_rows, list):
+            raise _DailyLimitDataError(
+                f"result.list не является списком: {type(page_rows).__name__}"
+            )
+
+        next_cursor = result.get("nextPageCursor")
+        if next_cursor is None:
+            next_cursor = ""
+        elif not isinstance(next_cursor, str):
+            # Токен непонятного типа окончанием выборки не является: подстановка
+            # "" вместо него молча обрезала бы день.
+            raise _DailyLimitDataError(
+                f"недоказанный тип nextPageCursor: {type(next_cursor).__name__}"
+            )
+
+        rows.extend(page_rows)
+
+        if not next_cursor:
+            return rows
+        if not page_rows:
+            raise _DailyLimitDataError(
+                "пустая страница с непустым nextPageCursor: "
+                "окончание выборки не доказано"
+            )
+        if next_cursor in seen_cursors:
+            raise _DailyLimitDataError(
+                "Bybit повторил уже использованный nextPageCursor: "
+                "выборка страниц не сходится"
+            )
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+    raise _DailyLimitDataError(
+        f"пагинация не завершилась за {_MAX_DAILY_PNL_PAGES} стр.: "
+        "день получен не полностью"
+    )
+
+
 def check_daily_limit():
     """
     Строгая проверка просадки (Prop-Style).
     Формула: Realized PnL (за сегодня) + Floating PnL (текущий).
     Если сумма ниже DAILY_LOSS_LIMIT — запрет торговли.
+
+    Realized PnL считается по ВСЕМ страницам закрытых сделок дня. Недоказанная
+    полнота выборки уходит в тот же fail-closed выход, что и ошибка API:
+    торговать по недосчитанному дневному убытку нельзя.
     """
     try:
         # 1. Считаем РЕАЛИЗОВАННЫЙ PnL с начала дня (00:00)
@@ -88,12 +196,11 @@ def check_daily_limit():
         start_of_day = datetime(now.year, now.month, now.day)
         ts_start = int(start_of_day.timestamp() * 1000)
 
-        # Запрашиваем закрытые сделки
-        # (limit=100 обычно хватает; при тысячах сделок нужна пагинация, но для защиты депозита достаточно)
-        closed_resp = session.get_closed_pnl(category="linear", startTime=ts_start, limit=100)
+        # Запрашиваем закрытые сделки — все страницы дня, а не только первую
+        closed_rows = _daily_closed_pnl_rows(ts_start)
 
         # Суммируем всё, что наторговали и закрыли сегодня
-        realized_pnl = sum(float(t['closedPnl']) for t in closed_resp['result']['list'])
+        realized_pnl = sum(float(t['closedPnl']) for t in closed_rows)
 
         # 2. Считаем ПЛАВАЮЩИЙ PnL (Unrealized)
         # Это "честный" результат прямо сейчас. Если висят минуса - они вычитаются.

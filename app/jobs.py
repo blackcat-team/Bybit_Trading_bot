@@ -68,6 +68,11 @@ from core.exit_binding import (
     read_stop_order_kind,
 )
 from core.utils import safe_float
+# Полная выборка closed-PnL одного интервала с единственным контрактом
+# пагинации: токен продолжения читается из result["nextPageCursor"] и уходит
+# следующим запросом параметром cursor. Реализация общая с /report намеренно —
+# два authoritative-отчёта не имеют права разойтись в проверке полноты страниц.
+from handlers.reporting import fetch_closed_pnl_rows
 from handlers.ui import (
     format_action,
     format_header,
@@ -970,36 +975,18 @@ async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
     (run_once + finally), чтобы избежать PTBUserWarning от run_daily(days=).
 
     Источник данных — Bybit get_closed_pnl (как /report), а не локальный журнал.
+
+    Неполная или аномальная пагинация отчётом не становится: сборщик
+    поднимает ошибку, задача её логирует и молча выходит. Заниженная недельная
+    статистика выглядит как правдивая, поэтому отправлять её нельзя.
     """
     try:
         now = datetime.now(timezone.utc)
         end_ts = int(now.timestamp() * 1000)
         start_ts = int((now - timedelta(days=7)).timestamp() * 1000)
 
-        # Собираем закрытые сделки за неделю (один 7-дневный чанк, с пагинацией)
-        all_trades: list = []
-        cursor: str = ""
-        pages = 0
-        while True:
-            pages += 1
-            if pages > 50:
-                logging.warning("Weekly report: прервана пагинация (>50 стр.)")
-                break
-            kw: dict = dict(
-                category="linear",
-                startTime=start_ts,
-                endTime=end_ts,
-                limit=100,
-            )
-            if cursor:
-                kw["cursor"] = cursor
-            resp = await bybit_call(session.get_closed_pnl, **kw)
-            page_trades = resp.get("result", {}).get("list", [])
-            all_trades.extend(page_trades)
-            cursor = resp.get("result", {}).get("cursor", "")
-            if not cursor or not page_trades:
-                break
-            await asyncio.sleep(0.1)
+        # Закрытые сделки за неделю: один 7-дневный интервал, все его страницы.
+        all_trades = await fetch_closed_pnl_rows(start_ts, end_ts)
 
         if not all_trades:
             await context.bot.send_message(

@@ -734,7 +734,7 @@ rows keep reading `UNKNOWN` by design; no journal migration or backfill was made
 A position closed manually, or closed before the observer's first cycle ever saw
 its protective order, has no binding and stays `UNKNOWN`. The known Closed-PnL
 pagination defect (`result["cursor"]` instead of `result["nextPageCursor"]` in
-`send_report`) is deliberately untouched and is carried by LIVE-FIX5.
+`send_report`) was deliberately untouched here and is carried by LIVE-FIX5.
 `weekly_source_report_job` in `app/jobs.py` still divides aggregated PnL by the
 current global risk; it is out of this scope, so it stays reported, not touched.
 
@@ -815,16 +815,129 @@ both entry writers are unchanged.
 
 **Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
 
-### LIVE-FIX5 — Closed-PnL pagination continuation token (planned, not started)
+### LIVE-FIX5 — Closed-PnL pagination continuation token (READY FOR QA)
 
-**Finding (not fixed):** in `handlers/reporting.py` the closed-PnL page loop
-reads the continuation token from `result["cursor"]`, while Bybit V5 returns it
-as `result["nextPageCursor"]`. A period with more than one page per 7-day chunk
-is therefore under-reported. Deliberately left untouched by LIVE-FIX4 to keep
-that diff narrow; the line and its `_MAX_PAGES` guard are unchanged.
+**Root cause proven from the repository:** both authoritative closed-PnL
+consumers read the continuation token from `result["cursor"]`, while Bybit V5
+returns it as `result.nextPageCursor` and accepts it back as the request
+parameter `cursor`. `handlers/reporting.py::send_report` and
+`app/jobs.py::weekly_source_report_job` each carried their own copy of the loop,
+so any period with more than one page per interval silently reported only its
+first page. A third call site, `core/trading_core.py::check_daily_limit()`, made a
+single request and summed only the first `result.list`. It never read
+`result["cursor"]`, so it did not carry *this* token defect, but QA proved it
+carried the same incompleteness as a trading gate; it is remediated below.
 
-**Status:** planned. Not started, not authorised for bundling into any other
-stage.
+**Why partial pages are a safety issue, not a cosmetic one:** an under-reported
+page set is indistinguishable from a truthful one. PnL, R, winrate and the trade
+count all shrink together and still look internally consistent, so the operator
+reads a smaller loss or a better winrate as fact.
+
+**Remediation:** one shared collector, `fetch_closed_pnl_rows(start_ms, end_ms)`
+in `handlers/reporting.py`, is now the single implementation of the contract, and
+`weekly_source_report_job` calls it instead of duplicating the loop — two
+authoritative reports must not diverge on page completeness. The token is read
+only from `result["nextPageCursor"]` by `_next_page_cursor()` and passed to the
+next request as `cursor`, byte-exact: no trimming, no case folding, no other
+normalisation. `result["cursor"]` is never a continuation token, even when it sits
+in the same response next to the real one. The page size stays at the official
+1..100 range of this endpoint (`_PAGE_LIMIT = 100`); the Get Order History limit
+is a different endpoint's and is not borrowed. The existing 7-day chunking of the
+report period, the row interpretation, sorting, month filtering, source
+attribution, PnL, winrate, trade count, CSV semantics and the LIVE-FIX2/LIVE-FIX4
+historical-R resolution are all unchanged.
+
+**Fail-closed direction kept:** the terminal state is exactly a missing `None` or
+`""` token. A non-empty token must be `str`; a number, a `bool`, a list or a dict
+is not proof that the data ended. `_validate_resp()` now also requires
+`type(retCode) is int` (`False == 0` in Python, so a `bool` would have passed as
+success), a `dict` `result` and a `list` `result.list` — a missing or malformed
+`result` is an error, not an empty period. An empty page carrying a non-empty
+continuation, a repeated continuation token (checked against every token already
+used, so the loop cannot spin), and `_MAX_PAGES` reached while a continuation is
+still pending all raise instead of returning the rows collected so far. A
+terminal token on the last allowed page is still a success. On any of these,
+`/report` shows its existing safe error message and no partial PnL/R/winrate/trade
+count, and `weekly_source_report_job` logs, sends nothing and still reschedules
+itself — a fabricated weekly report is worse than no weekly report.
+
+**Affected code:**
+
+- `handlers/reporting.py` — `_PAGE_LIMIT`, the strengthened `_validate_resp()`,
+  the new `_next_page_cursor()` and `fetch_closed_pnl_rows()`; `send_report()`
+  now delegates the page loop. The user-facing error path, chunking and the
+  historical-R resolver are unchanged.
+- `app/jobs.py` — `weekly_source_report_job()` uses the shared collector; its
+  `get_global_risk()` denominator, empty-week message, outer `except` and
+  `finally` reschedule are unchanged. `handlers.reporting` was already loaded
+  transitively through `handlers.ui`, so the import adds no new surface.
+- `tests/test_live5_closed_pnl_pagination.py` — NEW, focused pagination tests for
+  both consumers, including regressions that fail on the baseline because it
+  followed `result["cursor"]`.
+- `tests/test_report_validation.py` — extended for the strengthened response
+  contract; the previous lenient "missing `result` ⇒ empty list" expectation was
+  replaced by a fail-closed one.
+
+**Residual risk for the Architect (not fixed here):**
+`weekly_source_report_job` still divides aggregated PnL by the *current* global
+risk. That defect is untouched by design and stays a separate follow-up.
+`_MAX_PAGES = 50` × `limit 100` bounds one interval at 5000 rows; a real interval
+larger than that now fails the report instead of truncating it, which is the
+intended direction but is a behaviour change an operator could observe.
+
+**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+Not verified in production.
+
+#### LIVE-FIX5 remediation — `check_daily_limit()` incomplete Closed-PnL pagination (READY FOR QA)
+
+**Finding (QA RED), proven from the repository:** `check_daily_limit()` is the
+daily-drawdown trading gate, and it issued one `get_closed_pnl(limit=100)` and
+summed only the first `result.list`. When Bybit returned a non-empty
+`nextPageCursor`, every later closure of the day was omitted from realized PnL.
+Because the omitted rows are exactly the ones that make the day worse, the gate
+could answer `can_trade=True` after `DAILY_LOSS_LIMIT` had actually been reached —
+an under-counted loss opens a new position instead of blocking it.
+
+**Remediation:** a narrow private paginator, `_daily_closed_pnl_rows(ts_start)`,
+sits next to the gate in `core/trading_core.py` and returns every page of the day.
+The token is read only from `result["nextPageCursor"]` and passed to the next
+request as `cursor`, byte-exact; `result["cursor"]` is never a continuation token.
+`limit` stays at the official `100`. The paginator is deliberately core-local and
+duplicated rather than imported: `core` must not depend on `handlers`, so the
+reporting collector is not reused and no layering or circular dependency is
+introduced.
+
+**Fail-closed direction:** success requires a `dict` response,
+`type(retCode) is int and retCode == 0` (`False == 0` in Python, so a `bool` is
+rejected), a `dict` `result` and a `list` `result.list`. Terminal is exactly a
+missing, `None` or `""` token. A truthy non-string token, an empty page carrying a
+continuation, a repeated token, a page cap with a continuation still pending, and
+any failure on a later page all raise `_DailyLimitDataError`, which the gate's
+existing `except` turns into `(False, 0.0)`. Unproven completeness therefore
+blocks new trading through the semantics that were already there, and partial
+realized PnL is never used. The `DAILY_LOSS_LIMIT` formula
+(`realized + floating`), the gate signature, its callers and every other risk gate
+are unchanged.
+
+**Affected code:**
+
+- `core/trading_core.py` — `_DAILY_PNL_PAGE_LIMIT`, `_MAX_DAILY_PNL_PAGES`,
+  `_DailyLimitDataError`, `_daily_closed_pnl_rows()`; `check_daily_limit()` now
+  sums all pages of the day.
+- `tests/test_live5_daily_limit_pagination.py` — NEW, focused gate tests,
+  including regressions that fail on the single-page baseline (a loss on page 2
+  flipping the gate from `can_trade=True` to blocked).
+- `tests/test_p11_failclosed.py` — the two happy-path fixtures now carry
+  `retCode: 0`; a response without `retCode` is not a Bybit response and is
+  fail-closed under the strengthened contract. Their assertions are unchanged.
+
+**Residual risk for the Architect:** `_MAX_DAILY_PNL_PAGES = 50` × `limit 100`
+bounds one day at 5000 closures; a day larger than that now blocks trading instead
+of under-counting it, which is the intended direction but is an observable
+behaviour change.
+
+**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+Not verified in production.
 
 ### LIVE acceptance state
 
