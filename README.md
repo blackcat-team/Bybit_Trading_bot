@@ -41,6 +41,37 @@ The project gradually grew from a small Telegram utility into a long-running tra
 
 ---
 
+## 📱 Telegram interface
+
+Telegram is the main interface for the bot.
+
+The current UI is in Russian. These are real screenshots from the working bot, not mockups.
+
+### Trading status
+
+Check the current trading state, daily PnL, configured risk, total heat, active positions, orders and signal sources.
+
+<p align="center">
+  <img src="./docs/screenshots/status.png" width="760" alt="Bybit Telegram Bot trading status">
+</p>
+
+### Order accepted
+
+After a signal passes validation, the bot shows the accepted order together with its position size, Stop Loss, leverage, risk and Bybit-side verification.
+
+<p align="center">
+  <img src="./docs/screenshots/order-accepted.png" width="760" alt="Bybit Telegram Bot accepted order">
+</p>
+
+### Position management
+
+Open positions can be monitored and managed directly from Telegram, including Stop Loss and Take Profit controls.
+
+<p align="center">
+  <img src="./docs/screenshots/positions.png" width="760" alt="Bybit Telegram Bot position management">
+</p>
+---
+
 ## Core features
 
 ### 🎯 Fixed risk per trade
@@ -405,23 +436,6 @@ Start with Bybit demo mode before using live funds.
 * [ ] Check `/status`
 * [ ] Test one small trade end-to-end
 * [ ] Verify both Stop Loss and Take Profit orders
-
----
-
-## Screenshots
-
-Telegram is the main interface for the project.
-
-**Current UI language: Russian.**
-
-Screenshots will be added here to show the real workflow without replacing the actual interface with mockups.
-
-<!--
-Suggested screenshots:
-1. /status
-2. trade preview / confirmation
-3. open position with SL / TP
--->
 
 ---
 
