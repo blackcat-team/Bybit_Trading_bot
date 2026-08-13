@@ -8,7 +8,9 @@
 <img src="https://img.shields.io/badge/Bybit-V5%20API-F7A600?style=flat-square" alt="Bybit V5 API">
 <img src="https://img.shields.io/badge/Telegram-Bot-26A5E4?style=flat-square&logo=telegram&logoColor=white" alt="Telegram Bot">
 <img src="https://img.shields.io/badge/UI-Russian-6C757D?style=flat-square" alt="Russian UI">
-<img src="https://img.shields.io/badge/Status-Active-2EA44F?style=flat-square" alt="Status">
+<a href="https://github.com/blackcat-team/Bybit_Trading_bot/actions/workflows/tests.yml">
+  <img src="https://github.com/blackcat-team/Bybit_Trading_bot/actions/workflows/tests.yml/badge.svg?branch=main" alt="Tests">
+</a>
 
 <br><br>
 
