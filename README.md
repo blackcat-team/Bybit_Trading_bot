@@ -268,6 +268,7 @@ flowchart LR
     STATE --> TG
 
     MON --> ALERTS[Telegram Alerts]
+```
 ---
 
 ## Quick start
