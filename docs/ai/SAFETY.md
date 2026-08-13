@@ -1,6 +1,6 @@
 # Trading safety contract
 
-This is a normative contract for every implementation and QA task. The production bot can act on real funds.
+This is a normative contract for every implementation or review task. The production bot can act on real funds.
 
 ## Live writes and exchange truth
 

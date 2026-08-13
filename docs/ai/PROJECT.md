@@ -8,21 +8,6 @@ The repository contains a Python Telegram bot for Bybit trading operations. Prod
 
 `main.py` is the application entry point. It builds the Telegram application, registers command, callback, and text/caption message handlers, schedules background jobs, and starts polling.
 
-## Operating model
-
-Four roles, four different tools:
-
-| Role | Tool | Responsibility |
-| --- | --- | --- |
-| Architect | ChatGPT architecture chat | Scope, roadmap, safety invariants, DEV and QA prompts, stage decisions |
-| DEV | Claude Code, Opus 5, High | Code and focused tests inside the authorised scope |
-| QA | Kilo Code in VS Code, GPT-5.6 Sol, High, read-only | Independent review of the actual diff; `GREEN` / `YELLOW` / `RED` |
-| Human Operator | The person at the keyboard | Branches, staging, commit, push, merge, deploy, live runtime verification |
-
-The full definitions are in [AGENTS.md](../../AGENTS.md#roles) and the stage
-sequence is in [WORKFLOW.md](WORKFLOW.md). This table records who does what in
-this project; it is not a second copy of the workflow.
-
 ## Layout
 
 - `core/` contains configuration, Bybit-call adaptation, persistence, trading/risk helpers, conflict and heat controls, journal, notifications, and shared utilities.

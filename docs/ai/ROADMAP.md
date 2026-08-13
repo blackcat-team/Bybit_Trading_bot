@@ -14,7 +14,7 @@ This roadmap prioritizes future work; it is not authorization to combine items i
 8. Protection watchdog for open positions — done at commit `a3dae8f`.
 9. Durable trade audit trail — done at commit `bbd9aa2`.
 10. Telegram transport observability — done at commit `b0a7951`.
-11. Telegram utility commands — active, READY FOR QA.
+11. Telegram utility commands — active, awaiting independent review.
 
 ### HIGH-6 — Authoritative readback after Bybit writes (done at `77e2f41`)
 
@@ -37,7 +37,7 @@ and protective TP/SL orders. The user confirmed they probably pressed this butto
 before their Stop Loss disappeared. The destructive code path and temporal
 correlation are confirmed; the production journal lacks a full callback audit trail.
 
-**Solution implemented (READY FOR QA):**
+**Solution implemented (awaiting independent review):**
 
 - Global `cancel_all_orders` completely removed from the Telegram flow. All
   cancellations performed individually via exact `orderId` and `symbol`.
@@ -136,7 +136,7 @@ cooldown (e.g., 30 minutes) to prevent spam. Watchdog does not attempt to set or
 restore SL — operator must investigate and act manually. Watchdog does not touch
 lifecycle or journal; it is observability only.
 
-**Solution implemented (READY FOR QA):**
+**Solution implemented (awaiting independent review):**
 
 - Periodic job `protection_watchdog_job` performs one authoritative read per run
   (`get_positions(category="linear", settleCoin="USDT")` via `bybit_call`) and
@@ -196,7 +196,7 @@ A read-only Telegram command `/timeline BTCUSDT` shows recent events from the
 local durable journal, with no Bybit calls and no state change. No second
 journal; the existing lifecycle is not rewritten.
 
-**Solution implemented (READY FOR QA):**
+**Solution implemented (awaiting independent review):**
 
 - Existing journal is source of truth. New fields and events are
   additive/backward-compatible; old records without them stay readable; no
@@ -357,7 +357,7 @@ real errors (e.g., invalid `ALLOWED_ID`, broken handler logic) were buried.
 
 **Status:** done at `b0a7951`.
 
-### HIGH-11 — Telegram utility commands (active, READY FOR QA)
+### HIGH-11 — Telegram utility commands (active, awaiting independent review)
 
 **Goal:** two read-only operator conveniences that never touch trading state.
 
@@ -370,7 +370,7 @@ real errors (e.g., invalid `ALLOWED_ID`, broken handler logic) were buried.
   reported as unknown, never as a price and never as zero.
 - No trading writes of any kind.
 
-**Solution implemented (READY FOR QA):**
+**Solution implemented (awaiting independent review):**
 
 - `/info` builds its help text only from the actual production contract: the
   twelve commands really registered in `main.py` (`/start /stop /status /risk
@@ -415,7 +415,7 @@ real errors (e.g., invalid `ALLOWED_ID`, broken handler logic) were buried.
 - `tests/test_high11_telegram_utilities.py` — 11 focused tests (70 cases).
 - `tests/test_main_prod_sync.py` — `/info` and `/price` registration only.
 
-**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+**Status:** awaiting independent review (not done until review and commit).
 
 ### LIVE-FIX1 — bot-created Limit entry unreachable by safe cancellation (production verified, done)
 
@@ -434,7 +434,7 @@ treated any non-empty `stopOrderType` as protective and required
 could never pass. The attached `stopLoss` was never itself a rejection reason —
 the classifier does not read it.
 
-**Solution implemented (READY FOR QA):**
+**Solution implemented (awaiting independent review):**
 
 - The strict HIGH-7 path is unchanged and remains the default. A second, narrow
   path is gated on *proven durable bot ownership*: the same `symbol` and byte-exact
@@ -509,7 +509,7 @@ carry price and PnL only — no risk — so the R column was a function of the
 *current* setting rather than of the trade. Every `/risk` change silently
 rewrote the whole R history.
 
-**Solution implemented (READY FOR QA):**
+**Solution implemented (awaiting independent review):**
 
 - The current global risk is no longer imported by `handlers/reporting.py` at
   all. R is computed per trade from the risk durably recorded for that trade's
@@ -534,12 +534,12 @@ rewrote the whole R history.
   `planned_risk_usdt` by both entry paths, so no execution, sizing, SL/TP or
   entry-path change was needed and none was made.
 
-**Residual risk for the Architect (not fixed here):** Bybit V5 `closed-pnl`
+**Residual risk (not fixed here):** Bybit V5 `closed-pnl`
 identifies the order that *closed* the position, so a row's `orderId` normally
 differs from the bot's entry `orderId`. Where that is the case the join finds no
 evidence and R truthfully reads `UNKNOWN` instead of a fabricated number.
 Restoring proven R *coverage* needs a durable close-side identity link, which is
-outside the LIVE-FIX2 scope and needs an Architect decision.
+outside the LIVE-FIX2 scope and needs separate scope approval.
 `weekly_source_report_job` in `app/jobs.py` divides aggregated PnL by the current
 global risk in exactly the same way; `app/jobs.py` is outside this scope, so it
 is reported, not touched.
@@ -573,7 +573,7 @@ matches nothing. The evidence exists on the exchange, but only one hop away: for
 Futures attached TP/SL the child order carries `parentOrderLinkId` equal to the
 parent entry's `orderLinkId`.
 
-**Solution implemented (READY FOR QA):**
+**Solution implemented (awaiting independent review):**
 
 - A second exact path was added next to the existing direct one:
   closed-PnL `(symbol, orderId)` → the Order History row with exactly that
@@ -611,7 +611,7 @@ parent entry's `orderLinkId`.
   keep reading `UNKNOWN`, and no journal backfill, lifecycle event, execution,
   TP/SL, reconciliation or entry-persistence change was needed or made.
 
-**Residual risk for the Architect (not fixed here):** the ancestry path proves
+**Residual risk (not fixed here):** the ancestry path proves
 only exits that Bybit reports with a `parentOrderLinkId` — attached TP/SL
 children of an entry the bot placed with an `order_link_id`. A manual close, a
 conditional order created outside that ancestry, or an entry stored without a
@@ -628,7 +628,7 @@ not touched.
 - `core/journal.py` — `get_entry_link_risk_evidence()`. `get_entry_risk_evidence()`
   and all existing journal semantics are unchanged.
 - `tests/test_report_historical_r.py` — LIVE-FIX3 tests added next to the
-  LIVE-FIX2 ones, which stay GREEN.
+  LIVE-FIX2 ones, which remain passing.
 
 **Status:** superseded by LIVE-FIX4. The ancestry hypothesis was deployed and
 then disproven in production: the bot's own protective children report
@@ -658,7 +658,7 @@ proximity. The denominator of the historical R must therefore be persisted
 *before* the exit fires, while the protective order is still visible in open
 orders.
 
-**Solution implemented (READY FOR QA):**
+**Solution implemented (awaiting independent review):**
 
 - A new lifecycle-neutral journal event `EXIT_ORDER_BOUND` durably stores the
   exact protective `exit_order_id` together with the `planned_risk_usdt` proven
@@ -728,7 +728,7 @@ orders.
   entry `orderId`, `positionIdx`, planned risk, trigger price and binding source —
   so the operator can prove the binding is durable *before* the real exit.
 
-**Residual risk for the Architect (not fixed here):** coverage starts from the
+**Residual risk (not fixed here):** coverage starts from the
 first binding written by the observer. Old trades are not restored and legacy
 rows keep reading `UNKNOWN` by design; no journal migration or backfill was made.
 A position closed manually, or closed before the observer's first cycle ever saw
@@ -754,12 +754,12 @@ current global risk; it is out of this scope, so it stays reported, not touched.
   and its validators removed.
 - `tests/test_live4_exit_binding.py` — NEW, focused binding/timeline tests.
 - `tests/test_report_historical_r.py`, `tests/test_main_prod_sync.py` — extended;
-  the LIVE-FIX2 tests stay GREEN.
+  the LIVE-FIX2 tests remain passing.
 
 **Status:** merged and deployed at `bb9866b`. In production the binding still did
 not appear, for the reason recorded in the remediation subsection below.
 
-#### LIVE-FIX4 production remediation — entry side domain boundary (READY FOR QA)
+#### LIVE-FIX4 production remediation — entry side domain boundary (awaiting independent review)
 
 **Production evidence:** the observer was registered and ran (`interval 30 s`,
 first run 10 s), the ETHUSDT entry
@@ -813,9 +813,9 @@ case-shifted, exchange-side and non-string journal sides).
 `core/exit_binding.py`, `app/jobs.py`, `main.py`, `handlers/reporting.py` and
 both entry writers are unchanged.
 
-**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+**Status:** awaiting independent review (not done until review and commit).
 
-### LIVE-FIX5 — Closed-PnL pagination continuation token (READY FOR QA)
+### LIVE-FIX5 — Closed-PnL pagination continuation token (awaiting independent review)
 
 **Root cause proven from the repository:** both authoritative closed-PnL
 consumers read the continuation token from `result["cursor"]`, while Bybit V5
@@ -825,7 +825,7 @@ parameter `cursor`. `handlers/reporting.py::send_report` and
 so any period with more than one page per interval silently reported only its
 first page. A third call site, `core/trading_core.py::check_daily_limit()`, made a
 single request and summed only the first `result.list`. It never read
-`result["cursor"]`, so it did not carry *this* token defect, but QA proved it
+`result["cursor"]`, so it did not carry *this* token defect, but review proved it
 carried the same incompleteness as a trading gate; it is remediated below.
 
 **Why partial pages are a safety issue, not a cosmetic one:** an under-reported
@@ -878,19 +878,19 @@ itself — a fabricated weekly report is worse than no weekly report.
   contract; the previous lenient "missing `result` ⇒ empty list" expectation was
   replaced by a fail-closed one.
 
-**Residual risk for the Architect (not fixed here):**
+**Residual risk (not fixed here):**
 `weekly_source_report_job` still divides aggregated PnL by the *current* global
 risk. That defect is untouched by design and stays a separate follow-up.
 `_MAX_PAGES = 50` × `limit 100` bounds one interval at 5000 rows; a real interval
 larger than that now fails the report instead of truncating it, which is the
 intended direction but is a behaviour change an operator could observe.
 
-**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+**Status:** awaiting independent review (not done until review and commit).
 Not verified in production.
 
-#### LIVE-FIX5 remediation — `check_daily_limit()` incomplete Closed-PnL pagination (READY FOR QA)
+#### LIVE-FIX5 remediation — `check_daily_limit()` incomplete Closed-PnL pagination (awaiting independent review)
 
-**Finding (QA RED), proven from the repository:** `check_daily_limit()` is the
+**Finding (review blocker), proven from the repository:** `check_daily_limit()` is the
 daily-drawdown trading gate, and it issued one `get_closed_pnl(limit=100)` and
 summed only the first `result.list`. When Bybit returned a non-empty
 `nextPageCursor`, every later closure of the day was omitted from realized PnL.
@@ -931,12 +931,12 @@ are unchanged.
   `retCode: 0`; a response without `retCode` is not a Bybit response and is
   fail-closed under the strengthened contract. Their assertions are unchanged.
 
-**Residual risk for the Architect:** `_MAX_DAILY_PNL_PAGES = 50` × `limit 100`
+**Residual risk:** `_MAX_DAILY_PNL_PAGES = 50` × `limit 100`
 bounds one day at 5000 closures; a day larger than that now blocks trading instead
 of under-counting it, which is the intended direction but is an observable
 behaviour change.
 
-**Status:** READY FOR QA (not DONE until an independent QA verdict and commit).
+**Status:** awaiting independent review (not done until review and commit).
 Not verified in production.
 
 ### LIVE acceptance state
@@ -948,9 +948,9 @@ Not verified in production.
 ## Release policy
 
 - The production server is not updated after every HIGH commit. Merging is not deploying.
-- HIGH-4 through HIGH-11 are batched into one production release and reviewed together in a release QA pass. With HIGH-11 implemented (READY FOR QA), the next step is the joint Release QA of the whole batch; production deploy happens only after Release QA GREEN.
-- After the joint release QA passes, the Human Operator performs one deployment, then a runtime smoke check, then a period of observation.
-- The Architect sets the order of commit, merge, release QA, deploy, and runtime verification; no agent verdict authorises any of them.
+- HIGH-4 through HIGH-11 are batched into one production release and reviewed together before deployment. With HIGH-11 awaiting independent review, the next step is joint release review of the whole batch; production deploy happens only after the batch is accepted.
+- After the joint release review passes, an authorized operator performs one deployment, then a runtime smoke check, then a period of observation.
+- Commit, merge, release review, deployment, and runtime verification require explicit authorization; review evidence does not authorize any of them.
 
 ## MID
 
