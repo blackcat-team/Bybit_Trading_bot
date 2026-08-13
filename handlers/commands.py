@@ -71,7 +71,9 @@ async def set_risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(
                 f"{format_header('📊', 'STATUS')}\n\n"
                 f"🛡 <b>Риск</b>\n"
-                f"{format_value_block([('На сделку', f'{current:.2f} USDT')])}\n\n"
+                f"{format_value_block([('ENTRY→SL', f'{current:.2f} USDT')])}\n"
+                "Это ценовой риск от входа до SL; комиссии и проскальзывание "
+                "не входят, поэтому фактический PnL может отличаться.\n\n"
                 f"{format_action('для изменения используйте /risk 50')}",
                 parse_mode='HTML'
             )
@@ -92,7 +94,9 @@ async def set_risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(
             f"{format_header('✅', 'RISK UPDATED')}\n\n"
             f"🛡 <b>Риск</b>\n"
-            f"{format_value_block([('На сделку', f'{new_risk:.2f} USDT')])}",
+            f"{format_value_block([('ENTRY→SL', f'{new_risk:.2f} USDT')])}\n"
+            "Это ценовой риск от входа до SL; комиссии и проскальзывание "
+            "не входят, поэтому фактический PnL может отличаться.",
             parse_mode='HTML',
         )
         logging.info(f"Risk changed to {new_risk}$ by user")

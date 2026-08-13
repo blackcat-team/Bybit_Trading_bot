@@ -425,7 +425,9 @@ async def test_auto_be_change_writes_lifecycle_neutral_audit_event(jobs):
     appended = MagicMock(return_value=True)
     with patch.object(jobs, "append_event", appended):
         await jobs._journal_protection_change(
-            dict(_ROW), "AUTO-BE (2R)", 48000.12345678, 50100.5
+            dict(_ROW), "AUTO-BE (2R)", 48000.12345678, 50100.5,
+            plan={"order_id": "o-1", "order_link_id": "l-1"},
+            previous_exit_order_id="sl-1",
         )
 
     event, = [call.args[0] for call in appended.call_args_list]
@@ -449,7 +451,10 @@ async def test_risk_cut_source_and_unproven_position_idx_is_omitted(jobs):
     row = {"symbol": "BTCUSDT", "side": "Buy", "positionIdx": "нет",
            "stopLoss": ""}
     with patch.object(jobs, "append_event", appended):
-        await jobs._journal_protection_change(row, "Risk Cut (-0.3R)", 0.0, 49000.0)
+        await jobs._journal_protection_change(
+            row, "Risk Cut (-0.3R)", 0.0, 49000.0,
+            plan={"order_id": "o-1"}, previous_exit_order_id="sl-1",
+        )
 
     event = appended.call_args_list[0].args[0]
     assert event["protection_source"] == jobs.PROTECTION_SOURCE_RISK_CUT
@@ -466,7 +471,8 @@ async def test_audit_failure_never_repeats_the_exchange_write(jobs):
     with patch.object(jobs, "append_event", failing), \
          patch.object(jobs, "_set_auto_be_stop", stop_write):
         await jobs._journal_protection_change(
-            dict(_ROW), "AUTO-BE (2R)", 48000.0, 50100.0
+            dict(_ROW), "AUTO-BE (2R)", 48000.0, 50100.0,
+            plan={"order_id": "o-1"}, previous_exit_order_id="sl-1",
         )
 
     assert failing.call_count == 1
@@ -483,13 +489,15 @@ async def test_confirmation_records_only_proven_position_idx(jobs):
 
     with patch.object(jobs, "append_event", appended), \
          patch.object(jobs, "_fetch_fill_evidence",
-                      AsyncMock(return_value=(jobs.Decimal("0.5"), 1))):
+                      AsyncMock(return_value=(jobs.Decimal("0.5"), 1,
+                                              jobs.Decimal("50000")))):
         await jobs._confirm_position("BTCUSDT", dict(info))
     proven = appended.call_args_list[-1].args[0]
 
     with patch.object(jobs, "append_event", appended), \
          patch.object(jobs, "_fetch_fill_evidence",
-                      AsyncMock(return_value=(jobs.Decimal("0.5"), None))):
+                      AsyncMock(return_value=(jobs.Decimal("0.5"), None,
+                                              jobs.Decimal("50000")))):
         await jobs._confirm_position("BTCUSDT", dict(info))
     unproven = appended.call_args_list[-1].args[0]
 
@@ -540,14 +548,17 @@ async def test_reconciled_omits_unproven_position_idx(jobs):
 async def test_fill_evidence_returns_position_idx_of_matched_row(jobs):
     """positionIdx берётся только из строки с точным совпадением ордера."""
     response = {"retCode": 0, "result": {"list": [
-        {"orderId": "other", "cumExecQty": "9", "positionIdx": 2},
-        {"orderId": "o-1", "cumExecQty": "0.5", "positionIdx": 1},
+        {"symbol": "BTCUSDT", "orderId": "other", "cumExecQty": "9",
+         "avgPrice": "49000", "positionIdx": 2},
+        {"symbol": "BTCUSDT", "orderId": "o-1", "cumExecQty": "0.5",
+         "avgPrice": "50000", "positionIdx": 1},
     ]}}
     with patch.object(jobs, "bybit_call", AsyncMock(return_value=response)):
-        qty, idx = await jobs._fetch_fill_evidence("BTCUSDT", "o-1", "")
+        qty, idx, avg_entry = await jobs._fetch_fill_evidence("BTCUSDT", "o-1", "")
 
     assert str(qty) == "0.5"
     assert idx == 1
+    assert str(avg_entry) == "50000"
 
 
 # ── 7. Команда /timeline ──────────────────────────────────────────────────────

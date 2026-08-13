@@ -314,20 +314,17 @@ class TestProvenBinding:
         assert event["binding_source"] == mods.journal.EXIT_BINDING_SOURCE_OPEN_ORDERS
 
     @pytest.mark.asyncio
-    async def test_proven_stop_loss_child_is_bound_separately(self, mods, monkeypatch):
-        """Full SL и full TP связываются раздельно и с одним риском одного входа."""
+    async def test_generic_observer_does_not_create_first_sl_binding(self, mods, monkeypatch):
+        """TP audit сохраняется, first SL ownership из geometry запрещён."""
         _write_entry(mods)
 
         await _run_cycle(mods, monkeypatch, orders=[_tp_order(), _sl_order()])
 
         events = _bound(mods)
-        assert {ev["exit_kind"] for ev in events} == {
-            mods.journal.EXIT_KIND_SL, mods.journal.EXIT_KIND_TP,
-        }
-        assert {ev["exit_order_id"] for ev in events} == {_TP_ID, _SL_ID}
+        assert {ev["exit_kind"] for ev in events} == {mods.journal.EXIT_KIND_TP}
+        assert {ev["exit_order_id"] for ev in events} == {_TP_ID}
         assert {ev["planned_risk_usdt"] for ev in events} == {_RISK}
         by_kind = {ev["exit_kind"]: ev for ev in events}
-        assert by_kind[mods.journal.EXIT_KIND_SL]["trigger_price"] == _SL_LEVEL
         assert by_kind[mods.journal.EXIT_KIND_TP]["trigger_price"] == _TP_LEVEL
 
     @pytest.mark.asyncio
@@ -340,7 +337,7 @@ class TestProvenBinding:
         await _run_cycle(mods, monkeypatch, orders=[_tp_order(), _sl_order()])
 
         assert _bound(mods) == first
-        assert len(first) == 2
+        assert len(first) == 1
 
     @pytest.mark.asyncio
     async def test_new_protective_order_id_creates_new_binding(self, mods, monkeypatch):
@@ -378,7 +375,7 @@ class TestProvenBinding:
         assert len(_called(recorded, mods.jobs.session.get_open_orders)) == 1
         # Точечный запрос истории делается только по отобранному входу.
         history_calls = _called(recorded, mods.jobs.session.get_order_history)
-        assert [kw["orderId"] for kw in history_calls] == [_ENTRY_ID, "ENTRY-2"]
+        assert {kw["orderId"] for kw in history_calls} == {_ENTRY_ID, "ENTRY-2"}
 
 
 # ── 2. Недоказанный защитный ордер ───────────────────────────────────────────
@@ -433,7 +430,7 @@ class TestUnprovenExitOrder:
     async def test_ambiguous_kind_is_not_bound_while_proven_kind_is(
         self, mods, monkeypatch,
     ):
-        """Два TP одного вида — неоднозначность: связывается только доказанный SL."""
+        """Два TP неоднозначны, а first SL geometry binding запрещён."""
         _write_entry(mods)
 
         await _run_cycle(
@@ -441,9 +438,7 @@ class TestUnprovenExitOrder:
             orders=[_tp_order(), _tp_order(orderId="CLOSE-TP-DUP"), _sl_order()],
         )
 
-        event, = _bound(mods)
-        assert event["exit_kind"] == mods.journal.EXIT_KIND_SL
-        assert event["exit_order_id"] == _SL_ID
+        assert _bound(mods) == []
 
     @pytest.mark.asyncio
     async def test_position_without_level_is_not_bound_by_order_alone(
@@ -586,6 +581,7 @@ _UNPROVEN_POSITIONS = {
     "absent_position_idx": [_position_row(positionIdx=_ABSENT)],
     "other_avg_price": [_position_row(avgPrice="1870")],
     "absent_avg_price": [_position_row(avgPrice=_ABSENT)],
+    # Без fresh confirmation anchor partial geometry не разрешает FIRST binding.
     "partial_size": [_position_row(size="0.02")],
     "larger_size": [_position_row(size="0.08")],
     "zero_size": [_position_row(size="0")],
@@ -780,7 +776,7 @@ class TestLifecycleAndTimeline:
 
         await _run_cycle(mods, monkeypatch, orders=[_tp_order(), _sl_order()])
 
-        assert len(_bound(mods)) == 2
+        assert len(_bound(mods)) == 1
         assert mods.journal.get_position_lifecycles() == before
 
     @pytest.mark.asyncio
@@ -948,15 +944,10 @@ class TestJournalEntrySideBoundary:
         "journal_side, position_side, closing", _DIRECTIONS,
         ids=[row[0] for row in _DIRECTIONS],
     )
-    async def test_production_entry_side_binds_its_own_stop_loss(
+    async def test_production_entry_side_does_not_enable_first_sl_geometry_binding(
         self, mods, monkeypatch, journal_side, position_side, closing,
     ):
-        """Production-вход журнала связывается со своим защитным SL ровно один раз.
-
-        Регрессия ровно того отказа, который наблюдался на бирже: журнал несёт
-        LONG/SHORT, биржа — Buy/Sell, и без явного перевода на границе домена
-        связи не возникало ни за один цикл.
-        """
+        """Generic scan не создаёт first SL anchor даже при полной geometry."""
         _write_entry(
             mods, order_id=_PROD_ENTRY_ID, side=journal_side, qty=_PROD_QTY,
         )
@@ -967,13 +958,7 @@ class TestJournalEntrySideBoundary:
             positions=positions, orders=orders, history=history,
         )
 
-        event, = _bound(mods)
-        assert event["side"] == position_side
-        assert event["entry_order_id"] == _PROD_ENTRY_ID
-        assert event["exit_order_id"] == _PROD_SL_ID
-        assert event["exit_kind"] == mods.journal.EXIT_KIND_SL
-        assert event["planned_risk_usdt"] == _RISK
-        assert event["trigger_price"] == _PROD_SL_LEVEL
+        assert _bound(mods) == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

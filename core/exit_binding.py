@@ -264,6 +264,52 @@ def find_proven_position_row(
     return matched[0] if len(matched) == 1 else None
 
 
+def find_continuation_position_row(
+    rows, *, symbol, side, position_idx, original_qty, avg_price
+):
+    """Единственная remaining-позиция anchored lifecycle либо ``None``.
+
+    Continuation разрешена только после отдельного durable ownership anchor.
+    Поэтому количество может уменьшиться после partial close, но не может
+    исчезнуть или превысить original executed Q. Остальная identity остаётся
+    точной: symbol, side, positionIdx и authoritative executed avgPrice.
+    """
+    if not isinstance(rows, list):
+        return None
+    wanted_symbol = normalize_symbol(symbol)
+    wanted_side = normalize_side(side)
+    wanted_idx = read_position_idx(position_idx)
+    if (
+        not wanted_symbol
+        or not wanted_side
+        or wanted_idx is None
+        or not isinstance(original_qty, Decimal)
+        or not isinstance(avg_price, Decimal)
+        or not original_qty.is_finite()
+        or original_qty <= 0
+        or not avg_price.is_finite()
+        or avg_price <= 0
+    ):
+        return None
+    matched = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if normalize_symbol(row.get("symbol")) != wanted_symbol:
+            continue
+        if normalize_side(row.get("side")) != wanted_side:
+            continue
+        if read_position_idx(row.get("positionIdx")) != wanted_idx:
+            continue
+        remaining = to_positive_decimal(row.get("size"))
+        if remaining is None or remaining > original_qty:
+            continue
+        if to_positive_decimal(row.get("avgPrice")) != avg_price:
+            continue
+        matched.append(row)
+    return matched[0] if len(matched) == 1 else None
+
+
 def find_protective_exit_order_id(
     rows, *, symbol, exit_kind, position_idx, closing, level
 ) -> str:
@@ -336,6 +382,8 @@ def build_binding_event(
     exit_kind,
     planned_risk_usdt,
     trigger_price,
+    binding_origin=None,
+    protection_change_id=None,
 ) -> dict:
     """Durable-событие связи. Возвращает ``{}``, если связь не доказана целиком.
 
@@ -380,6 +428,12 @@ def build_binding_event(
     link_id = proven_order_id(entry_order_link_id)
     if link_id:
         event["entry_order_link_id"] = link_id
+    origin = proven_order_id(binding_origin)
+    change_id = proven_order_id(protection_change_id)
+    if origin:
+        event["binding_origin"] = origin
+    if change_id:
+        event["protection_change_id"] = change_id
     return event
 
 

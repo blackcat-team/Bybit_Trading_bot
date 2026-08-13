@@ -24,6 +24,7 @@ import os
 import json
 import time
 from pathlib import Path as _Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
 # ── Mock heavy deps before any project import ────────────────────────────────
@@ -78,7 +79,10 @@ def _confirmed(symbol, ts=1100.0):
 
 def _fill(order_id="OID-1", qty="1.0", link_id=None):
     """Успешный ответ get_order_history с исполнением конкретного ордера."""
-    row = {"orderId": order_id, "cumExecQty": qty, "symbol": "BTCUSDT"}
+    row = {
+        "orderId": order_id, "cumExecQty": qty, "symbol": "BTCUSDT",
+        "avgPrice": "50000",
+    }
     if link_id is not None:
         row["orderLinkId"] = link_id
     return {"retCode": 0, "retMsg": "OK", "result": {"list": [row]}}
@@ -127,18 +131,25 @@ async def _run_job(rec, snapshot_resp, *, snapshot_raises=None, pnl_resp=None,
     """Выполняет reconcile_journal_job с подменёнными Bybit/журналом/Telegram."""
     import app.jobs as jobs
 
-    # Сессия резолвится во время выполнения: другой тестовый модуль мог
-    # импортировать core.trading_core раньше со своим mock-объектом.
-    session = jobs.session
+    # Фиксированные method objects: MagicMock создаёт динамические attributes,
+    # из-за чего identity зависит от порядка импорта тестовых модулей.
+    get_positions = MagicMock(name="get_positions")
+    get_order_history = MagicMock(name="get_order_history")
+    get_closed_pnl = MagicMock(name="get_closed_pnl")
+    session = SimpleNamespace(
+        get_positions=get_positions,
+        get_order_history=get_order_history,
+        get_closed_pnl=get_closed_pnl,
+    )
     calls = []
 
     async def fake_bybit_call(fn, *args, **kwargs):
-        if fn is session.get_positions:
+        if fn is get_positions:
             calls.append("get_positions")
             if snapshot_raises is not None:
                 raise snapshot_raises
             return snapshot_resp
-        if fn is session.get_order_history:
+        if fn is get_order_history:
             calls.append("get_order_history")
             if order_raises is not None:
                 raise order_raises
@@ -146,7 +157,7 @@ async def _run_job(rec, snapshot_resp, *, snapshot_raises=None, pnl_resp=None,
             return order_resp if order_resp is not None else {
                 "retCode": 0, "result": {"list": []}
             }
-        if fn is session.get_closed_pnl:
+        if fn is get_closed_pnl:
             calls.append("get_closed_pnl")
             return pnl_resp if pnl_resp is not None else {"retCode": 0, "result": {"list": []}}
         calls.append(getattr(fn, "_mock_name", "other"))
@@ -159,7 +170,8 @@ async def _run_job(rec, snapshot_resp, *, snapshot_raises=None, pnl_resp=None,
 
     ctx.bot.send_message = AsyncMock(side_effect=_send)
 
-    with patch("app.jobs.bybit_call", fake_bybit_call), \
+    with patch("app.jobs.session", session), \
+         patch("app.jobs.bybit_call", fake_bybit_call), \
          patch("app.jobs.get_position_lifecycles", rec.get_position_lifecycles), \
          patch("app.jobs.append_event", rec.append_event), \
          patch("app.jobs.check_and_quarantine_sources", lambda: []):
@@ -271,15 +283,18 @@ async def test_pending_entry_is_never_reconciled(
      _fill(order_id="OID-1", qty="1.5")),
     # Ответ содержит только orderLinkId
     ({"retCode": 0, "result": {"orderLinkId": "LINK-9"}},
-     {"retCode": 0, "retMsg": "OK", "result": {"list": [
-         {"orderId": "OTHER", "orderLinkId": "LINK-9", "cumExecQty": "2"},
+         {"retCode": 0, "retMsg": "OK", "result": {"list": [
+             {"symbol": "BTCUSDT", "orderId": "OTHER",
+              "orderLinkId": "LINK-9", "cumExecQty": "2",
+              "avgPrice": "50000"},
      ]}}),
     # Чужие строки в истории не мешают найти свою
     ({"retCode": 0, "result": {"orderId": " OID-1 "}},
-     {"retCode": "0", "result": {"list": [
-         {"orderId": "OLD-MANUAL", "cumExecQty": "9"},
-         {"orderId": "OID-1", "cumExecQty": 0.75},
-     ]}}),
+         {"retCode": "0", "result": {"list": [
+             {"symbol": "BTCUSDT", "orderId": "OLD-MANUAL", "cumExecQty": "9"},
+             {"symbol": "BTCUSDT", "orderId": "OID-1", "cumExecQty": 0.75,
+              "avgPrice": "50000"},
+         ]}}),
 ])
 async def test_position_confirmed_once_on_proven_fill(place_resp, evidence):
     """Placement response → ENTRY_PLACED → ровно один POSITION_CONFIRMED.
@@ -293,6 +308,8 @@ async def test_position_confirmed_once_on_proven_fill(place_resp, evidence):
     assert entry_kwargs, "Идентификатор обязан извлекаться из ответа размещения"
 
     # Символ в журнале в другом регистре: нормализация обязана его сопоставить
+    if "order_link_id" in entry_kwargs and "order_id" not in entry_kwargs:
+        entry_kwargs["order_id"] = ""
     rec = _Recorder([_entry(" btcusdt ", **entry_kwargs)])
     assert rec.state("BTCUSDT") == PENDING
 

@@ -12,6 +12,7 @@ import asyncio
 import time
 import logging
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from telegram.ext import ContextTypes
@@ -40,6 +41,9 @@ from core.journal import (
     POSITION_NOT_FOUND_ON_EXCHANGE,
     PENDING, CONFIRMED,
     PROTECTION_CHANGE,
+    EXIT_KIND_SL,
+    INITIAL_SL_ANCHOR_SOURCE_CONFIRMATION,
+    EXIT_BINDING_ORIGIN_PROTECTION_CHANGE,
     PROTECTION_SOURCE_AUTO_BE,
     PROTECTION_SOURCE_RISK_CUT,
     get_position_lifecycles,
@@ -48,6 +52,8 @@ from core.journal import (
     get_disabled_sources,
     get_exit_binding_candidates,
     get_exit_binding_events,
+    get_auto_protection_evidence,
+    entry_side_to_position_side,
 )
 # Строгий разбор positionIdx и канонический write_outcome берутся из общего
 # контракта доказательств (HIGH-6): идентичность позиции в журнале обязана
@@ -57,12 +63,12 @@ from core.write_verify import WRITE_ACCEPTED, read_position_idx, to_positive_dec
 # (LIVE-FIX4). Здесь он только применяется к уже полученным снимкам биржи:
 # сетевых вызовов и записи в нём нет.
 from core.exit_binding import (
-    EXIT_KINDS,
     binding_key,
     build_binding_event,
     closing_side,
     find_protective_exit_order_id,
     find_proven_position_row,
+    find_continuation_position_row,
     position_protection_level,
     proven_entry_fill,
     read_stop_order_kind,
@@ -227,13 +233,16 @@ def _bybit_error_code(exc: Exception) -> int | None:
     return int(match.group(1)) if match else None
 
 
-async def _set_auto_be_stop(symbol: str, target_sl: float) -> tuple[bool, bool]:
+async def _set_auto_be_stop(
+    symbol: str, target_sl: float, position_idx: int
+) -> tuple[bool, bool]:
     """Set an Auto-BE SL and distinguish a real update from Bybit's benign no-op."""
     try:
         await bybit_call(
             session.set_trading_stop,
             category="linear",
             symbol=symbol,
+            positionIdx=position_idx,
             stopLoss=str(target_sl),
             slTriggerBy="LastPrice",
             _alert_errors=False,
@@ -279,8 +288,9 @@ def _exchange_level_repr(raw, parsed: float):
 
 
 async def _journal_protection_change(
-    row: dict, action_tag: str, stop_before: float, stop_requested: float
-) -> None:
+    row: dict, action_tag: str, stop_before: float, stop_requested: float,
+    *, plan: dict, previous_exit_order_id: str,
+) -> bool:
     """Durable audit реального автоматического сдвига SL (Auto-BE / Risk Cut).
 
     Событие lifecycle-neutral: оно не входит в TERMINAL_EVENTS, не подтверждает
@@ -302,7 +312,16 @@ async def _journal_protection_change(
         "stop_loss_before": _exchange_level_repr(row.get("stopLoss"), stop_before),
         "stop_loss_requested": str(stop_requested),
         "write_outcome": WRITE_ACCEPTED,
+        "protection_change_id": uuid.uuid4().hex,
+        "entry_order_id": plan.get("order_id", ""),
+        "previous_exit_order_id": previous_exit_order_id,
+        "previous_trigger": _exchange_level_repr(
+            row.get("stopLoss"), stop_before
+        ),
+        "requested_trigger": str(stop_requested),
     }
+    if plan.get("order_link_id"):
+        event["entry_order_link_id"] = plan["order_link_id"]
     # Идентичность позиции пишется только когда она доказана текущей
     # authoritative-строкой: выдуманный positionIdx склеил бы разные позиции.
     position_idx = read_position_idx(row.get("positionIdx"))
@@ -313,12 +332,14 @@ async def _journal_protection_change(
         written = await asyncio.to_thread(append_event, event)
     except Exception as exc:
         logging.error("Auto-BE: audit PROTECTION_CHANGE не записан: %s", exc)
-        return
+        return False
     if not written:
         logging.error(
             "Auto-BE: audit PROTECTION_CHANGE не записан для %s (source=%s)",
             event["symbol"], event["protection_source"],
         )
+        return False
+    return True
 
 
 # --- 1. Heartbeat (Проверка пульса) ---
@@ -351,11 +372,18 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         _pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
-        positions = _pos_resp['result']['list']
+        positions = _require_result_rows(_pos_resp, "get_positions")
+        protection_evidence = await asyncio.to_thread(get_auto_protection_evidence)
+        if not protection_evidence:
+            return
+        _orders_resp = await bybit_call(
+            session.get_open_orders, category="linear", settleCoin="USDT"
+        )
+        order_rows = _require_result_rows(_orders_resp, "get_open_orders")
         active = [p for p in positions if safe_float(p.get('size'), field='size') > 0]
 
         for p in active:
-            sym = p['symbol']
+            sym = normalize_symbol(p.get('symbol'))
             side = p['side']
             entry = safe_float(p.get('avgPrice'), field='avgPrice')
             current_price = safe_float(p.get('markPrice'), field='markPrice')
@@ -366,24 +394,63 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
             if entry <= 0 or current_price <= 0 or qty <= 0:
                 continue
 
+            plan = protection_evidence.get(sym)
+            if not plan:
+                continue
+            if plan.get("pending_change") is not None:
+                continue
+            if side not in ("Buy", "Sell") or plan["side"] != side:
+                continue
+            position_idx = read_position_idx(p.get("positionIdx"))
+            if position_idx is None or position_idx != plan["position_idx"]:
+                continue
+            identity_matches = [
+                row for row in positions
+                if isinstance(row, dict)
+                if normalize_symbol(row.get("symbol")) == sym
+                and row.get("side") == side
+                and read_position_idx(row.get("positionIdx")) == position_idx
+            ]
+            if len(identity_matches) != 1:
+                continue
+            current_entry = to_positive_decimal(p.get("avgPrice"))
+            current_qty = to_positive_decimal(p.get("size"))
+            original_entry = Decimal(str(plan["entry"]))
+            original_qty = Decimal(str(plan["qty"]))
+            if current_entry is None or current_entry != original_entry:
+                continue
+            if current_qty is None or current_qty > original_qty:
+                continue
+
             # Без стопа трейлить нечего
             if current_sl == 0: continue
 
             is_long = side == "Buy"
 
-            # --- ПОЛУЧЕНИЕ РИСКА (БЕЗ МАГИЧЕСКИХ ЧИСЕЛ) ---
-            risk_usd = get_risk_for_symbol(sym)
-
-            if risk_usd <= 0:
-                # Если риск не найден в базе, мы НЕ имеем права трогать стоп.
-                # Это защита от сбоев БД. Лучше ничего не делать, чем натворить дел.
-                # logging.warning(f"⚠️ Skip Auto-BE for {sym}: No risk data stored.")
+            # Текущий child SL обязан иметь exact durable binding к entry order
+            # этого lifecycle. Геометрия позиции ownership не доказывает.
+            sl_level = position_protection_level(p, EXIT_KIND_SL)
+            current_exit_id = find_protective_exit_order_id(
+                order_rows,
+                symbol=sym,
+                exit_kind=EXIT_KIND_SL,
+                position_idx=position_idx,
+                closing=closing_side(side),
+                level=sl_level,
+            )
+            bound_level = plan["sl_bindings"].get(current_exit_id)
+            if (
+                not current_exit_id
+                or bound_level is None
+                or sl_level is None
+                or bound_level != sl_level
+            ):
                 continue
 
-                # --- РАСЧЕТ 1R (ЦЕНОВАЯ ДИСТАНЦИЯ) ---
-            # Пока считаем через qty, так как initial_sl не храним в БД.
-            # Но благодаря проверке выше, это безопасно.
-            dist_1r_price = risk_usd / qty
+            # Исходные risk и qty берутся только из подтверждённого lifecycle.
+            # После частичного закрытия текущий qty меньше, но цена 1R неизменна.
+            risk_usd = plan["planned_risk_usdt"]
+            dist_1r_price = risk_usd / plan["qty"]
 
             # 2. Считаем текущий PnL в R
             if is_long:
@@ -437,13 +504,16 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
                 new_sl = round(round(new_sl / tick) * tick, 6)
 
                 try:
-                    _, changed = await _set_auto_be_stop(sym, new_sl)
+                    _, changed = await _set_auto_be_stop(sym, new_sl, position_idx)
                     if not changed:
                         continue
                     logging.info(f"♻️ {action_tag}: {sym} SL moved to {new_sl}")
                     # Durable audit доказанного изменения защиты — до
                     # уведомления: сбой Telegram не должен стирать след записи.
-                    await _journal_protection_change(p, action_tag, current_sl, new_sl)
+                    await _journal_protection_change(
+                        p, action_tag, current_sl, new_sl,
+                        plan=plan, previous_exit_order_id=current_exit_id,
+                    )
                     await context.bot.send_message(
                         chat_id=ALLOWED_ID,
                         text=(
@@ -744,17 +814,16 @@ def _lifecycle_order_ids(info: dict) -> tuple[str, str]:
 
 async def _fetch_fill_evidence(
     sym: str, order_id: str, order_link_id: str
-) -> tuple[Decimal, int | None]:
-    """Возвращает доказанный исполненный объём именно этого ордера и его positionIdx.
+) -> tuple[Decimal, int | None, Decimal]:
+    """Возвращает qty, positionIdx и actual avgPrice точного входного ордера.
 
     Read-only запрос get_order_history по точному orderId/orderLinkId.
     Ответ проходит тот же строгий контракт, что и снимок позиций. Доказательством
     считается только строка с точным совпадением идентификатора и cumExecQty > 0.
 
-    Вторым элементом возвращается positionIdx из той же самой точно совпавшей
-    строки, если он там доказан, иначе None. Отдельного запроса ради него не
-    делается, и он никогда не додумывается: неизвестный positionIdx обязан
-    остаться неизвестным, иначе разные позиции одного символа склеятся.
+    Цена берётся только из ``avgPrice`` той же exact order-history строки.
+    ``ENTRY_PLACED.entry`` для Market может быть reference-ценой до исполнения
+    и фактом исполнения не является.
 
     Поднимает _SnapshotUnknown при timeout/exception, malformed ответе,
     невалидном retCode, отсутствии ордера, несовпадении идентификатора и
@@ -776,6 +845,7 @@ async def _fetch_fill_evidence(
 
     rows = _require_result_rows(resp, "get_order_history")
 
+    matched = []
     for row in rows:
         if not isinstance(row, dict):
             raise _SnapshotUnknown(
@@ -786,27 +856,38 @@ async def _fetch_fill_evidence(
         row_id = row_id.strip() if isinstance(row_id, str) else ""
         row_link = row_link.strip() if isinstance(row_link, str) else ""
 
-        exact = (order_id and row_id == order_id) or (
-            order_link_id and row_link == order_link_id
-        )
+        # Exact orderId — основной identity. orderLinkId нужен только когда
+        # durable orderId отсутствует.
+        exact = row_id == order_id if order_id else row_link == order_link_id
         if not exact:
             continue
-        if "cumExecQty" not in row:
-            raise _SnapshotUnknown(
-                f"get_order_history: у ордера {order_id or order_link_id} нет cumExecQty"
-            )
-        exec_qty = _parse_decimal_qty(
-            row.get("cumExecQty"),
-            f"get_order_history cumExecQty {sym}",
-            allow_zero=True,
-        )
-        # Malformed positionIdx не делает исполнение недоказанным: контракт
-        # подтверждения от него не зависит, поэтому он просто остаётся None.
-        return exec_qty, read_position_idx(row.get("positionIdx"))
+        matched.append(row)
 
-    raise _SnapshotUnknown(
-        f"get_order_history: ордер {order_id or order_link_id} по {sym} не найден"
+    if len(matched) != 1:
+        raise _SnapshotUnknown(
+            f"get_order_history: exact ордер {order_id or order_link_id} "
+            f"найден {len(matched)} раз"
+        )
+
+    row = matched[0]
+    if normalize_symbol(row.get("symbol")) != normalize_symbol(sym):
+        raise _SnapshotUnknown("get_order_history: symbol exact ордера не совпал")
+    if "cumExecQty" not in row:
+        raise _SnapshotUnknown(
+            f"get_order_history: у ордера {order_id or order_link_id} нет cumExecQty"
+        )
+    exec_qty = _parse_decimal_qty(
+        row.get("cumExecQty"),
+        f"get_order_history cumExecQty {sym}",
+        allow_zero=True,
     )
+    avg_entry_price = to_positive_decimal(row.get("avgPrice"))
+    if avg_entry_price is None:
+        raise _SnapshotUnknown(
+            f"get_order_history: у ордера {order_id or order_link_id} "
+            "нет доказанного avgPrice"
+        )
+    return exec_qty, read_position_idx(row.get("positionIdx")), avg_entry_price
 
 
 async def _confirm_position(sym: str, info: dict) -> None:
@@ -837,7 +918,7 @@ async def _confirm_position(sym: str, info: dict) -> None:
         return
 
     try:
-        exec_qty, position_idx = await _fetch_fill_evidence(
+        exec_qty, position_idx, avg_entry_price = await _fetch_fill_evidence(
             sym, order_id, order_link_id
         )
     except _SnapshotUnknown as unknown:
@@ -855,6 +936,57 @@ async def _confirm_position(sym: str, info: dict) -> None:
         )
         return
 
+    initial_anchor = {}
+    if position_idx is not None and order_id:
+        try:
+            position_resp = await bybit_call(
+                session.get_positions, category="linear", symbol=sym
+            )
+            position_rows = _require_result_rows(
+                position_resp, "get_positions initial anchor"
+            )
+            position_side = entry_side_to_position_side(info.get("side"))
+            position = find_proven_position_row(
+                position_rows,
+                symbol=sym,
+                side=position_side,
+                position_idx=position_idx,
+                exec_qty=exec_qty,
+                avg_price=avg_entry_price,
+            )
+            if position is not None:
+                sl_level = position_protection_level(position, EXIT_KIND_SL)
+                orders_resp = await bybit_call(
+                    session.get_open_orders, category="linear", symbol=sym
+                )
+                order_rows = _require_result_rows(
+                    orders_resp, "get_open_orders initial anchor"
+                )
+                sl_order_id = find_protective_exit_order_id(
+                    order_rows,
+                    symbol=sym,
+                    exit_kind=EXIT_KIND_SL,
+                    position_idx=position_idx,
+                    closing=closing_side(position_side),
+                    level=sl_level,
+                )
+                if sl_order_id and sl_level is not None:
+                    initial_anchor = {
+                        "initial_sl_order_id": sl_order_id,
+                        "initial_sl_trigger": str(sl_level),
+                        "initial_sl_anchor_source": (
+                            INITIAL_SL_ANCHOR_SOURCE_CONFIRMATION
+                        ),
+                    }
+        except _SnapshotUnknown as unknown:
+            logging.warning(
+                "Reconcile: initial SL anchor %s не доказан: %s", sym, unknown
+            )
+        except Exception as exc:
+            logging.warning(
+                "Reconcile: initial SL anchor %s недоступен: %s", sym, exc
+            )
+
     event = {
         "event": POSITION_CONFIRMED,
         "symbol": sym,
@@ -862,6 +994,7 @@ async def _confirm_position(sym: str, info: dict) -> None:
         "source_tag": info.get("source_tag", ""),
         "entry_event_ts": info.get("entry_event_ts", 0.0),
         "cum_exec_qty": str(exec_qty),
+        "avg_entry_price": str(avg_entry_price),
     }
     if order_id:
         event["order_id"] = order_id
@@ -869,6 +1002,7 @@ async def _confirm_position(sym: str, info: dict) -> None:
         event["order_link_id"] = order_link_id
     if position_idx is not None:
         event["position_idx"] = position_idx
+    event.update(initial_anchor)
 
     written = await asyncio.to_thread(append_event, event)
     if not written:
@@ -1475,23 +1609,74 @@ async def _fetch_entry_fill(sym: str, order_id: str):
 async def _bind_symbol_exits(
     sym: str, plan: dict, position_rows: list, order_rows: list, known: set
 ) -> None:
-    """Записывает доказанные связи защитных выходов одного инструмента.
+    """Re-bind SL только для anchored lifecycle с causal protection change."""
+    entry_order_id = plan.get("order_id", "")
+    pending = plan.get("pending_change")
+    if not entry_order_id or not isinstance(pending, dict):
+        return
+    original_qty = Decimal(str(plan.get("qty")))
+    avg_entry = Decimal(str(plan.get("entry")))
+    position = find_continuation_position_row(
+        position_rows,
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=plan.get("position_idx"),
+        original_qty=original_qty,
+        avg_price=avg_entry,
+    )
+    if position is None:
+        logging.debug(
+            "Exit binding: %s continuation position не доказана",
+            sym,
+        )
+        return
 
-    Доказательство собирается из трёх независимых частей: план входа из
-    журнала, authoritative-исполнение именно этого ордера и текущая позиция с
-    текущим защитным ордером. Любая недоказанная часть просто прекращает
-    связывание этого символа: несвязанная сделка честнее сделки с чужим
-    знаменателем R.
+    closing = closing_side(plan.get("side"))
+    level = position_protection_level(position, EXIT_KIND_SL)
+    requested = Decimal(str(pending.get("requested_trigger")))
+    if level is None or level != requested:
+        return
+    exit_order_id = find_protective_exit_order_id(
+        order_rows,
+        symbol=sym,
+        exit_kind=EXIT_KIND_SL,
+        position_idx=plan.get("position_idx"),
+        closing=closing,
+        level=level,
+    )
+    if not exit_order_id:
+        return
+    event = build_binding_event(
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=plan.get("position_idx"),
+        entry_order_id=entry_order_id,
+        entry_order_link_id=plan.get("order_link_id"),
+        exit_order_id=exit_order_id,
+        exit_kind=EXIT_KIND_SL,
+        planned_risk_usdt=plan.get("planned_risk_usdt"),
+        trigger_price=level,
+        binding_origin=EXIT_BINDING_ORIGIN_PROTECTION_CHANGE,
+        protection_change_id=pending.get("change_id"),
+    )
+    key = binding_key(event)
+    if not event or key is None or key in known:
+        return
+    written = await asyncio.to_thread(append_event, event)
+    if not written:
+        logging.error("Exit binding: continuation %s → %s не записана", sym, exit_order_id)
+        return
+    known.add(key)
 
-    Full SL и full TP связываются независимо друг от друга и с одним и тем же
-    риском одного подтверждённого входа: закрыть позицию может любой из них.
-    """
+
+async def _bind_symbol_take_profit(
+    sym: str, plan: dict, position_rows: list, order_rows: list, known: set
+) -> None:
+    """Сохраняет historical TP binding; automation ownership не создаёт."""
     entry_order_id = plan.get("order_id", "")
     fill = await _fetch_entry_fill(sym, entry_order_id)
     if fill is None:
-        logging.debug("Exit binding: %s пропущен — исполнение входа не доказано", sym)
         return
-
     position = find_proven_position_row(
         position_rows,
         symbol=sym,
@@ -1501,67 +1686,38 @@ async def _bind_symbol_exits(
         avg_price=fill["avg_price"],
     )
     if position is None:
-        logging.debug(
-            "Exit binding: %s пропущен — текущая позиция не доказана тем же входом",
-            sym,
-        )
         return
-
-    closing = closing_side(plan.get("side"))
-    for exit_kind in EXIT_KINDS:
-        level = position_protection_level(position, exit_kind)
-        if level is None:
-            continue
-        exit_order_id = find_protective_exit_order_id(
-            order_rows,
-            symbol=sym,
-            exit_kind=exit_kind,
-            position_idx=fill["position_idx"],
-            closing=closing,
-            level=level,
-        )
-        if not exit_order_id:
-            continue
-
-        event = build_binding_event(
-            symbol=sym,
-            side=plan.get("side"),
-            position_idx=fill["position_idx"],
-            entry_order_id=entry_order_id,
-            entry_order_link_id=plan.get("order_link_id"),
-            exit_order_id=exit_order_id,
-            exit_kind=exit_kind,
-            planned_risk_usdt=plan.get("planned_risk_usdt"),
-            trigger_price=level,
-        )
-        if not event:
-            continue
-
-        key = binding_key(event)
-        if key is None or key in known:
-            # Уже сохранённая связь повторно не пишется: журнал append-only,
-            # и одинаковое событие каждые 30 секунд только зашумило бы аудит.
-            continue
-
-        written = await asyncio.to_thread(append_event, event)
-        if not written:
-            # Незаписанная связь не считается сохранённой: следующий прогон
-            # попробует снова, пока позиция ещё открыта.
-            logging.error(
-                "Exit binding: связь %s %s → %s не записана durable",
-                sym, exit_kind, exit_order_id,
-            )
-            continue
-
+    level = position_protection_level(position, "tp")
+    if level is None:
+        return
+    exit_order_id = find_protective_exit_order_id(
+        order_rows,
+        symbol=sym,
+        exit_kind="tp",
+        position_idx=fill["position_idx"],
+        closing=closing_side(plan.get("side")),
+        level=level,
+    )
+    event = build_binding_event(
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=fill["position_idx"],
+        entry_order_id=entry_order_id,
+        entry_order_link_id=plan.get("order_link_id"),
+        exit_order_id=exit_order_id,
+        exit_kind="tp",
+        planned_risk_usdt=plan.get("planned_risk_usdt"),
+        trigger_price=level,
+    )
+    key = binding_key(event)
+    if not event or key is None or key in known:
+        return
+    if await asyncio.to_thread(append_event, event):
         known.add(key)
-        logging.info(
-            "Exit binding: %s %s → %s связан с риском %s USDT",
-            sym, exit_kind, exit_order_id, event["planned_risk_usdt"],
-        )
 
 
 async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
-    """Периодически связывает защитный ордер выхода с риском своего входа.
+    """Поддерживает causal SL continuation и отдельный historical TP audit.
 
     Наблюдатель только читает: get_positions, get_open_orders, точный
     get_order_history и append-only журнал. Отсюда не размещаются ордера, не
@@ -1574,14 +1730,19 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
     с входным ордером (у SL/TP-детей пустые orderLinkId и parentOrderLinkId), и
     знаменатель исторического R восстановить нечем.
 
-    За цикл выполняется один общий снимок позиций и один общий снимок открытых
-    ордеров на все инструменты; отдельный запрос делается только по точному
-    входному ордеру уже отобранного кандидата. Недоказанный журнал, недоказанный
-    снимок и недоказанная идентичность дают отсутствие связи, а не догадку.
+    Первый SL ownership anchor здесь никогда не создаётся. SL re-bind доступен
+    только anchored lifecycle с exact pending PROTECTION_CHANGE. Historical TP
+    binding остаётся read-only и не предоставляет automation ownership.
     """
     try:
-        candidates = await asyncio.to_thread(get_exit_binding_candidates)
-        if not candidates:
+        anchored = await asyncio.to_thread(get_auto_protection_evidence)
+        continuations = {
+            sym: plan for sym, plan in anchored.items()
+            if plan.get("anchored") is True
+            and isinstance(plan.get("pending_change"), dict)
+        }
+        tp_candidates = await asyncio.to_thread(get_exit_binding_candidates)
+        if not continuations and not tp_candidates:
             return
 
         try:
@@ -1594,7 +1755,10 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         open_symbols = _binding_open_position_symbols(position_rows)
-        pending = [sym for sym in candidates if sym in open_symbols]
+        pending = [
+            sym for sym in set(continuations) | set(tp_candidates)
+            if sym in open_symbols
+        ]
         if not pending:
             return
 
@@ -1625,9 +1789,14 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
 
         for sym in pending:
             try:
-                await _bind_symbol_exits(
-                    sym, candidates[sym], position_rows, order_rows, known
-                )
+                if sym in tp_candidates:
+                    await _bind_symbol_take_profit(
+                        sym, tp_candidates[sym], position_rows, order_rows, known
+                    )
+                if sym in continuations:
+                    await _bind_symbol_exits(
+                        sym, continuations[sym], position_rows, order_rows, known
+                    )
             except _SnapshotUnknown as unknown:
                 # Недоказанное исполнение одного входа не отменяет связывание
                 # остальных инструментов.

@@ -304,7 +304,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                f"{format_header('✅', 'POSITION UPDATED')}\n"
                                                f"Position: {h(sym)}\n\n"
                                                f"🛡 <b>Защита</b>\n"
-                                               f"{format_value_block([('TP', target_str), ('Режим', 'безубыток с комиссией')])}",
+                                               f"{format_value_block([('TP', target_str), ('Режим', 'уровень выше цены входа')])}",
                                                parse_mode='HTML')
 
             except Exception as e:

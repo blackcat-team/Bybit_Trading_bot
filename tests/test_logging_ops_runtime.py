@@ -41,7 +41,7 @@ async def test_auto_be_34040_is_benign_without_alert_or_retry(
     monkeypatch.setattr(jobs, "alert_bybit_error", alert)
 
     with caplog.at_level(logging.INFO):
-        handled, changed = await jobs._set_auto_be_stop("COTIUSDT", 0.01562)
+        handled, changed = await jobs._set_auto_be_stop("COTIUSDT", 0.01562, 0)
 
     assert handled is True
     assert changed is False
@@ -78,7 +78,7 @@ async def test_auto_be_other_errors_keep_alert_and_error_contract(
     monkeypatch.setattr(jobs, "alert_bybit_error", alert)
 
     with pytest.raises(type(error), match=str(error)):
-        await jobs._set_auto_be_stop("COTIUSDT", 0.01562)
+        await jobs._set_auto_be_stop("COTIUSDT", 0.01562, 0)
 
     assert api_call.await_count == 1
     alert.assert_awaited_once_with(error, "set_trading_stop")

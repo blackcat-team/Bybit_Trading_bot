@@ -23,11 +23,10 @@
                       лимитных входов (preview → confirm → индивидуальные cancel по
                       точному orderId) вместе со снимками защиты до и после.
                       Lifecycle не меняет и терминальным не является.
-  PROTECTION_CHANGE — durable-аудит реального автоматического переноса SL
-                      (Auto-BE / Risk Cut): сторона, доказанный position_idx, SL до
-                      записи, запрошенный SL и исход записи. Фактический SL после
-                      записи как факт биржи не утверждается: без authoritative-
-                      чтения запрошенный уровень остаётся именно запросом.
+  PROTECTION_CHANGE — durable causal-аудит автоматического переноса SL:
+                       exact entry orderId, positionIdx, previous exact SL child,
+                       previous/requested trigger, source и change id. Фактический
+                       SL после записи доказывает только subsequent observer.
                       Lifecycle не меняет и терминальным не является.
   EXIT_ORDER_BOUND  — durable-связь точного защитного ордера выхода (SL или TP)
                       с доказанным planned_risk_usdt конкретного входа бота.
@@ -123,6 +122,8 @@ EXIT_KIND_TP = "tp"
 # снимок открытых ордеров биржи. Post-close реконструкция источником не
 # является и в binding_source появиться не может.
 EXIT_BINDING_SOURCE_OPEN_ORDERS = "get_open_orders"
+INITIAL_SL_ANCHOR_SOURCE_CONFIRMATION = "position_confirmation"
+EXIT_BINDING_ORIGIN_PROTECTION_CHANGE = "protection_change"
 
 # Каноническая сторона входа в журнале — значение поля ``side`` события
 # ENTRY_PLACED. Оба production-пути записи (limit — handlers/signal_parser.py,
@@ -144,6 +145,10 @@ _ENTRY_SIDE_POSITION_SIDE = {
 # protection_source события PROTECTION_CHANGE).
 PROTECTION_SOURCE_AUTO_BE  = "AUTO_BE"
 PROTECTION_SOURCE_RISK_CUT = "RISK_CUT"
+AUTO_PROTECTION_SOURCES = (
+    PROTECTION_SOURCE_AUTO_BE,
+    PROTECTION_SOURCE_RISK_CUT,
+)
 
 # Терминальные события: после любого из них символ больше не отслеживается,
 # пока не появится новое ENTRY_PLACED.
@@ -469,6 +474,317 @@ def get_position_lifecycles(events: list | None = None) -> dict:
     return lifecycles
 
 
+def get_auto_protection_evidence() -> dict:
+    """Возвращает строгие durable-доказательства для автоматической защиты.
+
+    Результат содержит только активный ``CONFIRMED`` lifecycle, для которого
+    один и тот же вход доказан точными order id/link id, а ``POSITION_CONFIRMED``
+    дополнительно доказал positionIdx, исполненный объём и actual avgPrice.
+    ``qty`` и ``planned_risk_usdt`` берутся из ``ENTRY_PLACED``, а immutable
+    executed entry — только из ``POSITION_CONFIRMED.avg_entry_price``. Текущий
+    риск, reference entry и текущий размер позиции сюда не подставляются.
+
+    Любая malformed-анomalия в journal делает результат пустым. Старые события
+    без новых обязательных полей не считаются ошибкой, но такой lifecycle не
+    попадает в результат и потому не может вызвать live-write.
+    """
+    lifecycles: dict = {}
+
+    def _proven_order_id(raw, field: str):
+        if raw is None:
+            return ""
+        if isinstance(raw, bool) or not isinstance(raw, str):
+            raise _OwnershipUnproven(f"поле {field} malformed")
+        return raw.strip()
+
+    def _proven_entry_side(raw):
+        if raw is None:
+            return ""
+        if type(raw) is not str:
+            raise _OwnershipUnproven("поле side malformed")
+        return _ENTRY_SIDE_POSITION_SIDE.get(raw, "")
+
+    def _proven_position_side(raw):
+        if type(raw) is not str:
+            return ""
+        return raw if raw in ("Buy", "Sell") else ""
+
+    def _plan_amount(ev: dict, field: str, parser):
+        if field not in ev:
+            return None
+        raw = ev.get(field)
+        if raw is None:
+            raise _OwnershipUnproven(f"поле {field} malformed")
+        value = parser(raw)
+        if value is None:
+            raise _OwnershipUnproven(f"поле {field} malformed")
+        return value
+
+    def _confirmed_idx(ev: dict):
+        if "position_idx" not in ev:
+            return None
+        raw = ev.get("position_idx")
+        value = read_position_idx(raw)
+        if value is None:
+            raise _OwnershipUnproven("поле position_idx malformed")
+        return value
+
+    def _same_identity(current: dict, ev: dict) -> bool:
+        event_order_id = _proven_order_id(ev.get("order_id"), "order_id")
+        event_link_id = _proven_order_id(ev.get("order_link_id"), "order_link_id")
+        if current["order_id"]:
+            return event_order_id == current["order_id"]
+        return bool(
+            current["order_link_id"]
+            and event_link_id == current["order_link_id"]
+        )
+
+    try:
+        for event_type, ev in _iter_strict_events():
+            symbol = normalize_symbol(ev.get("symbol"))
+            if not symbol:
+                if event_type in (ENTRY_PLACED, POSITION_CONFIRMED, *TERMINAL_EVENTS):
+                    raise _OwnershipUnproven(
+                        f"событие {event_type} без доказанного symbol"
+                    )
+                # Lifecycle-neutral записи без одного symbol (например,
+                # пакетная отмена) не участвуют в ownership-решении.
+                continue
+
+            if event_type == ENTRY_PLACED:
+                order_id = _proven_order_id(ev.get("order_id"), "order_id")
+                order_link_id = _proven_order_id(
+                    ev.get("order_link_id"), "order_link_id"
+                )
+                side = _proven_entry_side(ev.get("side"))
+                qty = _plan_amount(ev, "qty", _proven_positive_amount)
+                risk = _plan_amount(ev, "planned_risk_usdt", _proven_risk_usdt)
+                # Вход без точной identity или полного плана остаётся безопасно
+                # неуправляемым. Не достраиваем его из текущего exchange state.
+                if not (order_id or order_link_id) or not side:
+                    lifecycles[symbol] = {"state": "UNPROVEN"}
+                    continue
+                lifecycles[symbol] = {
+                    "state": PENDING,
+                    "order_id": order_id,
+                    "order_link_id": order_link_id,
+                    "side": side,
+                    "qty": qty,
+                    "entry": None,
+                    "planned_risk_usdt": risk,
+                    "position_idx": None,
+                    "sl_bindings": {},
+                    "anchored": False,
+                    "pending_change": None,
+                }
+                if qty is None or risk is None:
+                    lifecycles[symbol]["state"] = "UNPROVEN"
+
+            elif event_type == POSITION_CONFIRMED:
+                current = lifecycles.get(symbol)
+                if current is None or current.get("state") != PENDING:
+                    continue
+                if not _same_identity(current, ev):
+                    current["state"] = "UNPROVEN"
+                    continue
+                confirmed_side = _proven_entry_side(ev.get("side"))
+                if not confirmed_side or confirmed_side != current["side"]:
+                    current["state"] = "UNPROVEN"
+                    continue
+                confirmed_idx = _confirmed_idx(ev)
+                confirmed_qty = _plan_amount(
+                    ev, "cum_exec_qty", _proven_positive_amount
+                )
+                confirmed_entry = _plan_amount(
+                    ev, "avg_entry_price", _proven_positive_amount
+                )
+                if (
+                    confirmed_idx is None
+                    or confirmed_qty is None
+                    or confirmed_qty != current["qty"]
+                    or confirmed_entry is None
+                ):
+                    current["state"] = "UNPROVEN"
+                    continue
+                current["state"] = CONFIRMED
+                current["position_idx"] = confirmed_idx
+                current["qty"] = confirmed_qty
+                current["entry"] = confirmed_entry
+                anchor_order_id = _proven_order_id(
+                    ev.get("initial_sl_order_id"), "initial_sl_order_id"
+                )
+                anchor_trigger = _plan_amount(
+                    ev, "initial_sl_trigger", _proven_positive_decimal
+                )
+                anchor_source = ev.get("initial_sl_anchor_source")
+                if (
+                    anchor_order_id
+                    and anchor_trigger is not None
+                    and anchor_source == INITIAL_SL_ANCHOR_SOURCE_CONFIRMATION
+                ):
+                    current["sl_bindings"][anchor_order_id] = {
+                        "position_idx": confirmed_idx,
+                        "side": current["side"],
+                        "risk": current["planned_risk_usdt"],
+                        "trigger": anchor_trigger,
+                    }
+                    current["anchored"] = True
+
+            elif event_type == PROTECTION_CHANGE:
+                current = lifecycles.get(symbol)
+                if (
+                    current is None
+                    or current.get("state") != CONFIRMED
+                    or not current.get("anchored")
+                ):
+                    continue
+                change_id = _proven_order_id(
+                    ev.get("protection_change_id"), "protection_change_id"
+                )
+                entry_order_id = _proven_order_id(
+                    ev.get("entry_order_id"), "entry_order_id"
+                )
+                previous_exit_id = _proven_order_id(
+                    ev.get("previous_exit_order_id"), "previous_exit_order_id"
+                )
+                previous_trigger = _plan_amount(
+                    ev, "previous_trigger", _proven_positive_decimal
+                )
+                requested_trigger = _plan_amount(
+                    ev, "requested_trigger", _proven_positive_decimal
+                )
+                previous_binding = current["sl_bindings"].get(previous_exit_id)
+                if (
+                    not change_id
+                    or entry_order_id != current.get("order_id")
+                    or read_position_idx(ev.get("position_idx"))
+                    != current.get("position_idx")
+                    or _proven_position_side(ev.get("side")) != current.get("side")
+                    or ev.get("protection_source") not in AUTO_PROTECTION_SOURCES
+                    or ev.get("write_outcome") != "accepted-response"
+                    or previous_binding is None
+                    or previous_binding["trigger"] != previous_trigger
+                    or requested_trigger is None
+                ):
+                    continue
+                next_change = {
+                    "change_id": change_id,
+                    "previous_exit_order_id": previous_exit_id,
+                    "previous_trigger": previous_trigger,
+                    "requested_trigger": requested_trigger,
+                }
+                known_change = current.get("pending_change")
+                if known_change is not None and known_change != next_change:
+                    current["state"] = "UNPROVEN"
+                    continue
+                current["pending_change"] = next_change
+
+            elif event_type == EXIT_ORDER_BOUND:
+                current = lifecycles.get(symbol)
+                pending = current.get("pending_change") if current else None
+                if (
+                    current is None
+                    or current.get("state") != CONFIRMED
+                    or not current.get("anchored")
+                    or pending is None
+                ):
+                    continue
+                entry_order_id = _proven_order_id(
+                    ev.get("entry_order_id"), "entry_order_id"
+                )
+                exit_order_id = _proven_order_id(
+                    ev.get("exit_order_id"), "exit_order_id"
+                )
+                if not entry_order_id or entry_order_id != current.get("order_id"):
+                    continue
+                bound_link = _proven_order_id(
+                    ev.get("entry_order_link_id"), "entry_order_link_id"
+                )
+                if (
+                    bound_link
+                    and current.get("order_link_id")
+                    and bound_link != current["order_link_id"]
+                ):
+                    current["state"] = "UNPROVEN"
+                    continue
+                binding = {
+                    "position_idx": read_position_idx(ev.get("position_idx")),
+                    "side": _proven_position_side(ev.get("side")),
+                    "risk": _plan_amount(
+                        ev, "planned_risk_usdt", _proven_risk_usdt
+                    ),
+                    "trigger": _plan_amount(
+                        ev, "trigger_price", _proven_positive_decimal
+                    ),
+                }
+                if (
+                    ev.get("exit_kind") != EXIT_KIND_SL
+                    or ev.get("binding_source") != EXIT_BINDING_SOURCE_OPEN_ORDERS
+                    or ev.get("binding_origin")
+                    != EXIT_BINDING_ORIGIN_PROTECTION_CHANGE
+                    or _proven_order_id(
+                        ev.get("protection_change_id"), "protection_change_id"
+                    ) != pending["change_id"]
+                    or not exit_order_id
+                    or binding["side"] != current.get("side")
+                    or binding["position_idx"] is None
+                    or binding["risk"] != current.get("planned_risk_usdt")
+                    or binding["trigger"] != pending["requested_trigger"]
+                ):
+                    continue
+                # Observer пишет новую binding-ревизию, когда Bybit меняет
+                # trigger защитного child, даже если его orderId сохранился.
+                # Физически последняя строгая запись — актуальное durable
+                # evidence этого же exact child/entry.
+                current["sl_bindings"][exit_order_id] = binding
+                current["pending_change"] = None
+
+            elif event_type in TERMINAL_EVENTS:
+                current = lifecycles.get(symbol)
+                if current is None:
+                    continue
+                if current.get("state") == "CONFIRMED" and not _same_identity(current, ev):
+                    current["state"] = "UNPROVEN"
+                else:
+                    current["state"] = TERMINAL
+    except (_OwnershipUnproven, TypeError, ValueError) as exc:
+        logging.warning(
+            "journal auto protection scan: evidence is unproven (%s) — no writes",
+            exc,
+        )
+        return {}
+    except Exception as exc:
+        logging.error("journal auto protection scan failed: %s", exc)
+        return {}
+
+    return {
+        symbol: {
+            "order_id": info["order_id"],
+            "order_link_id": info["order_link_id"],
+            "side": info["side"],
+            "qty": info["qty"],
+            "entry": info["entry"],
+            "planned_risk_usdt": info["planned_risk_usdt"],
+            "position_idx": info["position_idx"],
+            "sl_bindings": {
+                exit_id: binding["trigger"]
+                for exit_id, binding in info["sl_bindings"].items()
+                if binding["position_idx"] == info["position_idx"]
+            },
+            "anchored": info["anchored"],
+            "pending_change": info["pending_change"],
+        }
+        for symbol, info in lifecycles.items()
+        if info.get("state") == CONFIRMED
+        and info.get("qty") is not None
+        and info.get("entry") is not None
+        and info.get("planned_risk_usdt") is not None
+        and info.get("position_idx") is not None
+        and info.get("anchored") is True
+        and bool(info.get("order_id"))
+    }
+
+
 class _OwnershipUnproven(Exception):
     """Внутренний сигнал: доказательство владения нарушено (fail-closed).
 
@@ -654,6 +970,25 @@ def _proven_positive_amount(raw):
     это именно этот вход.
     """
     return _proven_risk_usdt(raw)
+
+
+def _proven_positive_decimal(raw):
+    """Доказанное положительное конечное Decimal-значение либо ``None``."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, str):
+        source = raw.strip()
+        if not source:
+            return None
+    elif isinstance(raw, (int, float, Decimal)):
+        source = str(raw)
+    else:
+        return None
+    try:
+        value = Decimal(source)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return value if value.is_finite() and value > 0 else None
 
 
 def entry_side_to_position_side(raw) -> str:
