@@ -247,7 +247,27 @@ Bybit_Trading_bot/
 ├── main.py
 └── requirements.txt
 ```
+---
 
+## 🧩 Architecture
+
+The bot is split into a few simple layers: Telegram handles user interaction, trading logic validates and prepares actions, and the Bybit client handles exchange communication.
+
+```mermaid
+flowchart LR
+    TG[Telegram] --> H[Handlers]
+    H --> SP[Signal Parsing]
+    H --> RM[Risk Management]
+
+    SP --> EX[Trade Execution]
+    RM --> EX
+    EX --> BY[Bybit V5 API]
+
+    BY --> MON[Position & Order Monitoring]
+    MON --> STATE[Runtime State & Journal]
+    STATE --> TG
+
+    MON --> ALERTS[Telegram Alerts]
 ---
 
 ## Quick start
