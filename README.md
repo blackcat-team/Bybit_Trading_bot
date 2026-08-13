@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="./docs/assets/bybit-bot-avatar.png" width="150" alt="Bybit Telegram Trading Bot">
+
 # 📈 Bybit Telegram Trading Bot
 
 ### Risk-managed trading automation for Bybit Linear USDT, controlled through Telegram
@@ -475,3 +477,4 @@ Review the code and configuration yourself before connecting a funded account.
 Built and maintained by **BlackCat**.
 
 [GitHub](https://github.com/blackcat-team) · [Telegram](https://t.me/red_tvr) · [X](https://x.com/red_tvr)
+</div>
