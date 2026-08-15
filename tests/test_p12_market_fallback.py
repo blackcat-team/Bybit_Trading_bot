@@ -276,7 +276,7 @@ class TestMarketEntryCarriesOrderIdentifier:
             await button_handler(update, ctx)
 
         assert journal.call_count == 1, "ENTRY_PLACED пишется ровно один раз"
-        return journal.call_args.args[0], journal, calls
+        return journal.call_args.args[0], journal, calls, ctx
 
     @pytest.mark.asyncio
     async def test_order_id_from_placement_response_is_recorded(self):
@@ -285,7 +285,7 @@ class TestMarketEntryCarriesOrderIdentifier:
             True, "⚡️ Исполнен Маркет по BTCUSDT", 0.01,
             {"retCode": 0, "result": {"orderId": " MOID-5 ", "orderLinkId": "MLINK-5"}},
         )
-        event, _, calls = await self._entry_event(place_result)
+        event, _, calls, ctx = await self._entry_event(place_result)
 
         assert event["order_id"] == "MOID-5", "Идентификатор обрезан и записан"
         assert event["order_link_id"] == "MLINK-5"
@@ -296,15 +296,21 @@ class TestMarketEntryCarriesOrderIdentifier:
             assert field in event, f"Потеряно прежнее поле {field}"
         # Обнаружение позиции не заменяет exact order correlation
         assert calls.count("place_market_with_retry") == 1, "Ретраи размещения не менялись"
+        assert ctx.job_queue.run_once.call_count == 1
+        callback, delay = ctx.job_queue.run_once.call_args.args[:2]
+        assert callback.__name__ == "fresh_entry_confirmation_job"
+        assert delay == 1.0
+        assert ctx.job_queue.run_once.call_args.kwargs["data"]["order_id"] == "MOID-5"
 
     @pytest.mark.asyncio
     async def test_missing_identifier_is_not_invented(self):
         """Трёхэлементный (legacy) возврат: id не выдумывается, событие прежнее."""
-        event, _, _ = await self._entry_event(_PLACE_OK)
+        event, _, _, ctx = await self._entry_event(_PLACE_OK)
 
         assert "order_id" not in event and "order_link_id" not in event
         assert event["symbol"] == "BTCUSDT", "Symbol не подменяет identifier"
         assert event["order_type"] == "market", "Прежний контракт события сохранён"
+        assert ctx.job_queue.run_once.call_count == 0
 
     @pytest.mark.asyncio
     async def test_failed_journal_write_does_not_replace_order(self):
@@ -313,8 +319,9 @@ class TestMarketEntryCarriesOrderIdentifier:
             True, "⚡️ Исполнен Маркет по BTCUSDT", 0.01,
             {"retCode": 0, "result": {"orderId": "MOID-5"}},
         )
-        _, _, calls = await self._entry_event(place_result, journal_ok=False)
+        _, _, calls, ctx = await self._entry_event(place_result, journal_ok=False)
 
         assert calls.count("place_market_with_retry") == 1, "Повторное размещение недопустимо"
         assert not any("cancel" in name for name in calls), \
             "Автоотмена принятого ордера недопустима"
+        assert ctx.job_queue.run_once.call_count == 0

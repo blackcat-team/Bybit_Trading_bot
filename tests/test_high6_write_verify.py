@@ -222,7 +222,7 @@ class _MarketBybit:
                  place_reject_code=None, pre=None, tick=_TICK):
         self.b = b
         self.positions = list(positions)
-        self.pre = _position(rows=[]) if pre is None else pre
+        self.pre = _position(rows=[_row(size="0", side="")]) if pre is None else pre
         self.place_ok = place_ok
         self.place_msg = place_msg
         self.place_reject_code = place_reject_code
@@ -808,12 +808,34 @@ class TestMarketEntryReadback:
         # Неразбираемый size — снимок не доказан
         assert b._snapshot_position_keys(
             _position(rows=[_row(size="abc")]), _SYMBOL) is None
+        # Штатная explicit-symbol flat row Bybit не требует направления.
+        assert b._snapshot_position_keys(
+            _position(rows=[_row(size="0", side="")]), _SYMBOL) == set()
+        assert b._snapshot_position_keys(
+            _position(rows=[_row(size=0, side="")]), _SYMBOL) == set()
+        assert b._snapshot_position_keys(
+            _position(rows=[_row(size="0", side="Buy")]), _SYMBOL
+        ) is None
+        for malformed_size in ("", None, "abc", "NaN", "Infinity", "-1"):
+            assert b._snapshot_position_keys(
+                _position(rows=[_row(size=malformed_size, side="")]), _SYMBOL
+            ) is None
+        # Но активная позиция без доказанного Buy/Sell остаётся fail-closed.
+        assert b._snapshot_position_keys(
+            _position(rows=[_row(size="1", side="")]), _SYMBOL) is None
+        assert b._snapshot_position_keys(
+            _position(rows=[_row(symbol="ETHUSDT", size="0", side="")]),
+            _SYMBOL,
+        ) is None
+        assert b._snapshot_position_keys(
+            {"retCode": 0, "result": {"list": []}}, _SYMBOL
+        ) is None
         # Ответ с ошибкой в конверте — снимок не доказан
         assert b._snapshot_position_keys(
             _position(sl="40000", ret_code=10001), _SYMBOL) is None
-        # Корректный пустой список — снимок доказан, позиций не было
+        # Empty explicit-symbol response does not prove flat.
         assert b._snapshot_position_keys(
-            {"retCode": 0, "result": {"list": []}}, _SYMBOL) == set()
+            {"retCode": 0, "result": {"list": []}}, _SYMBOL) is None
 
     def test_unproven_pre_snapshot_blocks_correlation(self, b):
         """B4: pre_keys is None fail-closed блокирует корреляцию позиции."""

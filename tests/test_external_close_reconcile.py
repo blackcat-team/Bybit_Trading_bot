@@ -77,24 +77,26 @@ def _confirmed(symbol, ts=1100.0):
     return {"event": POSITION_CONFIRMED, "symbol": symbol, "ts": ts}
 
 
-def _fill(order_id="OID-1", qty="1.0", link_id=None):
+def _fill(order_id="OID-1", qty="1.0", link_id=None, position_idx=0):
     """Успешный ответ get_order_history с исполнением конкретного ордера."""
     row = {
         "orderId": order_id, "cumExecQty": qty, "symbol": "BTCUSDT",
-        "avgPrice": "50000",
+        "avgPrice": "50000", "positionIdx": position_idx,
     }
     if link_id is not None:
         row["orderLinkId"] = link_id
     return {"retCode": 0, "retMsg": "OK", "result": {"list": [row]}}
 
 
-def _snapshot(*symbols):
+def _snapshot(*symbols, size="1.0", avg_price="50000", position_idx=0):
     """Успешный снимок get_positions с явным retCode=0."""
     return {
         "retCode": 0,
         "retMsg": "OK",
         "result": {"list": [
-            {"symbol": s, "size": "1.0", "side": "Buy"} for s in symbols
+            {"symbol": s, "size": size, "side": "Buy",
+             "avgPrice": avg_price, "positionIdx": position_idx,
+             "stopLoss": "49000"} for s in symbols
         ]},
     }
 
@@ -125,6 +127,18 @@ class _Recorder:
         self.journal.append(event)   # durable: виден следующему циклу
         return True
 
+    def append_position_confirmation(self, event, expected):
+        current = self.get_position_lifecycles().get(event.get("symbol"), {})
+        if current.get("state") != PENDING:
+            return journal.CONFIRM_APPEND_NOT_CURRENT
+        if current.get("entry_event_ts") != expected.get("entry_event_ts"):
+            return journal.CONFIRM_APPEND_NOT_CURRENT
+        return (
+            journal.CONFIRM_APPEND_WRITTEN
+            if self.append_event(event)
+            else journal.CONFIRM_APPEND_FAILED
+        )
+
 
 async def _run_job(rec, snapshot_resp, *, snapshot_raises=None, pnl_resp=None,
                    order_resp=None, order_raises=None):
@@ -135,10 +149,12 @@ async def _run_job(rec, snapshot_resp, *, snapshot_raises=None, pnl_resp=None,
     # из-за чего identity зависит от порядка импорта тестовых модулей.
     get_positions = MagicMock(name="get_positions")
     get_order_history = MagicMock(name="get_order_history")
+    get_open_orders = MagicMock(name="get_open_orders")
     get_closed_pnl = MagicMock(name="get_closed_pnl")
     session = SimpleNamespace(
         get_positions=get_positions,
         get_order_history=get_order_history,
+        get_open_orders=get_open_orders,
         get_closed_pnl=get_closed_pnl,
     )
     calls = []
@@ -157,6 +173,13 @@ async def _run_job(rec, snapshot_resp, *, snapshot_raises=None, pnl_resp=None,
             return order_resp if order_resp is not None else {
                 "retCode": 0, "result": {"list": []}
             }
+        if fn is get_open_orders:
+            calls.append("get_open_orders")
+            return {"retCode": 0, "result": {"list": [{
+                "symbol": "BTCUSDT", "orderId": "SL-1", "positionIdx": 0,
+                "side": "Sell", "reduceOnly": True, "closeOnTrigger": True,
+                "stopOrderType": "StopLoss", "triggerPrice": "49000",
+            }]}}
         if fn is get_closed_pnl:
             calls.append("get_closed_pnl")
             return pnl_resp if pnl_resp is not None else {"retCode": 0, "result": {"list": []}}
@@ -174,6 +197,7 @@ async def _run_job(rec, snapshot_resp, *, snapshot_raises=None, pnl_resp=None,
          patch("app.jobs.bybit_call", fake_bybit_call), \
          patch("app.jobs.get_position_lifecycles", rec.get_position_lifecycles), \
          patch("app.jobs.append_event", rec.append_event), \
+         patch("app.jobs.append_position_confirmation", rec.append_position_confirmation), \
          patch("app.jobs.check_and_quarantine_sources", lambda: []):
         await jobs.reconcile_journal_job(ctx)
     return calls
@@ -266,6 +290,7 @@ async def test_pending_entry_is_never_reconciled(
         None, {}, "not-a-dict", {"result": None}, {"result": {}},
         {"result": {"orderId": ""}}, {"result": {"orderId": "   "}},
         {"result": {"orderId": None}}, {"result": {"orderId": 12345}},
+        {"result": {"orderId": " UNKNOWN ", "orderLinkId": "—"}},
         {"retCode": 0, "symbol": "BTCUSDT", "result": {"symbol": "BTCUSDT"}},
     ):
         assert extract_order_ids(barren) == {}, f"Выдуманный идентификатор из {barren!r}"
@@ -281,19 +306,19 @@ async def test_pending_entry_is_never_reconciled(
     ({"retCode": 0, "retMsg": "OK",
       "result": {"orderId": "OID-1", "orderLinkId": ""}},
      _fill(order_id="OID-1", qty="1.5")),
-    # Ответ содержит только orderLinkId
+    # Ответ содержит только durable orderLinkId: exact link достаточно.
     ({"retCode": 0, "result": {"orderLinkId": "LINK-9"}},
          {"retCode": 0, "retMsg": "OK", "result": {"list": [
              {"symbol": "BTCUSDT", "orderId": "OTHER",
               "orderLinkId": "LINK-9", "cumExecQty": "2",
-              "avgPrice": "50000"},
+              "avgPrice": "50000", "positionIdx": 0},
      ]}}),
     # Чужие строки в истории не мешают найти свою
     ({"retCode": 0, "result": {"orderId": " OID-1 "}},
          {"retCode": "0", "result": {"list": [
              {"symbol": "BTCUSDT", "orderId": "OLD-MANUAL", "cumExecQty": "9"},
              {"symbol": "BTCUSDT", "orderId": "OID-1", "cumExecQty": 0.75,
-              "avgPrice": "50000"},
+              "avgPrice": "50000", "positionIdx": 0},
          ]}}),
 ])
 async def test_position_confirmed_once_on_proven_fill(place_resp, evidence):
@@ -308,23 +333,36 @@ async def test_position_confirmed_once_on_proven_fill(place_resp, evidence):
     assert entry_kwargs, "Идентификатор обязан извлекаться из ответа размещения"
 
     # Символ в журнале в другом регистре: нормализация обязана его сопоставить
-    if "order_link_id" in entry_kwargs and "order_id" not in entry_kwargs:
-        entry_kwargs["order_id"] = ""
-    rec = _Recorder([_entry(" btcusdt ", **entry_kwargs)])
+    rec = _Recorder([
+        _entry(
+            " btcusdt ",
+            order_id=entry_kwargs.get("order_id", ""),
+            order_link_id=entry_kwargs.get("order_link_id", ""),
+        )
+    ])
     assert rec.state("BTCUSDT") == PENDING
 
-    await _run_job(rec, _snapshot("BTCUSDT"), order_resp=evidence)
+    fill_qty = evidence["result"]["list"][-1]["cumExecQty"]
+    await _run_job(
+        rec, _snapshot("BTCUSDT", size=str(fill_qty)), order_resp=evidence
+    )
 
     confirms = rec.events_of(POSITION_CONFIRMED)
     assert len(confirms) == 1, "Ровно одно подтверждение"
     assert confirms[0]["symbol"] == "BTCUSDT"
+    assert confirms[0].get("order_id", "") == entry_kwargs.get("order_id", "")
+    assert confirms[0].get("order_link_id", "") == entry_kwargs.get(
+        "order_link_id", ""
+    )
     for invented in ("pnl_usdt", "exit", "reason", "R"):
         assert invented not in confirms[0], f"Выдуманное поле в подтверждении: {invented}"
     assert rec.state("BTCUSDT") == CONFIRMED
     assert rec.messages == [], "Подтверждение не уведомляет оператора"
 
     # Повторный снимок с той же позицией не дублирует подтверждение
-    calls = await _run_job(rec, _snapshot("BTCUSDT"), order_resp=evidence)
+    calls = await _run_job(
+        rec, _snapshot("BTCUSDT", size=str(fill_qty)), order_resp=evidence
+    )
     assert len(rec.events_of(POSITION_CONFIRMED)) == 1, "Дубля подтверждения нет"
     assert "get_order_history" not in calls, \
         "CONFIRMED lifecycle не перепроверяет order evidence"
@@ -468,11 +506,15 @@ async def test_unknown_snapshot_changes_nothing(snapshot_resp, raises):
     from app.jobs import parse_positions_snapshot, _SnapshotUnknown
     assert parse_positions_snapshot({"retCode": 0, "result": {"list": []}}) == set()
     assert parse_positions_snapshot(
-        {"retCode": "0", "result": {"list": [{"symbol": "btcusdt", "size": "2"}]}}
+        {"retCode": "0", "result": {"list": [
+            {"symbol": "btcusdt", "size": "2", "side": "Buy"}
+        ]}}
     ) == {"BTCUSDT"}
-    # size == 0 — позиции нет, но снимок достоверен
+    # Bybit explicit-symbol flat row: size == 0 и side == "" достоверно flat.
     assert parse_positions_snapshot(
-        {"retCode": 0, "result": {"list": [{"symbol": "BTCUSDT", "size": "0"}]}}
+        {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "0", "side": ""}
+        ]}}
     ) == set()
     with pytest.raises(_SnapshotUnknown):
         parse_positions_snapshot({"result": {"list": []}})

@@ -481,30 +481,49 @@ async def test_audit_failure_never_repeats_the_exchange_write(jobs):
 
 @pytest.mark.asyncio
 async def test_confirmation_records_only_proven_position_idx(jobs):
-    """POSITION_CONFIRMED сохраняет positionIdx из точно совпавшей строки
-    fill evidence и не пишет его, когда он не доказан."""
+    """POSITION_CONFIRMED requires a proven positionIdx and current geometry."""
     appended = MagicMock(return_value=True)
-    info = {"order_id": "o-1", "order_link_id": "", "side": "Buy",
+    info = {"order_id": "o-1", "order_link_id": "", "side": "LONG",
             "entry_event_ts": 1700000000.0}
+    position_resp = {"retCode": 0, "result": {"list": [{
+        "symbol": "BTCUSDT", "side": "Buy", "positionIdx": 1,
+        "size": "0.5", "avgPrice": "50000", "stopLoss": "49000",
+    }]}}
+    orders_resp = {"retCode": 0, "result": {"list": [{
+        "symbol": "BTCUSDT", "orderId": "sl-1", "positionIdx": 1,
+        "side": "Sell", "reduceOnly": True, "closeOnTrigger": True,
+        "stopOrderType": "StopLoss", "triggerPrice": "49000",
+    }]}}
 
-    with patch.object(jobs, "append_event", appended), \
+    with patch.object(jobs, "append_position_confirmation",
+                      lambda event, _expected: appended(event) and
+                      jobs.CONFIRM_APPEND_WRITTEN), \
          patch.object(jobs, "_fetch_fill_evidence",
                       AsyncMock(return_value=(jobs.Decimal("0.5"), 1,
-                                              jobs.Decimal("50000")))):
-        await jobs._confirm_position("BTCUSDT", dict(info))
+                                              jobs.Decimal("50000")))), \
+         patch.object(jobs, "bybit_call", AsyncMock(return_value=orders_resp)):
+        await jobs._confirm_position(
+            "BTCUSDT", dict(info), position_resp=position_resp
+        )
     proven = appended.call_args_list[-1].args[0]
 
-    with patch.object(jobs, "append_event", appended), \
+    before = appended.call_count
+    with patch.object(jobs, "append_position_confirmation",
+                      lambda event, _expected: appended(event) and
+                      jobs.CONFIRM_APPEND_WRITTEN), \
          patch.object(jobs, "_fetch_fill_evidence",
                       AsyncMock(return_value=(jobs.Decimal("0.5"), None,
                                               jobs.Decimal("50000")))):
-        await jobs._confirm_position("BTCUSDT", dict(info))
-    unproven = appended.call_args_list[-1].args[0]
+        result = await jobs._confirm_position(
+            "BTCUSDT", dict(info), position_resp=position_resp
+        )
 
     assert proven["event"] == jobs.POSITION_CONFIRMED
     assert proven["position_idx"] == 1
     assert proven["order_id"] == "o-1"
-    assert "position_idx" not in unproven
+    assert proven["initial_sl_order_id"] == "sl-1"
+    assert result == jobs.CONFIRM_RESULT_DEFERRED
+    assert appended.call_count == before
 
 
 @pytest.mark.asyncio
@@ -559,6 +578,59 @@ async def test_fill_evidence_returns_position_idx_of_matched_row(jobs):
     assert str(qty) == "0.5"
     assert idx == 1
     assert str(avg_entry) == "50000"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable_id,durable_link,row_id,row_link,accepted", [
+    ("o-1", "l-1", "o-1", "l-1", True),
+    ("o-1", "l-1", "o-1", "other", False),
+    ("o-1", "l-1", "other", "l-1", False),
+    ("o-1", "", "o-1", "other", True),
+    ("", "l-1", "other", "l-1", True),
+])
+async def test_fill_evidence_requires_all_durable_identifiers(
+    jobs, durable_id, durable_link, row_id, row_link, accepted
+):
+    response = {"retCode": 0, "result": {"list": [{
+        "symbol": "BTCUSDT", "orderId": row_id, "orderLinkId": row_link,
+        "cumExecQty": "0.5", "avgPrice": "50000", "positionIdx": 1,
+    }]}}
+    with patch.object(jobs, "bybit_call", AsyncMock(return_value=response)):
+        if accepted:
+            qty, idx, price = await jobs._fetch_fill_evidence(
+                "BTCUSDT", durable_id, durable_link
+            )
+            assert (str(qty), idx, str(price)) == ("0.5", 1, "50000")
+        else:
+            with pytest.raises(jobs._SnapshotUnknown):
+                await jobs._fetch_fill_evidence(
+                    "BTCUSDT", durable_id, durable_link
+                )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_field,exit_value", [
+    ("reduceOnly", True),
+    ("reduceOnly", "true"),
+    ("closeOnTrigger", True),
+    ("closeOnTrigger", "true"),
+    ("stopOrderType", "StopLoss"),
+    ("createType", "CreateByTakeProfit"),
+    ("orderFilter", "StopOrder"),
+    ("orderType", "UNKNOWN"),
+    ("reduceOnly", None),
+])
+async def test_exit_like_history_row_is_not_fresh_entry_fill(
+    jobs, exit_field, exit_value
+):
+    row = {
+        "symbol": "BTCUSDT", "orderId": "o-1", "cumExecQty": "0.5",
+        "avgPrice": "50000", "positionIdx": 1, exit_field: exit_value,
+    }
+    response = {"retCode": 0, "result": {"list": [row]}}
+    with patch.object(jobs, "bybit_call", AsyncMock(return_value=response)):
+        with pytest.raises(jobs._SnapshotUnknown):
+            await jobs._fetch_fill_evidence("BTCUSDT", "o-1", "")
 
 
 # ── 7. Команда /timeline ──────────────────────────────────────────────────────

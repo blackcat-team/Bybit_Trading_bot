@@ -54,6 +54,11 @@ from core.journal import (
     get_exit_binding_events,
     get_auto_protection_evidence,
     entry_side_to_position_side,
+    normalize_durable_order_identifier,
+    append_position_confirmation,
+    is_current_pending_lifecycle,
+    CONFIRM_APPEND_WRITTEN,
+    CONFIRM_APPEND_NOT_CURRENT,
 )
 # Строгий разбор positionIdx и канонический write_outcome берутся из общего
 # контракта доказательств (HIGH-6): идентичность позиции в журнале обязана
@@ -90,6 +95,14 @@ from handlers.ui import (
 
 # Засекаем время старта
 START_TIME = time.time()
+
+FRESH_CONFIRM_ATTEMPTS = 3
+FRESH_CONFIRM_RETRY_DELAY_SEC = 1.0
+CONFIRM_SOURCE_FRESH = "fresh_market"
+CONFIRM_SOURCE_PERIODIC = "periodic_recovery"
+CONFIRM_RESULT_SUCCESS = "SUCCESS"
+CONFIRM_RESULT_DEFERRED = "DEFERRED"
+CONFIRM_RESULT_NOT_CURRENT = "NOT_CURRENT"
 
 
 class _SnapshotUnknown(Exception):
@@ -194,7 +207,10 @@ def parse_positions_snapshot(resp) -> set:
       - result является dict;
       - ключ list присутствует и является list;
       - каждая строка — dict с непустым символом и корректным size
-        (bool, отрицательное, NaN, Infinity и нечисловое → UNKNOWN).
+        (bool, отрицательное, NaN, Infinity и нечисловое → UNKNOWN);
+      - для size > 0 сторона должна быть доказанным Buy/Sell. Штатная flat-
+        строка Bybit с size == 0 и side == "" остаётся доказанным отсутствием
+        позиции: направление у отсутствующей позиции не требуется.
 
     Пустой список при выполненных условиях — достоверное «позиций нет»;
     size == 0 означает отсутствие позиции по символу.
@@ -215,6 +231,16 @@ def parse_positions_snapshot(resp) -> set:
             raise _SnapshotUnknown("get_positions: в строке позиции отсутствует символ")
         size = _parse_decimal_qty(row.get("size"), f"get_positions size {symbol}")
         if size > 0:
+            raw_side = row.get("side")
+            if not isinstance(raw_side, str):
+                raise _SnapshotUnknown(
+                    f"get_positions: сторона активной позиции {symbol} не строка"
+                )
+            side = raw_side.strip().capitalize()
+            if side not in ("Buy", "Sell"):
+                raise _SnapshotUnknown(
+                    f"get_positions: сторона активной позиции {symbol} не доказана"
+                )
             open_syms.add(symbol)
     return open_syms
 
@@ -770,7 +796,16 @@ async def reconcile_journal_job(context: ContextTypes.DEFAULT_TYPE):
             present = sym in open_syms
 
             if state == PENDING and present:
-                await _confirm_position(sym, info)
+                logging.info(
+                    "Periodic recovery confirmation: symbol=%s side=%s "
+                    "orderId=%s orderLinkId=%s source=get_positions",
+                    sym, info.get("side", ""), info.get("order_id", "") or "-",
+                    info.get("order_link_id", "") or "-",
+                )
+                await _confirm_position(
+                    sym, info, position_resp=_pos_resp,
+                    confirmation_source=CONFIRM_SOURCE_PERIODIC,
+                )
             elif state == CONFIRMED and not present:
                 await _reconcile_missing_position(context, sym, info)
             # PENDING без позиции, CONFIRMED с позицией и TERMINAL — без действий.
@@ -806,10 +841,37 @@ def _lifecycle_order_ids(info: dict) -> tuple[str, str]:
     Отсутствующие идентификаторы дают пустые строки: их наличие обязательно
     для подтверждения, а придумывать их нельзя.
     """
-    def _clean(raw) -> str:
-        return raw.strip() if isinstance(raw, str) else ""
+    return (
+        normalize_durable_order_identifier(info.get("order_id")),
+        normalize_durable_order_identifier(info.get("order_link_id")),
+    )
 
-    return _clean(info.get("order_id")), _clean(info.get("order_link_id"))
+
+def _history_entry_discriminators_ok(row: dict) -> bool:
+    """Fail closed on present fields incompatible with this bot's entry orders."""
+    for field in ("reduceOnly", "closeOnTrigger"):
+        if field not in row:
+            continue
+        raw = row.get(field)
+        if raw is False:
+            continue
+        if isinstance(raw, str) and raw.strip().lower() == "false":
+            continue
+        return False
+
+    allowed_text = {
+        "orderType": {"Market", "Limit"},
+        "stopOrderType": {"", "UNKNOWN"},
+        "orderFilter": {"", "Order"},
+        "createType": {"", "CreateByUser"},
+    }
+    for field, allowed in allowed_text.items():
+        if field not in row:
+            continue
+        raw = row.get(field)
+        if not isinstance(raw, str) or raw.strip() not in allowed:
+            return False
+    return True
 
 
 async def _fetch_fill_evidence(
@@ -830,6 +892,13 @@ async def _fetch_fill_evidence(
     отсутствующем либо нулевом исполненном объёме. Совпадения только по symbol
     или side доказательством не являются.
     """
+    order_id = normalize_durable_order_identifier(order_id)
+    order_link_id = normalize_durable_order_identifier(order_link_id)
+    if not order_id and not order_link_id:
+        raise _SnapshotUnknown(
+            f"get_order_history: у lifecycle {sym} нет durable orderId/orderLinkId"
+        )
+
     kwargs = {"category": "linear", "symbol": sym, "limit": 50}
     if order_id:
         kwargs["orderId"] = order_id
@@ -851,14 +920,15 @@ async def _fetch_fill_evidence(
             raise _SnapshotUnknown(
                 f"get_order_history: строка не dict: {type(row).__name__}"
             )
-        row_id = row.get("orderId")
-        row_link = row.get("orderLinkId")
-        row_id = row_id.strip() if isinstance(row_id, str) else ""
-        row_link = row_link.strip() if isinstance(row_link, str) else ""
+        row_id = normalize_durable_order_identifier(row.get("orderId"))
+        row_link = normalize_durable_order_identifier(row.get("orderLinkId"))
 
-        # Exact orderId — основной identity. orderLinkId нужен только когда
-        # durable orderId отсутствует.
-        exact = row_id == order_id if order_id else row_link == order_link_id
+        # Every durable identifier that exists is conjunctive evidence. A row
+        # matching one identifier but contradicting the other is another order.
+        exact = (
+            (not order_id or row_id == order_id)
+            and (not order_link_id or row_link == order_link_id)
+        )
         if not exact:
             continue
         matched.append(row)
@@ -872,6 +942,10 @@ async def _fetch_fill_evidence(
     row = matched[0]
     if normalize_symbol(row.get("symbol")) != normalize_symbol(sym):
         raise _SnapshotUnknown("get_order_history: symbol exact ордера не совпал")
+    if not _history_entry_discriminators_ok(row):
+        raise _SnapshotUnknown(
+            "get_order_history: exact ордер доказанно является закрывающим"
+        )
     if "cumExecQty" not in row:
         raise _SnapshotUnknown(
             f"get_order_history: у ордера {order_id or order_link_id} нет cumExecQty"
@@ -890,7 +964,13 @@ async def _fetch_fill_evidence(
     return exec_qty, read_position_idx(row.get("positionIdx")), avg_entry_price
 
 
-async def _confirm_position(sym: str, info: dict) -> None:
+async def _confirm_position(
+    sym: str,
+    info: dict,
+    *,
+    position_resp=None,
+    confirmation_source: str = CONFIRM_SOURCE_PERIODIC,
+) -> str:
     """Подтверждает lifecycle только при доказанном исполнении своего ордера.
 
     Присутствие символа в снимке само по себе НЕ подтверждает PENDING: на том
@@ -904,9 +984,9 @@ async def _confirm_position(sym: str, info: dict) -> None:
     только отсюда, никогда placement-хендлерами, и не содержит PnL, цены
     выхода или причины закрытия.
 
-    Доказанный positionIdx из той же самой fill evidence сохраняется в событии
-    как канонический идентификатор позиции. Недоказанный не записывается вовсе:
-    контракт подтверждения от него не зависит и не ослабляется.
+    Доказанный positionIdx из той же fill evidence обязателен. Текущая позиция
+    должна ровно совпасть с исполнением по symbol/side/positionIdx/qty/avgPrice,
+    а исходный SL child должен быть доказан до единственной atomic-записи.
     """
     order_id, order_link_id = _lifecycle_order_ids(info)
     if not order_id and not order_link_id:
@@ -915,7 +995,7 @@ async def _confirm_position(sym: str, info: dict) -> None:
             "Reconcile: %s остаётся PENDING — в ENTRY_PLACED нет orderId/orderLinkId",
             sym,
         )
-        return
+        return CONFIRM_RESULT_DEFERRED
 
     try:
         exec_qty, position_idx, avg_entry_price = await _fetch_fill_evidence(
@@ -927,65 +1007,100 @@ async def _confirm_position(sym: str, info: dict) -> None:
             "Reconcile: подтверждение %s отложено (UNKNOWN order evidence): %s",
             sym, unknown,
         )
-        return
+        return CONFIRM_RESULT_DEFERRED
 
     if exec_qty <= 0:
         logging.info(
             "Reconcile: %s остаётся PENDING — исполненный объём ордера %s равен 0",
             sym, order_id or order_link_id,
         )
-        return
+        return CONFIRM_RESULT_DEFERRED
 
-    initial_anchor = {}
-    if position_idx is not None and order_id:
-        try:
+    # LIVE-FIX6 ownership is indivisible: exact fill must still be represented
+    # by the exact current position geometry before confirmation can be durable.
+    if position_idx is None or (not order_id and not order_link_id):
+        logging.warning(
+            "Position confirmation deferred: symbol=%s source=%s "
+            "reason=position_identity_unproven",
+            sym, confirmation_source,
+        )
+        return CONFIRM_RESULT_DEFERRED
+
+    try:
+        if position_resp is None:
             position_resp = await bybit_call(
                 session.get_positions, category="linear", symbol=sym
             )
-            position_rows = _require_result_rows(
-                position_resp, "get_positions initial anchor"
+        parse_positions_snapshot(position_resp)
+        position_rows = _require_result_rows(
+            position_resp, "get_positions confirmation"
+        )
+        position_side = entry_side_to_position_side(info.get("side"))
+        position = find_proven_position_row(
+            position_rows,
+            symbol=sym,
+            side=position_side,
+            position_idx=position_idx,
+            exec_qty=exec_qty,
+            avg_price=avg_entry_price,
+        )
+        if position is None:
+            logging.info(
+                "Position confirmation deferred: symbol=%s source=%s "
+                "reason=exact_current_position_unproven",
+                sym, confirmation_source,
             )
-            position_side = entry_side_to_position_side(info.get("side"))
-            position = find_proven_position_row(
-                position_rows,
-                symbol=sym,
-                side=position_side,
-                position_idx=position_idx,
-                exec_qty=exec_qty,
-                avg_price=avg_entry_price,
-            )
-            if position is not None:
-                sl_level = position_protection_level(position, EXIT_KIND_SL)
-                orders_resp = await bybit_call(
-                    session.get_open_orders, category="linear", symbol=sym
-                )
-                order_rows = _require_result_rows(
-                    orders_resp, "get_open_orders initial anchor"
-                )
-                sl_order_id = find_protective_exit_order_id(
-                    order_rows,
-                    symbol=sym,
-                    exit_kind=EXIT_KIND_SL,
-                    position_idx=position_idx,
-                    closing=closing_side(position_side),
-                    level=sl_level,
-                )
-                if sl_order_id and sl_level is not None:
-                    initial_anchor = {
-                        "initial_sl_order_id": sl_order_id,
-                        "initial_sl_trigger": str(sl_level),
-                        "initial_sl_anchor_source": (
-                            INITIAL_SL_ANCHOR_SOURCE_CONFIRMATION
-                        ),
-                    }
-        except _SnapshotUnknown as unknown:
+            return CONFIRM_RESULT_DEFERRED
+
+        sl_level = position_protection_level(position, EXIT_KIND_SL)
+        if sl_level is None:
             logging.warning(
-                "Reconcile: initial SL anchor %s не доказан: %s", sym, unknown
+                "Position confirmation deferred: symbol=%s source=%s "
+                "reason=initial_sl_level_unproven",
+                sym, confirmation_source,
             )
-        except Exception as exc:
+            return CONFIRM_RESULT_DEFERRED
+        orders_resp = await bybit_call(
+            session.get_open_orders, category="linear", symbol=sym
+        )
+        order_rows = _require_result_rows(
+            orders_resp, "get_open_orders initial anchor"
+        )
+        sl_order_id = find_protective_exit_order_id(
+            order_rows,
+            symbol=sym,
+            exit_kind=EXIT_KIND_SL,
+            position_idx=position_idx,
+            closing=closing_side(position_side),
+            level=sl_level,
+        )
+        if not sl_order_id:
             logging.warning(
-                "Reconcile: initial SL anchor %s недоступен: %s", sym, exc
+                "Position confirmation deferred: symbol=%s source=%s "
+                "reason=initial_sl_order_unproven",
+                sym, confirmation_source,
             )
+            return CONFIRM_RESULT_DEFERRED
+    except _SnapshotUnknown as unknown:
+        logging.warning(
+            "Position confirmation deferred: symbol=%s source=%s "
+            "reason=unknown_current_ownership detail=%s",
+            sym, confirmation_source, unknown,
+        )
+        return CONFIRM_RESULT_DEFERRED
+    except Exception as exc:
+        logging.warning(
+            "Position confirmation deferred: symbol=%s source=%s "
+            "reason=current_ownership_unavailable detail=%s",
+            sym, confirmation_source, exc,
+        )
+        return CONFIRM_RESULT_DEFERRED
+
+    initial_anchor = {
+        "initial_sl_order_id": sl_order_id,
+        "initial_sl_trigger": str(sl_level),
+        "initial_sl_anchor_source": INITIAL_SL_ANCHOR_SOURCE_CONFIRMATION,
+    }
 
     event = {
         "event": POSITION_CONFIRMED,
@@ -1004,17 +1119,86 @@ async def _confirm_position(sym: str, info: dict) -> None:
         event["position_idx"] = position_idx
     event.update(initial_anchor)
 
-    written = await asyncio.to_thread(append_event, event)
-    if not written:
+    append_result = await asyncio.to_thread(
+        append_position_confirmation, event, info
+    )
+    if append_result == CONFIRM_APPEND_NOT_CURRENT:
+        logging.info(
+            "Position confirmation skipped: symbol=%s source=%s "
+            "reason=lifecycle_changed_before_append",
+            sym, confirmation_source,
+        )
+        return CONFIRM_RESULT_NOT_CURRENT
+    if append_result != CONFIRM_APPEND_WRITTEN:
         # Без durable-записи символ остаётся PENDING: сверка не начнётся,
         # подтверждение будет повторено на следующем цикле.
         logging.error(
             "Reconcile: не удалось записать POSITION_CONFIRMED для %s", sym
         )
-        return
+        return CONFIRM_RESULT_DEFERRED
     logging.info(
-        "Reconcile: POSITION_CONFIRMED для %s (ордер %s, исполнено %s)",
-        sym, order_id or order_link_id, exec_qty,
+        "Position confirmation written: symbol=%s source=%s order=%s "
+        "cumExecQty=%s",
+        sym, confirmation_source, order_id or order_link_id, exec_qty,
+    )
+    return CONFIRM_RESULT_SUCCESS
+
+
+async def fresh_entry_confirmation_job(context: ContextTypes.DEFAULT_TYPE):
+    """Promptly confirms one fresh Market entry using read-only evidence.
+
+    The job starts only after durable ``ENTRY_PLACED``. It performs a bounded
+    number of authoritative reads and never repeats placement or another
+    exchange write. UNKNOWN or not-yet-filled evidence leaves the exact
+    lifecycle PENDING for the hourly reconciliation backstop.
+    """
+    info = getattr(getattr(context, "job", None), "data", None)
+    if not isinstance(info, dict):
+        logging.warning("Fresh confirmation deferred: reason=missing_job_data")
+        return
+
+    sym = normalize_symbol(info.get("symbol"))
+    if not sym:
+        logging.warning("Fresh confirmation deferred: reason=invalid_symbol")
+        return
+
+    for attempt in range(1, FRESH_CONFIRM_ATTEMPTS + 1):
+        if attempt > 1:
+            await asyncio.sleep(FRESH_CONFIRM_RETRY_DELAY_SEC)
+
+        if not await asyncio.to_thread(is_current_pending_lifecycle, sym, info):
+            logging.info(
+                "Fresh confirmation stopped: symbol=%s attempt=%s "
+                "reason=lifecycle_not_current",
+                sym, attempt,
+            )
+            return
+
+        try:
+            position_resp = await bybit_call(
+                session.get_positions, category="linear", symbol=sym
+            )
+        except Exception as exc:
+            logging.warning(
+                "Fresh confirmation deferred: symbol=%s attempt=%s/%s "
+                "reason=position_read_failed detail=%s",
+                sym, attempt, FRESH_CONFIRM_ATTEMPTS, exc,
+            )
+            continue
+
+        result = await _confirm_position(
+            sym,
+            info,
+            position_resp=position_resp,
+            confirmation_source=CONFIRM_SOURCE_FRESH,
+        )
+        if result in (CONFIRM_RESULT_SUCCESS, CONFIRM_RESULT_NOT_CURRENT):
+            return
+
+    logging.warning(
+        "Fresh confirmation remains PENDING: symbol=%s attempts=%s "
+        "recovery=periodic_reconcile",
+        sym, FRESH_CONFIRM_ATTEMPTS,
     )
 
 

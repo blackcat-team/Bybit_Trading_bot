@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import time
+from decimal import Decimal, InvalidOperation
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram import error as tg_error
@@ -63,6 +64,11 @@ _PREVIEW_TS: dict = {}
 # Имя пути записи в доказательствах проверки (HIGH-6).
 _MARKET_VERIFY_PATH = "market_entry"
 
+# Prompt read-only confirmation starts shortly after durable ENTRY_PLACED.
+# Further bounded attempts and their delay live in app.jobs with the single
+# authoritative confirmation contract.
+FRESH_CONFIRM_FIRST_DELAY_SEC = 1.0
+
 
 def _write_is_proven_rejection(reject_code) -> bool:
     """True, только если биржа доказанно отказала до применения записи.
@@ -103,12 +109,14 @@ def _snapshot_position_keys(resp, symbol):
     нельзя молча пропустить, записать под ключом с пустым символом или стороной
     и нельзя счесть отсутствием позиции — любой из этих вариантов позволил бы
     выдать чужую позицию за свою. Пустое множество означает доказанное
-    «позиций инструмента не было».
+    «позиция инструмента доказанно flat». Пустой либо wrong-symbol-only ответ
+    explicit-symbol запроса доказательством flat не является.
 
     Fail-closed триггеры: строка не dict; отсутствующий, не строковый или пустой
     ``symbol``; несравнимый символ; отсутствующая или не ``Buy``/``Sell``
     сторона; отсутствующий или не 0/1/2 ``positionIdx``; отсутствующий,
-    неразбираемый, bool, NaN, Infinity или отрицательный ``size``; активная
+    ``None``, пустой, неразбираемый, bool, NaN, Infinity или отрицательный
+    ``size``; активная
     строка (``size`` > 0) без доказанного положительного ``avgPrice``.
     """
     if not envelope_ok(resp):
@@ -120,6 +128,7 @@ def _snapshot_position_keys(resp, symbol):
     if not wanted_symbol:
         return SNAPSHOT_UNPROVEN
     keys = set()
+    matched_symbol = False
     for row in rows:
         if not isinstance(row, dict):
             return SNAPSHOT_UNPROVEN
@@ -131,12 +140,7 @@ def _snapshot_position_keys(resp, symbol):
         if raw_symbol.strip().upper() != wanted_symbol:
             # Доказанно другой инструмент: к этой записи не относится.
             continue
-        raw_side = row.get("side")
-        if not isinstance(raw_side, str):
-            return SNAPSHOT_UNPROVEN
-        side_key = raw_side.strip().capitalize()
-        if side_key not in ("Buy", "Sell"):
-            return SNAPSHOT_UNPROVEN
+        matched_symbol = True
         if "positionIdx" not in row:
             return SNAPSHOT_UNPROVEN
         idx = read_position_idx(row.get("positionIdx"))
@@ -144,17 +148,41 @@ def _snapshot_position_keys(resp, symbol):
             return SNAPSHOT_UNPROVEN
         if "size" not in row:
             return SNAPSHOT_UNPROVEN
-        size = read_protection_level(row.get("size"))
-        if size is MALFORMED or size is MISSING:
+        raw_size = row.get("size")
+        if isinstance(raw_size, bool) or raw_size is None:
             return SNAPSHOT_UNPROVEN
-        if size is None:
+        if isinstance(raw_size, str):
+            source = raw_size.strip()
+            if not source:
+                return SNAPSHOT_UNPROVEN
+        elif isinstance(raw_size, (int, float, Decimal)):
+            source = raw_size
+        else:
+            return SNAPSHOT_UNPROVEN
+        try:
+            size = Decimal(source)
+        except (InvalidOperation, TypeError, ValueError):
+            return SNAPSHOT_UNPROVEN
+        if not size.is_finite() or size < 0:
+            return SNAPSHOT_UNPROVEN
+        if size == 0:
             # Доказанно нулевой размер: позиции нет, идентичность не занимаем.
+            # Bybit штатно отдаёт flat one-way row с side=""; направление для
+            # отсутствующей позиции не требуется, но positionIdx уже доказан.
+            if row.get("side") != "":
+                return SNAPSHOT_UNPROVEN
             continue
+        raw_side = row.get("side")
+        if not isinstance(raw_side, str):
+            return SNAPSHOT_UNPROVEN
+        side_key = raw_side.strip().capitalize()
+        if side_key not in ("Buy", "Sell"):
+            return SNAPSHOT_UNPROVEN
         if to_positive_decimal(row.get("avgPrice")) is None:
             # Активная позиция без доказанной цены входа: строка недостоверна.
             return SNAPSHOT_UNPROVEN
         keys.add((wanted_symbol, side_key, idx))
-    return keys
+    return keys if matched_symbol else SNAPSHOT_UNPROVEN
 
 
 def _resolve_entry_position_idx(resp, symbol, side, pre_keys):
@@ -909,6 +937,45 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             or order_ids.get("order_link_id")
                             or "идентификатор недоступен",
                         )
+                    elif order_ids:
+                        try:
+                            # Local import avoids the handlers -> app.jobs ->
+                            # handlers import cycle during application startup.
+                            from app.jobs import fresh_entry_confirmation_job
+
+                            confirmation_data = {
+                                "symbol": sym,
+                                "side": side,
+                                "source_tag": src_val or "unknown",
+                                "entry_event_ts": entry_event.get("ts"),
+                                "order_id": order_ids.get("order_id", ""),
+                                "order_link_id": order_ids.get("order_link_id", ""),
+                            }
+                            context.job_queue.run_once(
+                                fresh_entry_confirmation_job,
+                                FRESH_CONFIRM_FIRST_DELAY_SEC,
+                                data=confirmation_data,
+                            )
+                            logging.info(
+                                "Fresh confirmation scheduled: symbol=%s side=%s "
+                                "orderId=%s orderLinkId=%s first_delay=%ss",
+                                sym, side,
+                                confirmation_data["order_id"] or "-",
+                                confirmation_data["order_link_id"] or "-",
+                                FRESH_CONFIRM_FIRST_DELAY_SEC,
+                            )
+                        except Exception as schedule_exc:
+                            # ENTRY_PLACED remains durable and hourly reconcile
+                            # remains the recovery path; no exchange write repeats.
+                            logging.warning(
+                                "Fresh confirmation deferred: symbol=%s side=%s "
+                                "orderId=%s reason=scheduling_failed detail=%s",
+                                sym, side,
+                                order_ids.get("order_id")
+                                or order_ids.get("order_link_id")
+                                or "-",
+                                schedule_exc,
+                            )
                 except Exception as je:
                     logging.error(
                         "journal ENTRY_PLACED failed для %s: %s — lifecycle tracking "

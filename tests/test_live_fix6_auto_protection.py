@@ -1,6 +1,7 @@
 """LIVE-FIX6: durable ownership and immutable original R geometry."""
 
 import os
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -88,6 +89,12 @@ def _write_events(monkeypatch, tmp_path, *events):
         assert journal.append_event(dict(event)) is True
 
 
+def _current_lifecycle(symbol="ETHUSDT"):
+    current = dict(journal.get_position_lifecycles()[symbol])
+    current["symbol"] = symbol
+    return current
+
+
 def _position(
     symbol="ETHUSDT", *, qty="10", mark="101.5", idx=0, side="Buy",
     entry="100", stop="99",
@@ -116,6 +123,22 @@ def _sl_order(
         "stopOrderType": "StopLoss",
         "triggerPrice": trigger,
     }
+
+
+def _history_row(
+    *, order_id="entry-1", order_link_id="", qty="10", entry="100", idx=0,
+    symbol="ETHUSDT", **extra,
+):
+    row = {
+        "symbol": symbol,
+        "orderId": order_id,
+        "orderLinkId": order_link_id,
+        "cumExecQty": qty,
+        "avgPrice": entry,
+        "positionIdx": idx,
+    }
+    row.update(extra)
+    return row
 
 
 async def _run_job(monkeypatch, tmp_path, positions, events=None, *, risk_lookup=None,
@@ -217,10 +240,7 @@ async def test_market_reference_entry_is_replaced_by_authoritative_fill_entry(
 
     monkeypatch.setattr(jobs, "session", fake_session)
     monkeypatch.setattr(jobs, "bybit_call", call)
-    await jobs._confirm_position("ETHUSDT", {
-        "order_id": "entry-1", "order_link_id": "", "side": "LONG",
-        "entry_event_ts": 1000.0,
-    })
+    await jobs._confirm_position("ETHUSDT", _current_lifecycle())
     assert journal.read_events(event_type=journal.POSITION_CONFIRMED)[0][
         "avg_entry_price"
     ] == "1888.25"
@@ -504,10 +524,7 @@ async def test_changed_protection_waits_for_exact_rebinding(
     monkeypatch.setattr(jobs, "is_trading_enabled", lambda: True)
     context = SimpleNamespace(bot=AsyncMock())
 
-    await jobs._confirm_position("ETHUSDT", {
-        "order_id": "entry-1", "order_link_id": "", "side": "LONG",
-        "entry_event_ts": 1000.0,
-    })
+    await jobs._confirm_position("ETHUSDT", _current_lifecycle())
     confirmed = journal.read_events(event_type=journal.POSITION_CONFIRMED)
     assert confirmed[0]["initial_sl_order_id"] == "sl-1"
 
@@ -554,6 +571,323 @@ def test_sequential_same_symbol_lifecycles_keep_exact_entry_plan(
     assert evidence["ETHUSDT"]["sl_bindings"] == {
         "new-sl": journal.Decimal("190")
     }
+
+
+@pytest.mark.asyncio
+async def test_prompt_confirmation_is_bounded_and_unknown_stays_pending(
+    monkeypatch, tmp_path
+):
+    _write_events(monkeypatch, tmp_path, _entry())
+    info = _current_lifecycle()
+    calls = []
+
+    async def get_positions(**_kwargs):
+        calls.append("get_positions")
+        return {"retCode": 0, "result": {"list": [
+            {"symbol": "ETHUSDT", "size": "0", "side": ""}
+        ]}}
+
+    monkeypatch.setattr(jobs, "session", SimpleNamespace(get_positions=get_positions))
+    monkeypatch.setattr(jobs, "bybit_call", lambda fn, **kwargs: fn(**kwargs))
+    sleep = AsyncMock()
+    monkeypatch.setattr(jobs.asyncio, "sleep", sleep)
+
+    await jobs.fresh_entry_confirmation_job(
+        SimpleNamespace(job=SimpleNamespace(data=info))
+    )
+
+    assert calls == ["get_positions"] * jobs.FRESH_CONFIRM_ATTEMPTS
+    assert sleep.await_count == jobs.FRESH_CONFIRM_ATTEMPTS - 1
+    assert journal.get_position_lifecycles()["ETHUSDT"]["state"] == journal.PENDING
+    assert journal.read_events(event_type=journal.POSITION_CONFIRMED) == []
+
+
+@pytest.mark.asyncio
+async def test_prompt_and_periodic_confirmation_are_idempotent_for_exact_lifecycle(
+    monkeypatch, tmp_path
+):
+    _write_events(monkeypatch, tmp_path, _entry())
+    info = _current_lifecycle()
+    position = _position()
+    history = {
+        "symbol": "ETHUSDT", "orderId": "entry-1", "cumExecQty": "10",
+        "avgPrice": "100", "positionIdx": 0,
+    }
+    sl_order = _sl_order()
+
+    async def get_positions(**_kwargs):
+        return {"retCode": 0, "result": {"list": [position]}}
+
+    async def get_order_history(**_kwargs):
+        return {"retCode": 0, "result": {"list": [history]}}
+
+    async def get_open_orders(**_kwargs):
+        return {"retCode": 0, "result": {"list": [sl_order]}}
+
+    session = SimpleNamespace(
+        get_positions=get_positions,
+        get_order_history=get_order_history,
+        get_open_orders=get_open_orders,
+    )
+
+    async def call(fn, **kwargs):
+        return await fn(**kwargs)
+
+    monkeypatch.setattr(jobs, "session", session)
+    monkeypatch.setattr(jobs, "bybit_call", call)
+
+    await asyncio.gather(
+        jobs.fresh_entry_confirmation_job(
+            SimpleNamespace(job=SimpleNamespace(data=dict(info)))
+        ),
+        jobs._confirm_position(
+            "ETHUSDT", dict(info),
+            position_resp={"retCode": 0, "result": {"list": [position]}},
+        ),
+    )
+    await jobs._confirm_position(
+        "ETHUSDT", dict(info),
+        position_resp={"retCode": 0, "result": {"list": [position]}},
+    )
+
+    confirmations = journal.read_events(event_type=journal.POSITION_CONFIRMED)
+    assert len(confirmations) == 1
+    assert confirmations[0]["order_id"] == "entry-1"
+    assert confirmations[0]["initial_sl_order_id"] == "sl-1"
+
+
+@pytest.mark.asyncio
+async def test_stale_prompt_never_confirms_new_same_symbol_lifecycle(
+    monkeypatch, tmp_path
+):
+    _write_events(monkeypatch, tmp_path, _entry(order_id="old"))
+    stale = _current_lifecycle()
+    _write_events(
+        monkeypatch, tmp_path,
+        {"event": journal.RECONCILED, "symbol": "ETHUSDT", "order_id": "old"},
+        _entry(order_id="new"),
+    )
+    bybit = AsyncMock()
+    monkeypatch.setattr(jobs, "bybit_call", bybit)
+
+    await jobs.fresh_entry_confirmation_job(
+        SimpleNamespace(job=SimpleNamespace(data=stale))
+    )
+
+    bybit.assert_not_awaited()
+    assert journal.get_position_lifecycles()["ETHUSDT"]["order_id"] == "new"
+    assert journal.read_events(event_type=journal.POSITION_CONFIRMED) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("position", [
+    _position(qty="7", entry="100", idx=0),
+    _position(qty="10", entry="100", idx=1),
+    _position(qty="10", entry="101", idx=0),
+], ids=["unrelated_same_side_qty", "wrong_position_idx", "wrong_avg_price"])
+async def test_exact_fill_cannot_confirm_incompatible_current_position(
+    monkeypatch, tmp_path, position
+):
+    _write_events(monkeypatch, tmp_path, _entry())
+
+    async def get_order_history(**_kwargs):
+        return {"retCode": 0, "result": {"list": [_history_row()]}}
+
+    async def get_open_orders(**_kwargs):
+        return {"retCode": 0, "result": {"list": [_sl_order()]}}
+
+    session = SimpleNamespace(
+        get_order_history=get_order_history,
+        get_open_orders=get_open_orders,
+    )
+
+    async def call(fn, **kwargs):
+        return await fn(**kwargs)
+
+    monkeypatch.setattr(jobs, "session", session)
+    monkeypatch.setattr(jobs, "bybit_call", call)
+    result = await jobs._confirm_position(
+        "ETHUSDT", _current_lifecycle(),
+        position_resp={"retCode": 0, "result": {"list": [position]}},
+    )
+
+    assert result == jobs.CONFIRM_RESULT_DEFERRED
+    assert journal.get_position_lifecycles()["ETHUSDT"]["state"] == journal.PENDING
+    assert journal.read_events(event_type=journal.POSITION_CONFIRMED) == []
+
+
+@pytest.mark.asyncio
+async def test_exact_fill_and_matching_current_position_confirm_with_anchor(
+    monkeypatch, tmp_path
+):
+    _write_events(monkeypatch, tmp_path, _entry())
+
+    async def get_order_history(**_kwargs):
+        return {"retCode": 0, "result": {"list": [_history_row()]}}
+
+    async def get_open_orders(**_kwargs):
+        return {"retCode": 0, "result": {"list": [_sl_order()]}}
+
+    session = SimpleNamespace(
+        get_order_history=get_order_history,
+        get_open_orders=get_open_orders,
+    )
+
+    async def call(fn, **kwargs):
+        return await fn(**kwargs)
+
+    monkeypatch.setattr(jobs, "session", session)
+    monkeypatch.setattr(jobs, "bybit_call", call)
+    result = await jobs._confirm_position(
+        "ETHUSDT", _current_lifecycle(),
+        position_resp={"retCode": 0, "result": {"list": [_position()]}},
+    )
+
+    assert result == jobs.CONFIRM_RESULT_SUCCESS
+    confirmed = journal.read_events(event_type=journal.POSITION_CONFIRMED)
+    assert len(confirmed) == 1
+    assert confirmed[0]["initial_sl_order_id"] == "sl-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "order_id,order_link_id,row_id,row_link,expected",
+    [
+        ("", "link-1", "exchange-id", "link-1", jobs.CONFIRM_RESULT_SUCCESS),
+        ("entry-1", "", "entry-1", "row-link", jobs.CONFIRM_RESULT_SUCCESS),
+        ("entry-1", "link-1", "entry-1", "link-1", jobs.CONFIRM_RESULT_SUCCESS),
+        ("entry-1", "link-1", "entry-1", "wrong-link", jobs.CONFIRM_RESULT_DEFERRED),
+        ("UNKNOWN", "link-1", "exchange-id", "link-1", jobs.CONFIRM_RESULT_SUCCESS),
+        ("entry-1", "UNKNOWN", "entry-1", "row-link", jobs.CONFIRM_RESULT_SUCCESS),
+        ("UNKNOWN", "UNKNOWN", "entry-1", "link-1", jobs.CONFIRM_RESULT_DEFERRED),
+    ],
+    ids=[
+        "link_only",
+        "id_only",
+        "both_exact",
+        "both_contradictory",
+        "unknown_id_is_link_only",
+        "unknown_link_is_id_only",
+        "both_unknown",
+    ],
+)
+async def test_confirmation_uses_only_genuine_durable_identifiers(
+    monkeypatch, tmp_path, order_id, order_link_id, row_id, row_link, expected
+):
+    _write_events(
+        monkeypatch,
+        tmp_path,
+        _entry(order_id=order_id, order_link_id=order_link_id),
+    )
+    history_calls = []
+
+    async def get_order_history(**kwargs):
+        history_calls.append(kwargs)
+        return {"retCode": 0, "result": {"list": [
+            _history_row(order_id=row_id, order_link_id=row_link)
+        ]}}
+
+    async def get_open_orders(**_kwargs):
+        return {"retCode": 0, "result": {"list": [_sl_order()]}}
+
+    session = SimpleNamespace(
+        get_order_history=get_order_history,
+        get_open_orders=get_open_orders,
+    )
+
+    async def call(fn, **kwargs):
+        return await fn(**kwargs)
+
+    monkeypatch.setattr(jobs, "session", session)
+    monkeypatch.setattr(jobs, "bybit_call", call)
+    result = await jobs._confirm_position(
+        "ETHUSDT",
+        _current_lifecycle(),
+        position_resp={"retCode": 0, "result": {"list": [_position()]}},
+    )
+
+    assert result == expected
+    confirmed = journal.read_events(event_type=journal.POSITION_CONFIRMED)
+    if expected == jobs.CONFIRM_RESULT_SUCCESS:
+        assert len(confirmed) == 1
+        assert confirmed[0].get("order_id", "") == (
+            journal.normalize_durable_order_identifier(order_id)
+        )
+        assert confirmed[0].get("order_link_id", "") == (
+            journal.normalize_durable_order_identifier(order_link_id)
+        )
+        assert confirmed[0]["position_idx"] == 0
+        assert confirmed[0]["initial_sl_order_id"] == "sl-1"
+    else:
+        assert confirmed == []
+        assert journal.get_position_lifecycles()["ETHUSDT"]["state"] == journal.PENDING
+
+    if order_id == order_link_id == "UNKNOWN":
+        assert history_calls == []
+    elif journal.normalize_durable_order_identifier(order_id):
+        assert history_calls[0]["orderId"] == order_id
+        assert "orderLinkId" not in history_calls[0]
+    else:
+        assert history_calls[0]["orderLinkId"] == order_link_id
+        assert "orderId" not in history_calls[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unknown_first", [True, False], ids=["unknown_first", "proof_first"])
+async def test_asymmetric_anchor_contenders_leave_one_complete_confirmation(
+    monkeypatch, tmp_path, unknown_first
+):
+    _write_events(monkeypatch, tmp_path, _entry())
+    info = _current_lifecycle()
+    position_resp = {"retCode": 0, "result": {"list": [_position()]}}
+    barrier = asyncio.Event()
+    unknown_released = asyncio.Event()
+
+    async def get_order_history(**_kwargs):
+        return {"retCode": 0, "result": {"list": [_history_row()]}}
+
+    open_calls = 0
+
+    async def get_open_orders(**_kwargs):
+        nonlocal open_calls
+        open_calls += 1
+        call_no = open_calls
+        if unknown_first:
+            if call_no == 1:
+                barrier.set()
+                await unknown_released.wait()
+                raise RuntimeError("transient open-orders failure")
+            await barrier.wait()
+            unknown_released.set()
+            return {"retCode": 0, "result": {"list": [_sl_order()]}}
+        if call_no == 1:
+            barrier.set()
+            await unknown_released.wait()
+            return {"retCode": 0, "result": {"list": [_sl_order()]}}
+        await barrier.wait()
+        unknown_released.set()
+        raise RuntimeError("late transient open-orders failure")
+
+    session = SimpleNamespace(
+        get_order_history=get_order_history,
+        get_open_orders=get_open_orders,
+    )
+
+    async def call(fn, **kwargs):
+        return await fn(**kwargs)
+
+    monkeypatch.setattr(jobs, "session", session)
+    monkeypatch.setattr(jobs, "bybit_call", call)
+    results = await asyncio.gather(
+        jobs._confirm_position("ETHUSDT", dict(info), position_resp=position_resp),
+        jobs._confirm_position("ETHUSDT", dict(info), position_resp=position_resp),
+    )
+
+    assert jobs.CONFIRM_RESULT_SUCCESS in results
+    confirmations = journal.read_events(event_type=journal.POSITION_CONFIRMED)
+    assert len(confirmations) == 1
+    assert confirmations[0]["initial_sl_order_id"] == "sl-1"
+    assert confirmations[0]["initial_sl_trigger"] == "99"
 
 
 def test_info_risk_wording_is_price_risk_not_fee_inclusive():

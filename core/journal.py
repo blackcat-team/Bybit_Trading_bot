@@ -73,6 +73,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from decimal import Decimal, InvalidOperation
 
@@ -84,6 +85,9 @@ from core.config import (
 # второй, ослабленный вариант той же проверки создал бы расхождение в том, что
 # считается доказанной идентичностью позиции. Модуль чистый (stdlib + Decimal).
 from core.write_verify import read_position_idx
+
+
+_JOURNAL_LOCK = threading.RLock()
 
 # ---------------------------------------------------------------------------
 # Константы типов событий журнала
@@ -124,6 +128,10 @@ EXIT_KIND_TP = "tp"
 EXIT_BINDING_SOURCE_OPEN_ORDERS = "get_open_orders"
 INITIAL_SL_ANCHOR_SOURCE_CONFIRMATION = "position_confirmation"
 EXIT_BINDING_ORIGIN_PROTECTION_CHANGE = "protection_change"
+
+CONFIRM_APPEND_WRITTEN = "WRITTEN"
+CONFIRM_APPEND_NOT_CURRENT = "NOT_CURRENT"
+CONFIRM_APPEND_FAILED = "FAILED"
 
 # Каноническая сторона входа в журнале — значение поля ``side`` события
 # ENTRY_PLACED. Оба production-пути записи (limit — handlers/signal_parser.py,
@@ -171,6 +179,12 @@ POSITION_NOT_FOUND_ON_EXCHANGE = "POSITION_NOT_FOUND_ON_EXCHANGE"
 # «цена выхода 0» и «цена выхода не доказана» — разные утверждения.
 UNKNOWN = "UNKNOWN"
 
+# Canonical placeholders used by this repository for missing identifier
+# evidence. Matching is deliberately exact after surrounding whitespace is
+# removed: no case folding or fuzzy aliases may turn an unknown value into an
+# exchange identifier.
+_NON_DURABLE_ORDER_IDENTIFIERS = frozenset({UNKNOWN, "—"})
+
 # Сколько последних relevant-событий отдаёт timeline по умолчанию.
 TIMELINE_DEFAULT_LIMIT = 20
 
@@ -189,6 +203,21 @@ def normalize_symbol(raw) -> str:
     if not isinstance(raw, str):
         return ""
     return raw.strip().upper()
+
+
+def normalize_durable_order_identifier(raw) -> str:
+    """Return a real exchange identifier, or ``""`` when evidence is absent.
+
+    Only strings can be identifiers. Empty/blank values and the repository's
+    exact missing-evidence placeholders ``UNKNOWN`` and ``—`` are absent.
+    Genuine identifiers are stripped but otherwise preserved byte-for-byte.
+    """
+    if type(raw) is not str:
+        return ""
+    identifier = raw.strip()
+    if not identifier or identifier in _NON_DURABLE_ORDER_IDENTIFIERS:
+        return ""
+    return identifier
 
 
 def extract_order_ids(resp) -> dict:
@@ -214,9 +243,9 @@ def extract_order_ids(resp) -> dict:
         ("orderId", "order_id"),
         ("orderLinkId", "order_link_id"),
     ):
-        raw = result.get(raw_key)
-        if isinstance(raw, str) and raw.strip():
-            ids[canonical_key] = raw.strip()
+        identifier = normalize_durable_order_identifier(result.get(raw_key))
+        if identifier:
+            ids[canonical_key] = identifier
     return ids
 
 # ---------------------------------------------------------------------------
@@ -280,7 +309,7 @@ def get_disabled_sources() -> dict:
 # Ввод-вывод журнала
 # ---------------------------------------------------------------------------
 
-def append_event(event: dict) -> bool:
+def _append_event_unlocked(event: dict) -> bool:
     """
     Дописывает одно JSON-событие в файл журнала (формат JSONL).
 
@@ -324,6 +353,12 @@ def append_event(event: dict) -> bool:
         logging.error("journal append_event failed: %s", exc)
         return False
     return True
+
+
+def append_event(event: dict) -> bool:
+    """Durably append one event while serialising journal writers."""
+    with _JOURNAL_LOCK:
+        return _append_event_unlocked(event)
 
 
 def read_events(
@@ -474,6 +509,93 @@ def get_position_lifecycles(events: list | None = None) -> dict:
     return lifecycles
 
 
+def _confirmation_identity(info: dict) -> tuple[str, str, float | None]:
+    raw_ts = info.get("entry_event_ts")
+    try:
+        entry_ts = float(raw_ts)
+    except (TypeError, ValueError):
+        entry_ts = None
+    if entry_ts is not None and (not math.isfinite(entry_ts) or entry_ts <= 0):
+        entry_ts = None
+    return (
+        normalize_durable_order_identifier(info.get("order_id")),
+        normalize_durable_order_identifier(info.get("order_link_id")),
+        entry_ts,
+    )
+
+
+def _same_pending_lifecycle(current: dict | None, expected: dict) -> bool:
+    if not isinstance(current, dict) or current.get("state") != PENDING:
+        return False
+    current_id, current_link, current_ts = _confirmation_identity(current)
+    expected_id, expected_link, expected_ts = _confirmation_identity(expected)
+    if not expected_id and not expected_link:
+        return False
+    if expected_ts is None:
+        return False
+    return (
+        current_id == expected_id
+        and current_link == expected_link
+        and current_ts is not None
+        and current_ts == expected_ts
+    )
+
+
+def is_current_pending_lifecycle(symbol: str, expected: dict) -> bool:
+    """True only while the exact durable entry is still the current PENDING one."""
+    normalized = normalize_symbol(symbol)
+    if not normalized or not isinstance(expected, dict):
+        return False
+    with _JOURNAL_LOCK:
+        return _current_pending_lifecycle(normalized, expected)
+
+
+def _current_pending_lifecycle(symbol: str, expected: dict) -> bool:
+    """Fail closed unless the strict durable scan proves the expected entry."""
+    try:
+        events = [event for _event_type, event in _iter_strict_events()]
+    except Exception as exc:
+        logging.warning(
+            "journal confirmation scan: lifecycle не доказан (%s)", exc
+        )
+        return False
+    return _same_pending_lifecycle(
+        get_position_lifecycles(events).get(symbol), expected
+    )
+
+
+def append_position_confirmation(event: dict, expected: dict) -> str:
+    """Atomically append confirmation only for the exact current lifecycle.
+
+    Prompt confirmation and periodic recovery can race. The journal lock keeps
+    the current-lifecycle check and append indivisible, so a repeated attempt
+    cannot duplicate confirmation and a late result cannot bind to a newer
+    entry of the same symbol.
+    """
+    if not isinstance(event, dict) or event.get("event") != POSITION_CONFIRMED:
+        return CONFIRM_APPEND_NOT_CURRENT
+    symbol = normalize_symbol(event.get("symbol"))
+    if not symbol or not isinstance(expected, dict):
+        return CONFIRM_APPEND_NOT_CURRENT
+
+    event_id, event_link, event_ts = _confirmation_identity(event)
+    expected_id, expected_link, expected_ts = _confirmation_identity(expected)
+    if (
+        event_id != expected_id
+        or event_link != expected_link
+        or event_ts is None
+        or event_ts != expected_ts
+    ):
+        return CONFIRM_APPEND_NOT_CURRENT
+
+    with _JOURNAL_LOCK:
+        if not _current_pending_lifecycle(symbol, expected):
+            return CONFIRM_APPEND_NOT_CURRENT
+        if not _append_event_unlocked(event):
+            return CONFIRM_APPEND_FAILED
+    return CONFIRM_APPEND_WRITTEN
+
+
 def get_auto_protection_evidence() -> dict:
     """Возвращает строгие durable-доказательства для автоматической защиты.
 
@@ -495,7 +617,7 @@ def get_auto_protection_evidence() -> dict:
             return ""
         if isinstance(raw, bool) or not isinstance(raw, str):
             raise _OwnershipUnproven(f"поле {field} malformed")
-        return raw.strip()
+        return normalize_durable_order_identifier(raw)
 
     def _proven_entry_side(raw):
         if raw is None:
@@ -814,8 +936,10 @@ def _ownership_text(ev: dict, field: str) -> str:
 def _ownership_identity(ev: dict) -> tuple:
     """``(symbol, order_id, order_link_id)`` события в строгом разборе."""
     symbol = _ownership_text(ev, "symbol").upper()
-    order_id = _ownership_text(ev, "order_id")
-    order_link_id = _ownership_text(ev, "order_link_id")
+    order_id = normalize_durable_order_identifier(_ownership_text(ev, "order_id"))
+    order_link_id = normalize_durable_order_identifier(
+        _ownership_text(ev, "order_link_id")
+    )
     return symbol, order_id, order_link_id
 
 
