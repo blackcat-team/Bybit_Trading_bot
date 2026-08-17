@@ -5,6 +5,8 @@
 !.env.example
 
 # Keys and certificates
+credentials*
+secrets*
 *.key
 *.pem
 *.p12
@@ -17,12 +19,14 @@ secrets/
 *.db
 *.sqlite
 *.sqlite3
+*.jsonl
 logs/
 *.log
 
 # Virtual environments and caches
 .venv/
 venv/
+.mypy_cache/
 pycache/
 __pycache__/
 .pytest_cache/

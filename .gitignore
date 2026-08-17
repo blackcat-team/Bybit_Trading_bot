@@ -41,9 +41,14 @@ data/startup_last.txt
 CLAUDE.md
 .claude/
 .codex/
-.kilo/
+.kilo/kilo.jsonc
+.kilo/agent-manager.json
+.kilo/worktrees/
+.kilo/legacy-backup/
+.kilo/node_modules/
+.kilo/package.json
+.kilo/package-lock.json
 .serena/
-.kilocodeignore
 
 # Generated review artifacts (never commit)
 qa_packs/
