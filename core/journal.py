@@ -34,6 +34,19 @@
                       get_positions и get_open_orders, потому что после закрытия
                       связи между closed-PnL orderId и входом уже нет.
                       Lifecycle не меняет и терминальным не является.
+  TP_LADDER_PLACED  — durable-идентичность точной ноги Real-R TP-лестницы
+                      (LIVE-FIX8-B: только TP1) конкретного подтверждённого
+                      lifecycle: точные tp_order_id/tp_order_link_id из ответа
+                      place_order на размещение ИМЕННО этой ноги плюс
+                      неизменный контекст владения (entry order id, side,
+                      positionIdx, целевая цена и объём ноги).
+                      Lifecycle не меняет и терминальным не является.
+  TP_LADDER_FILL_OBSERVED — durable ФАКТ исполнения точной ноги TP-лестницы:
+                      authoritative-строка истории ордеров этого самого
+                      tp_order_id доказала cumExecQty > 0. Событие фиксирует
+                      только факт исполнения; вывод о милестоуне (1R/2R) оно
+                      не делает и защиту не включает.
+                      Lifecycle не меняет и терминальным не является.
 
 Чтение хронологии по инструменту — get_trade_timeline(): read-only, порядок
 физических строк JSONL, недоказанное evidence отображается как UNKNOWN.
@@ -118,6 +131,39 @@ PROTECTION_CHANGE  = "PROTECTION_CHANGE"
 # в TERMINAL_EVENTS не входит и в get_position_lifecycles не обрабатывается:
 # это только evidence о том, какой ордер биржи закроет уже открытую позицию.
 EXIT_ORDER_BOUND   = "EXIT_ORDER_BOUND"
+# Durable-идентичность точной ноги Real-R TP-лестницы (reduce-only Limit),
+# размещённой ботом для подтверждённого lifecycle. Как и предыдущие
+# аудиторские события, позицию не открывает и не закрывает, в TERMINAL_EVENTS
+# не входит и в get_position_lifecycles не обрабатывается.
+TP_LADDER_PLACED   = "TP_LADDER_PLACED"
+# Durable ФАКТ исполнения точной ноги TP-лестницы. Тоже lifecycle-neutral:
+# это evidence об исполнении конкретного ордера, а не милестоун и не защита.
+TP_LADDER_FILL_OBSERVED = "TP_LADDER_FILL_OBSERVED"
+
+# Канонический уровень ноги Real-R лестницы. LIVE-FIX8-B знает только TP1 —
+# ПЕРВУЮ логическую Real-R цель подтверждённого lifecycle. Значение участвует в
+# идентичности: событие с любым другим уровнем идентичностью TP1 не становится,
+# поэтому TP2/TP3 не могут быть прочитаны как TP1.
+TP_LEVEL_TP1 = "tp1"
+
+# Единственный допустимый источник точной идентичности ноги лестницы: ответ
+# Bybit на place_order ИМЕННО этой ноги. Цена, объём и близость к цели
+# идентичностью не являются, поэтому иной источник durable-идентичностью не
+# становится.
+TP_LADDER_SOURCE_PLACE_ORDER = "place_order"
+
+# Единственный допустимый источник факта исполнения ноги лестницы: точная
+# строка authoritative истории ордеров этого самого ордера. Уменьшение размера
+# позиции, текущая цена и любой reduce-only fill доказательством не являются.
+TP_FILL_SOURCE_ORDER_HISTORY = "get_order_history"
+
+# Исходы сверки РОДИТЕЛЬСКОГО lifecycle для evidence TP-лестницы. Три исхода
+# различаются намеренно: «другой родитель» безопасно игнорируется, а
+# противоречие durable-идентификаторов ОДНОГО И ТОГО ЖЕ входа — аномалия
+# журнала, и она обязана быть fail-closed, а не «почти совпадением».
+_TP_PARENT_MATCH = "MATCH"
+_TP_PARENT_CONFLICT = "CONFLICT"
+_TP_PARENT_OTHER = "OTHER"
 
 # Канонические виды защитного ордера выхода (поле exit_kind).
 EXIT_KIND_SL = "sl"
@@ -610,6 +656,13 @@ def get_auto_protection_evidence() -> dict:
     Любая malformed-анomalия в journal делает результат пустым. Старые события
     без новых обязательных полей не считаются ошибкой, но такой lifecycle не
     попадает в результат и потому не может вызвать live-write.
+
+    ``tp1`` — точная durable-идентичность ноги TP1 Real-R лестницы ИМЕННО этого
+    lifecycle (``order_id``, ``order_link_id``, ``price``, ``qty``, ``side``,
+    ``position_idx``) плюс ``exec_qty`` — доказанный факт её исполнения, либо
+    ``None``. Это только evidence: милестоун из него здесь не выводится, защита
+    не включается, а terminal/устаревший lifecycle в результат не попадает и
+    потому свой TP1 новой позиции того же символа не передаёт.
     """
     lifecycles: dict = {}
 
@@ -662,6 +715,81 @@ def get_auto_protection_evidence() -> dict:
             and event_link_id == current["order_link_id"]
         )
 
+    def _tp1_leg_ids(ev: dict):
+        """Точные идентификаторы ноги TP1, заявленные событием, либо ``None``.
+
+        Идентичность ноги — только точные ``tp_order_id`` / ``tp_order_link_id``
+        и канонический уровень :data:`TP_LEVEL_TP1`. Сохраняются существующие
+        правила идентичности проекта: id-only и link-only валидны, а
+        placeholder/пустое значение точной идентичностью не становится.
+        Событие другого уровня (TP2/TP3) идентичностью TP1 не является.
+        """
+        if ev.get("tp_level") != TP_LEVEL_TP1:
+            return None
+        order_id = _proven_order_id(ev.get("tp_order_id"), "tp_order_id")
+        link_id = _proven_order_id(ev.get("tp_order_link_id"), "tp_order_link_id")
+        if not order_id and not link_id:
+            return None
+        return order_id, link_id
+
+    def _tp1_parent_match(ev: dict, current: dict) -> str:
+        """Сверка РОДИТЕЛЬСКОГО lifecycle по единому контракту durable-ID.
+
+        Один и тот же контракт обязателен для ``TP_LADDER_PLACED`` и
+        ``TP_LADDER_FILL_OBSERVED``: иначе факт исполнения смог бы прикрепиться
+        к родителю, которого размещение не доказывало.
+
+        Правила те же, что во всём проекте:
+
+          * известен только ``entry_order_id`` — достаточно его совпадения;
+          * известен только ``entry_order_link_id`` — достаточно его совпадения;
+          * известны ОБА — совпасть обязаны ОБА (конъюнктивно);
+          * один совпал, другой противоречит — :data:`_TP_PARENT_CONFLICT`
+            (fail-closed): это утверждения об одном и том же входе, и выбирать
+            между ними нельзя;
+          * placeholder / пустой / ``UNKNOWN`` / malformed идентификатор
+            идентичностью не становится и совпадением не считается.
+
+        «Известен» означает доказан ОБЕИМИ сторонами: и durable-lifecycle, и
+        самим событием. Дополнительно обязана совпасть неизменная идентичность
+        позиции конфирмации — ``side`` и ``positionIdx``; ``positionIdx=0``
+        остаётся валидным.
+
+        Замечание о link-only родителе: в эту строгую проекцию lifecycle без
+        точного ``order_id`` не попадает вовсе (см. финальный фильтр), поэтому
+        практически родитель всегда имеет durable ``order_id``. Правило
+        сохранено, чтобы контракт идентичности не расходился с остальным
+        проектом.
+        """
+        event_id = _proven_order_id(ev.get("entry_order_id"), "entry_order_id")
+        event_link = _proven_order_id(
+            ev.get("entry_order_link_id"), "entry_order_link_id"
+        )
+        parent_id = current.get("order_id") or ""
+        parent_link = current.get("order_link_id") or ""
+
+        id_known = bool(parent_id and event_id)
+        link_known = bool(parent_link and event_link)
+        if not id_known and not link_known:
+            # Ни один durable идентификатор родителя не заявлен обеими
+            # сторонами: принадлежность не доказана.
+            return _TP_PARENT_OTHER
+
+        id_ok = (event_id == parent_id) if id_known else None
+        link_ok = (event_link == parent_link) if link_known else None
+        if id_ok is False or link_ok is False:
+            if id_ok is True or link_ok is True:
+                # Один durable идентификатор совпал, другой противоречит.
+                return _TP_PARENT_CONFLICT
+            return _TP_PARENT_OTHER
+
+        if (
+            _proven_position_side(ev.get("side")) != current.get("side")
+            or _confirmed_idx(ev) != current.get("position_idx")
+        ):
+            return _TP_PARENT_OTHER
+        return _TP_PARENT_MATCH
+
     try:
         for event_type, ev in _iter_strict_events():
             symbol = normalize_symbol(ev.get("symbol"))
@@ -703,6 +831,11 @@ def get_auto_protection_evidence() -> dict:
                     "sl_bindings": {},
                     "anchored": False,
                     "pending_change": None,
+                    # Точная durable-идентичность ноги TP1 Real-R лестницы этого
+                    # lifecycle и факт её исполнения. Новый вход всегда начинает
+                    # новый lifecycle, поэтому TP1 прошлой сделки того же
+                    # символа сюда не наследуется.
+                    "tp1": None,
                 }
                 if qty is None or risk is None:
                     lifecycles[symbol]["state"] = "UNPROVEN"
@@ -871,6 +1004,100 @@ def get_auto_protection_evidence() -> dict:
                 current["sl_bindings"][exit_order_id] = binding
                 current["pending_change"] = None
 
+            elif event_type == TP_LADDER_PLACED:
+                current = lifecycles.get(symbol)
+                if (
+                    current is None
+                    or current.get("state") != CONFIRMED
+                    or not current.get("anchored")
+                ):
+                    # Нога лестницы без активного подтверждённого родителя
+                    # владения не создаёт: неизвестный/неоднозначный родитель
+                    # fail-closed.
+                    continue
+                parent = _tp1_parent_match(ev, current)
+                if parent == _TP_PARENT_CONFLICT:
+                    # Durable-идентификаторы одного и того же входа
+                    # противоречат: это противоречие журнала, а не «другая
+                    # нога».
+                    current["state"] = "UNPROVEN"
+                    continue
+                if parent != _TP_PARENT_MATCH:
+                    continue
+                leg_ids = _tp1_leg_ids(ev)
+                tp_price = _plan_amount(ev, "tp_price", _proven_positive_decimal)
+                tp_qty = _plan_amount(ev, "tp_qty", _proven_positive_decimal)
+                if (
+                    leg_ids is None
+                    or tp_price is None
+                    or tp_qty is None
+                    or ev.get("tp_source") != TP_LADDER_SOURCE_PLACE_ORDER
+                ):
+                    continue
+                identity = {
+                    "order_id": leg_ids[0],
+                    "order_link_id": leg_ids[1],
+                    "price": tp_price,
+                    "qty": tp_qty,
+                    "side": current["side"],
+                    "position_idx": current["position_idx"],
+                    # Факт исполнения именно этой ноги; появляется только из
+                    # TP_LADDER_FILL_OBSERVED.
+                    "exec_qty": None,
+                }
+                known = current.get("tp1")
+                if known is None:
+                    current["tp1"] = identity
+                    continue
+                if any(
+                    known[field] != identity[field]
+                    for field in ("order_id", "order_link_id", "price", "qty")
+                ):
+                    # Две РАЗНЫЕ ноги TP1 для одного lifecycle: выбрать между
+                    # ними нельзя, «последняя» доказательством не является.
+                    current["state"] = "UNPROVEN"
+                # Повтор того же доказательства идемпотентен и уже доказанный
+                # факт исполнения не сбрасывает.
+
+            elif event_type == TP_LADDER_FILL_OBSERVED:
+                current = lifecycles.get(symbol)
+                tp1 = current.get("tp1") if current is not None else None
+                if (
+                    current is None
+                    or current.get("state") != CONFIRMED
+                    or not current.get("anchored")
+                    or tp1 is None
+                ):
+                    # Факт исполнения без durable-идентичности TP1 сам к
+                    # lifecycle не прикрепляется.
+                    continue
+                parent = _tp1_parent_match(ev, current)
+                if parent == _TP_PARENT_CONFLICT:
+                    # Совпал один durable идентификатор родителя, а другой
+                    # противоречит. Прикрепить факт исполнения к такому
+                    # «почти тому же» входу нельзя: это чужой lifecycle либо
+                    # порча журнала.
+                    current["state"] = "UNPROVEN"
+                    continue
+                if parent != _TP_PARENT_MATCH:
+                    continue
+                leg_ids = _tp1_leg_ids(ev)
+                exec_qty = _plan_amount(ev, "exec_qty", _proven_positive_decimal)
+                if (
+                    leg_ids is None
+                    or leg_ids[0] != tp1["order_id"]
+                    or leg_ids[1] != tp1["order_link_id"]
+                    or exec_qty is None
+                    or ev.get("fill_source") != TP_FILL_SOURCE_ORDER_HISTORY
+                ):
+                    # Исполнение другой ноги, другого lifecycle или недоказанный
+                    # объём фактом исполнения ЭТОЙ TP1 не становятся.
+                    continue
+                # ``cumExecQty`` одного ордера монотонно растёт, поэтому
+                # физически последнее строгое наблюдение — актуальный факт того
+                # же ордера, а повтор того же наблюдения противоречия не даёт.
+                tp1["exec_qty"] = exec_qty
+
             elif event_type in TERMINAL_EVENTS:
                 current = lifecycles.get(symbol)
                 if current is None:
@@ -906,6 +1133,10 @@ def get_auto_protection_evidence() -> dict:
             },
             "anchored": info["anchored"],
             "pending_change": info["pending_change"],
+            # Точная durable-идентичность ноги TP1 этого lifecycle вместе с
+            # фактом её исполнения (``exec_qty``), либо None. Само наличие
+            # evidence защиту не включает и милестоун не объявляет.
+            "tp1": dict(info["tp1"]) if isinstance(info["tp1"], dict) else None,
         }
         for symbol, info in lifecycles.items()
         if info.get("state") == CONFIRMED
@@ -1344,6 +1575,32 @@ def get_exit_binding_events() -> list | None:
         return None
     except Exception as exc:
         logging.error("journal exit binding events failed: %s", exc)
+        return None
+
+
+def get_tp_ladder_fill_events() -> list | None:
+    """
+    Строгий список уже записанных ``TP_LADDER_FILL_OBSERVED`` либо ``None``.
+
+    Нужен наблюдателю для дедупликации ровно по той же причине, что и
+    :func:`get_exit_binding_events`: уже сохранённый durable-факт исполнения
+    второй раз писать незачем. ``None`` означает «журнал не доказан» и обязано
+    трактоваться fail-closed, а не как «наблюдений ещё нет»: иначе пропущенная
+    повреждённая строка заставила бы дописывать дубликат каждый цикл.
+
+    Журнал только читается: не исправляется и не мигрируется.
+    """
+    try:
+        return _strict_journal_events(TP_LADDER_FILL_OBSERVED)
+    except _OwnershipUnproven as exc:
+        logging.warning(
+            "journal tp ladder fill events: журнал не доказан (%s) — наблюдение "
+            "пропущено",
+            exc,
+        )
+        return None
+    except Exception as exc:
+        logging.error("journal tp ladder fill events failed: %s", exc)
         return None
 
 

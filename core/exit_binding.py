@@ -25,6 +25,12 @@
 
 Корреляция по символу, времени, цене или близости чисел доказательством не
 является ни в одной из частей.
+
+Отдельно модуль отвечает на точный вопрос о ноге Real-R TP-лестницы: какой
+именно ордер биржи является ногой TP1 этого lifecycle и доказано ли, что ИМЕННО
+он исполнился. Нога лестницы — обычный reduce-only Limit-ордер бота, а не
+позиционный conditional TP-ребёнок из ``find_protective_exit_order_id``: это
+разные объекты биржи с разными orderId, и подменять один другим запрещено.
 """
 
 from decimal import Decimal
@@ -34,6 +40,12 @@ from core.journal import (
     EXIT_KIND_SL,
     EXIT_KIND_TP,
     EXIT_ORDER_BOUND,
+    TP_FILL_SOURCE_ORDER_HISTORY,
+    TP_LADDER_FILL_OBSERVED,
+    TP_LADDER_PLACED,
+    TP_LADDER_SOURCE_PLACE_ORDER,
+    TP_LEVEL_TP1,
+    normalize_durable_order_identifier,
     normalize_symbol,
 )
 from core.write_verify import (
@@ -469,3 +481,296 @@ def binding_key(ev):
     ):
         return None
     return (symbol, exit_id, entry_id, kind, idx, risk, trigger)
+
+
+# ---------------------------------------------------------------------------
+# Точная идентичность и точное исполнение ноги Real-R TP-лестницы (LIVE-FIX8-B)
+# ---------------------------------------------------------------------------
+#
+# Нога лестницы и позиционный conditional TP-ребёнок — РАЗНЫЕ объекты биржи.
+# Нога лестницы — обычный reduce-only Limit-ордер, размещённый ботом через
+# place_order; позиционный TP — conditional child самой позиции со своим
+# ``stopOrderType``, и его находит find_protective_exit_order_id. Смешивать их
+# нельзя: у них разные orderId, разная семантика и разный момент исполнения.
+# Поэтому идентичность ноги доказывает ТОЛЬКО точный orderId/orderLinkId её
+# собственного размещения, и здесь появляются отдельные примитивы.
+
+# Тип ордера ноги лестницы: ровно то, чем её размещает place_tp_ladder.
+_LADDER_LEG_ORDER_TYPE = "Limit"
+
+# Допустимые значения ``stopOrderType`` для НЕ-conditional ордера в истории
+# Bybit. Всё остальное (``StopLoss``, ``TakeProfit``, ``PartialTakeProfit``,
+# любое неизвестное значение) — conditional child позиции, а не нога лестницы.
+_LADDER_LEG_STOP_ORDER_TYPES = frozenset({"", "UNKNOWN"})
+
+# Канонический результат классификатора исполнения ноги. ``None`` — NOT_PROVEN
+# (единая конвенция доказательств этого модуля), dict с этим ``state`` —
+# PROVEN_EXECUTION. Ни милестоуна, ни политики защиты классификатор не решает.
+TP_FILL_PROVEN_EXECUTION = "PROVEN_EXECUTION"
+
+
+def proven_tp_ladder_fill(
+    rows, *, symbol, side, position_idx, tp_order_id, tp_order_link_id
+):
+    """Доказанное исполнение ИМЕННО этой ноги лестницы либо ``None``.
+
+    Чистая классификация уже полученных строк истории ордеров: сети, ввода-
+    вывода и записи здесь нет, живая биржа отсюда не читается.
+
+    ``None`` — NOT_PROVEN. Dict ``{"state": TP_FILL_PROVEN_EXECUTION,
+    "exec_qty": Decimal, "order_id": str, "order_link_id": str}`` —
+    PROVEN_EXECUTION: authoritative-строка ЭТОГО ордера доказала
+    ``cumExecQty`` > 0.
+
+    Первичным доказательством является точная идентичность ордера:
+
+      * id-only валидно, когда durable известен только ``orderId``;
+      * link-only валидно, когда durable известен только ``orderLinkId``;
+      * когда известны ОБА, совпадение конъюнктивно: строка, совпавшая по
+        одному идентификатору и противоречащая другому, — это другой ордер;
+      * placeholder/пустой/``UNKNOWN`` идентификатор точной идентичностью не
+        становится ни в durable-evidence, ни в строке биржи.
+
+    Дополнительно обязаны совпасть остальные измерения владения: инструмент,
+    ЗАКРЫВАЮЩАЯ сторона позиции (нога лестницы уменьшает позицию, поэтому её
+    ``side`` противоположна стороне позиции), точный ``positionIdx``
+    (``0`` остаётся валидным), доказанный ``reduceOnly`` и доказанный тип
+    объекта биржи.
+
+    Тип объекта доказывается ТОЛЬКО положительным evidence: строка обязана
+    содержать ``orderType`` ровно ``Limit`` и ``stopOrderType`` из принятого в
+    репозитории представления «обычный, не conditional ордер» (``""`` либо
+    ``UNKNOWN``). Отсутствие любого из этих ключей — недоказанный тип объекта, а
+    не «обычная нога»: unknown != proven, поэтому такая строка даёт NOT_PROVEN.
+    Иначе неполная строка истории смогла бы выдать conditional-ребёнка защиты
+    или рыночное закрытие за ногу лестницы.
+
+    NOT_PROVEN дают: нулевой ``cumExecQty``, чужой инструмент, чужая сторона,
+    чужой ``positionIdx``, чужой ``orderId``/``orderLinkId``, conditional
+    child, не-Limit (ручное/внешнее рыночное закрытие), не-reduce-only ордер,
+    отсутствующий/malformed ``reduceOnly``, отсутствующий ``orderType`` или
+    ``stopOrderType``, malformed-идентификаторы, malformed-строка и
+    неоднозначность (ни одной или более одной подходящей строки). Уменьшение
+    размера позиции доказательством исполнения ноги не является вовсе: оно
+    здесь не наблюдается.
+
+    Полнота исполнения (частичное или полное) политикой этого примитива не
+    является: возвращается ФАКТ — доказанный ``exec_qty``. Сравнить его с
+    durable-объёмом ноги вправе только более поздний слой.
+    """
+    if not isinstance(rows, list):
+        return None
+    wanted_symbol = normalize_symbol(symbol)
+    # Нога лестницы закрывает позицию, поэтому её сторона — закрывающая.
+    wanted_side = closing_side(side)
+    wanted_idx = read_position_idx(position_idx)
+    wanted_id = normalize_durable_order_identifier(tp_order_id)
+    wanted_link = normalize_durable_order_identifier(tp_order_link_id)
+    if (
+        not wanted_symbol
+        or not wanted_side
+        or wanted_idx is None
+        or (not wanted_id and not wanted_link)
+    ):
+        return None
+
+    matched = []
+    for row in rows:
+        if not isinstance(row, dict):
+            # Malformed payload доказательством исполнения быть не может.
+            return None
+        row_id = normalize_durable_order_identifier(row.get("orderId"))
+        row_link = normalize_durable_order_identifier(row.get("orderLinkId"))
+        if wanted_id and row_id != wanted_id:
+            continue
+        if wanted_link and row_link != wanted_link:
+            continue
+        matched.append((row, row_id, row_link))
+    if len(matched) != 1:
+        return None
+
+    row, row_id, row_link = matched[0]
+    if normalize_symbol(row.get("symbol")) != wanted_symbol:
+        return None
+    if normalize_side(row.get("side")) != wanted_side:
+        return None
+    if read_position_idx(row.get("positionIdx")) != wanted_idx:
+        return None
+    if not proven_true(row.get("reduceOnly")):
+        return None
+    # Тип объекта биржи доказывается только положительным evidence: оба поля
+    # обязаны присутствовать и иметь принятые значения. Отсутствие ключа
+    # обычным Limit-ордером не является.
+    raw_type = row.get("orderType")
+    if not isinstance(raw_type, str) or raw_type.strip() != _LADDER_LEG_ORDER_TYPE:
+        return None
+    raw_stop = row.get("stopOrderType")
+    if (
+        not isinstance(raw_stop, str)
+        or raw_stop.strip() not in _LADDER_LEG_STOP_ORDER_TYPES
+    ):
+        # Conditional child позиционного SL/TP ногой лестницы не является, а
+        # отсутствующее/неизвестное значение его не опровергает.
+        return None
+    exec_qty = to_positive_decimal(row.get("cumExecQty"))
+    if exec_qty is None:
+        # Ноль и недоказанный объём — это NOT_PROVEN, а не «исполнено».
+        return None
+    return {
+        "state": TP_FILL_PROVEN_EXECUTION,
+        "exec_qty": exec_qty,
+        "order_id": row_id,
+        "order_link_id": row_link,
+    }
+
+
+def build_tp1_ladder_event(
+    *,
+    symbol,
+    side,
+    position_idx,
+    entry_order_id,
+    entry_order_link_id,
+    tp_order_id,
+    tp_order_link_id,
+    tp_price,
+    tp_qty,
+) -> dict:
+    """Durable-событие точной идентичности ноги TP1. ``{}`` — не доказано.
+
+    ``side`` — сторона ПОЗИЦИИ и входа (как в :func:`build_binding_event`):
+    закрывающая сторона ноги из неё выводится однозначно, а сторона сделки
+    восстановлению не подлежит.
+
+    Событие записывает только доказанное. Без точной идентичности самой ноги
+    (``tp_order_id`` и/или ``tp_order_link_id``), без точной идентичности
+    родительского входа, без доказанного ``positionIdx`` и без доказанных
+    целевой цены и объёма ноги durable-идентичность не создаётся: выдуманная
+    идентичность TP1 хуже её отсутствия, потому что позже она припишет
+    lifecycle исполнение чужого ордера.
+    """
+    normalized_symbol = normalize_symbol(symbol)
+    normalized_side = normalize_side(side)
+    idx = read_position_idx(position_idx)
+    entry_id = normalize_durable_order_identifier(entry_order_id)
+    leg_id = normalize_durable_order_identifier(tp_order_id)
+    leg_link = normalize_durable_order_identifier(tp_order_link_id)
+    price = amount_text(tp_price)
+    qty = amount_text(tp_qty)
+    if (
+        not normalized_symbol
+        or not normalized_side
+        or idx is None
+        or not entry_id
+        or (not leg_id and not leg_link)
+        or not price
+        or not qty
+    ):
+        return {}
+
+    event = {
+        "event": TP_LADDER_PLACED,
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "position_idx": idx,
+        "entry_order_id": entry_id,
+        "tp_level": TP_LEVEL_TP1,
+        "tp_price": price,
+        "tp_qty": qty,
+        "tp_source": TP_LADDER_SOURCE_PLACE_ORDER,
+    }
+    entry_link = normalize_durable_order_identifier(entry_order_link_id)
+    if entry_link:
+        event["entry_order_link_id"] = entry_link
+    if leg_id:
+        event["tp_order_id"] = leg_id
+    if leg_link:
+        event["tp_order_link_id"] = leg_link
+    return event
+
+
+def build_tp1_fill_event(
+    *,
+    symbol,
+    side,
+    position_idx,
+    entry_order_id,
+    entry_order_link_id,
+    tp_order_id,
+    tp_order_link_id,
+    exec_qty,
+) -> dict:
+    """Durable-ФАКТ исполнения точной ноги TP1. ``{}`` — не доказано.
+
+    Записывается только authoritative-факт: точная идентичность ноги, точная
+    идентичность родительского входа и доказанный положительный исполненный
+    объём. Вывод о милестоуне (1R/2R) событие не делает и делать не имеет
+    права: политика принадлежит более позднему слою.
+    """
+    normalized_symbol = normalize_symbol(symbol)
+    normalized_side = normalize_side(side)
+    idx = read_position_idx(position_idx)
+    entry_id = normalize_durable_order_identifier(entry_order_id)
+    leg_id = normalize_durable_order_identifier(tp_order_id)
+    leg_link = normalize_durable_order_identifier(tp_order_link_id)
+    filled = amount_text(exec_qty)
+    if (
+        not normalized_symbol
+        or not normalized_side
+        or idx is None
+        or not entry_id
+        or (not leg_id and not leg_link)
+        or not filled
+    ):
+        return {}
+
+    event = {
+        "event": TP_LADDER_FILL_OBSERVED,
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "position_idx": idx,
+        "entry_order_id": entry_id,
+        "tp_level": TP_LEVEL_TP1,
+        "exec_qty": filled,
+        "fill_source": TP_FILL_SOURCE_ORDER_HISTORY,
+    }
+    entry_link = normalize_durable_order_identifier(entry_order_link_id)
+    if entry_link:
+        event["entry_order_link_id"] = entry_link
+    if leg_id:
+        event["tp_order_id"] = leg_id
+    if leg_link:
+        event["tp_order_link_id"] = leg_link
+    return event
+
+
+def tp1_fill_key(ev):
+    """Ключ дедупликации уже записанного факта исполнения TP1 либо ``None``.
+
+    Ключ включает точную идентичность ноги, её родительский вход, идентичность
+    позиции и сам доказанный объём. Поэтому повторный наблюдатель того же
+    состояния дубликат не пишет, а РОСТ исполненного объёма (частичное →
+    полное исполнение) даёт новое, правдивое событие. Старая запись при этом не
+    удаляется: журнал append-only.
+
+    ``None`` означает, что событие само по себе не доказано и в дедупликации
+    участвовать не может.
+    """
+    if not isinstance(ev, dict):
+        return None
+    symbol = normalize_symbol(ev.get("symbol"))
+    entry_id = normalize_durable_order_identifier(ev.get("entry_order_id"))
+    leg_id = normalize_durable_order_identifier(ev.get("tp_order_id"))
+    leg_link = normalize_durable_order_identifier(ev.get("tp_order_link_id"))
+    idx = read_position_idx(ev.get("position_idx"))
+    filled = amount_text(ev.get("exec_qty"))
+    if (
+        not symbol
+        or not entry_id
+        or (not leg_id and not leg_link)
+        or ev.get("tp_level") != TP_LEVEL_TP1
+        or idx is None
+        or not filled
+    ):
+        return None
+    return (symbol, entry_id, leg_id, leg_link, TP_LEVEL_TP1, idx, filled)

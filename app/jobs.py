@@ -53,6 +53,7 @@ from core.journal import (
     get_exit_binding_candidates,
     get_exit_binding_events,
     get_auto_protection_evidence,
+    get_tp_ladder_fill_events,
     actual_initial_r_from_evidence,
     entry_side_to_position_side,
     normalize_durable_order_identifier,
@@ -71,13 +72,16 @@ from core.write_verify import WRITE_ACCEPTED, read_position_idx, to_positive_dec
 from core.exit_binding import (
     binding_key,
     build_binding_event,
+    build_tp1_fill_event,
     closing_side,
     find_protective_exit_order_id,
     find_proven_position_row,
     find_continuation_position_row,
     position_protection_level,
     proven_entry_fill,
+    proven_tp_ladder_fill,
     read_stop_order_kind,
+    tp1_fill_key,
 )
 from core.utils import safe_float
 # Полная выборка closed-PnL одного интервала с единственным контрактом
@@ -1915,8 +1919,88 @@ async def _bind_symbol_take_profit(
         known.add(key)
 
 
+async def _observe_tp1_fill(sym: str, plan: dict, known: set) -> None:
+    """Фиксирует durable-ФАКТ исполнения точной ноги TP1 этого lifecycle.
+
+    Один read-only ``get_order_history`` по ТОЧНОЙ идентичности ноги (её
+    собственный ``orderId``, либо ``orderLinkId``, если durable известен только
+    он). Классификацию делает чистый
+    :func:`core.exit_binding.proven_tp_ladder_fill`, поэтому уменьшение размера
+    позиции, текущая цена, ручное/внешнее закрытие и любой посторонний
+    reduce-only fill доказательством исполнения TP1 не становятся.
+
+    Наблюдение ограничено: оно выполняется только для lifecycle с durable
+    TP1-идентичностью, чей факт исполнения ещё не записан, и прекращается
+    навсегда, как только этот факт стал durable (дедупликация по
+    :func:`core.exit_binding.tp1_fill_key`) либо lifecycle перестал быть
+    подтверждённым. Уточнять уже доказанный факт до полного объёма здесь
+    незачем: срез фиксирует ФАКТ исполнения ноги, а решение о полноте и о
+    милестоуне принадлежит более позднему слою. Наблюдается только открытая
+    позиция — у полностью закрытой защищать уже нечего.
+
+    Отсюда не размещаются ордера, не меняются SL/TP, не отменяются ордера и не
+    закрываются позиции. Милестоун (1R/2R), Risk Cut и Auto-BE это evidence не
+    включает: записывается только факт исполнения.
+    """
+    tp1 = plan.get("tp1")
+    if not isinstance(tp1, dict):
+        return
+    tp_order_id = normalize_durable_order_identifier(tp1.get("order_id"))
+    tp_order_link_id = normalize_durable_order_identifier(tp1.get("order_link_id"))
+    if not tp_order_id and not tp_order_link_id:
+        return
+
+    kwargs = {"category": "linear", "symbol": sym, "limit": 50}
+    if tp_order_id:
+        kwargs["orderId"] = tp_order_id
+    else:
+        kwargs["orderLinkId"] = tp_order_link_id
+
+    try:
+        resp = await bybit_call(session.get_order_history, **kwargs)
+    except Exception as exc:
+        raise _SnapshotUnknown(
+            f"get_order_history недоступен для TP1 {sym}: {exc}"
+        ) from None
+
+    rows = _require_result_rows(resp, "get_order_history tp1")
+    proven = proven_tp_ladder_fill(
+        rows,
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=tp1.get("position_idx"),
+        tp_order_id=tp_order_id,
+        tp_order_link_id=tp_order_link_id,
+    )
+    if proven is None:
+        # NOT_PROVEN: ещё не исполнено либо доказательство неоднозначно.
+        return
+
+    event = build_tp1_fill_event(
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=tp1.get("position_idx"),
+        entry_order_id=plan.get("order_id"),
+        entry_order_link_id=plan.get("order_link_id"),
+        tp_order_id=tp_order_id,
+        tp_order_link_id=tp_order_link_id,
+        exec_qty=proven["exec_qty"],
+    )
+    key = tp1_fill_key(event)
+    if not event or key is None or key in known:
+        return
+    if await asyncio.to_thread(append_event, event):
+        known.add(key)
+        logging.info(
+            "TP1 fill evidence written: symbol=%s tpOrderId=%s cumExecQty=%s",
+            sym, tp_order_id or tp_order_link_id, proven["exec_qty"],
+        )
+    else:
+        logging.error("TP1 fill evidence не записано для %s", sym)
+
+
 async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
-    """Поддерживает causal SL continuation и отдельный historical TP audit.
+    """Поддерживает causal SL continuation, historical TP audit и факт TP1.
 
     Наблюдатель только читает: get_positions, get_open_orders, точный
     get_order_history и append-only журнал. Отсюда не размещаются ордера, не
@@ -1932,6 +2016,12 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
     Первый SL ownership anchor здесь никогда не создаётся. SL re-bind доступен
     только anchored lifecycle с exact pending PROTECTION_CHANGE. Historical TP
     binding остаётся read-only и не предоставляет automation ownership.
+
+    Отдельным шагом фиксируется durable-факт исполнения точной ноги TP1 (см.
+    :func:`_observe_tp1_fill`) — только для подтверждённого lifecycle с уже
+    записанной durable TP1-идентичностью и только пока этот факт не записан.
+    Новый poller для этого не добавляется, и защита от такого evidence не
+    включается.
     """
     try:
         anchored = await asyncio.to_thread(get_auto_protection_evidence)
@@ -1941,7 +2031,14 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
             and isinstance(plan.get("pending_change"), dict)
         }
         tp_candidates = await asyncio.to_thread(get_exit_binding_candidates)
-        if not continuations and not tp_candidates:
+        # Факт исполнения TP1 наблюдается только там, где точная durable
+        # идентичность ноги уже есть, а её исполнение ещё не доказано.
+        tp1_pending = {
+            sym: plan for sym, plan in anchored.items()
+            if isinstance(plan.get("tp1"), dict)
+            and plan["tp1"].get("exec_qty") is None
+        }
+        if not continuations and not tp_candidates and not tp1_pending:
             return
 
         try:
@@ -1958,51 +2055,70 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
             sym for sym in set(continuations) | set(tp_candidates)
             if sym in open_symbols
         ]
-        if not pending:
+        tp1_symbols = [sym for sym in tp1_pending if sym in open_symbols]
+        if not pending and not tp1_symbols:
             return
 
-        try:
-            _orders_resp = await bybit_call(
-                session.get_open_orders, category="linear", settleCoin="USDT"
-            )
-            order_rows = _require_result_rows(_orders_resp, "get_open_orders")
-        except _SnapshotUnknown as unknown:
-            logging.warning(
-                "Exit binding: снимок открытых ордеров недостоверен: %s", unknown
-            )
-            return
-
-        protected = _binding_protected_symbols(order_rows)
-        pending = [sym for sym in pending if sym in protected]
-        if not pending:
-            return
-
-        recorded = await asyncio.to_thread(get_exit_binding_events)
-        if recorded is None:
-            # Недоказанный журнал не означает «связей ещё нет»: писать поверх
-            # него значило бы плодить дубликаты и портить аудит.
-            return
-        known = {
-            key for key in (binding_key(ev) for ev in recorded) if key is not None
-        }
-
-        for sym in pending:
+        if pending:
             try:
-                if sym in tp_candidates:
-                    await _bind_symbol_take_profit(
-                        sym, tp_candidates[sym], position_rows, order_rows, known
-                    )
-                if sym in continuations:
-                    await _bind_symbol_exits(
-                        sym, continuations[sym], position_rows, order_rows, known
-                    )
-            except _SnapshotUnknown as unknown:
-                # Недоказанное исполнение одного входа не отменяет связывание
-                # остальных инструментов.
-                logging.warning(
-                    "Exit binding: %s пропущен (UNKNOWN order evidence): %s",
-                    sym, unknown,
+                _orders_resp = await bybit_call(
+                    session.get_open_orders, category="linear", settleCoin="USDT"
                 )
+                order_rows = _require_result_rows(_orders_resp, "get_open_orders")
+            except _SnapshotUnknown as unknown:
+                logging.warning(
+                    "Exit binding: снимок открытых ордеров недостоверен: %s", unknown
+                )
+                return
+
+            protected = _binding_protected_symbols(order_rows)
+            pending = [sym for sym in pending if sym in protected]
+
+        if pending:
+            recorded = await asyncio.to_thread(get_exit_binding_events)
+            if recorded is None:
+                # Недоказанный журнал не означает «связей ещё нет»: писать поверх
+                # него значило бы плодить дубликаты и портить аудит.
+                return
+            known = {
+                key for key in (binding_key(ev) for ev in recorded) if key is not None
+            }
+
+            for sym in pending:
+                try:
+                    if sym in tp_candidates:
+                        await _bind_symbol_take_profit(
+                            sym, tp_candidates[sym], position_rows, order_rows, known
+                        )
+                    if sym in continuations:
+                        await _bind_symbol_exits(
+                            sym, continuations[sym], position_rows, order_rows, known
+                        )
+                except _SnapshotUnknown as unknown:
+                    # Недоказанное исполнение одного входа не отменяет связывание
+                    # остальных инструментов.
+                    logging.warning(
+                        "Exit binding: %s пропущен (UNKNOWN order evidence): %s",
+                        sym, unknown,
+                    )
+
+        if tp1_symbols:
+            observed = await asyncio.to_thread(get_tp_ladder_fill_events)
+            if observed is None:
+                # Недоказанный журнал фактом «наблюдений нет» не является.
+                return
+            known_fills = {
+                key for key in (tp1_fill_key(ev) for ev in observed)
+                if key is not None
+            }
+            for sym in tp1_symbols:
+                try:
+                    await _observe_tp1_fill(sym, tp1_pending[sym], known_fills)
+                except _SnapshotUnknown as unknown:
+                    logging.warning(
+                        "TP1 fill: %s пропущен (UNKNOWN order evidence): %s",
+                        sym, unknown,
+                    )
 
     except Exception as e:
         logging.error("Exit binding job error: %s", e)

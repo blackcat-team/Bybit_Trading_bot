@@ -200,6 +200,7 @@ def test_exact_confirmed_lifecycle_proves_original_plan(monkeypatch, tmp_path):
             "sl_bindings": {"sl-1": journal.Decimal("99")},
             "anchored": True,
             "pending_change": None,
+            "tp1": None,
         }
     }
 

@@ -17,13 +17,19 @@ from core.config import (
     DAILY_LOSS_LIMIT, USER_RISK_USD
 )
 from core.bybit_call import bybit_call
-from core.exit_binding import find_continuation_position_row
+from core.exit_binding import build_tp1_ladder_event, find_continuation_position_row
 from core.journal import (
     actual_initial_r_from_evidence,
+    append_event,
+    extract_order_ids,
     get_auto_protection_evidence,
     normalize_symbol,
 )
 from core.utils import safe_float
+# Единый контракт конверта ответа Bybit (HIGH-6): успехом считается только
+# доказанный ``retCode == 0`` строгого типа. Второго парсера успеха здесь не
+# появляется — используется уже существующий примитив.
+from core.write_verify import envelope_ok, read_ret_code
 
 # --- 1. Инициализация Сессии Bybit ---
 # Этот объект session мы будем импортировать в другие файлы
@@ -290,6 +296,11 @@ async def place_tp_ladder(symbol):
     Прежний контракт сохраняется только там, где канонического доказательства
     нет вовсе (ручная/внешняя позиция).
     Деградирует до 2 или 1 TP-ордера, если позиция слишком маленькая для сплита.
+
+    Для доказанного lifecycle дополнительно фиксируется точная durable-
+    идентичность ноги TP1 (её собственные ``orderId``/``orderLinkId`` из ответа
+    на размещение). Это только evidence: защиту, милестоуны и Risk Cut оно не
+    включает, а на размещение ног не влияет.
     """
     try:
         # 1. Получаем живую позицию
@@ -394,10 +405,21 @@ async def place_tp_ladder(symbol):
         logs = [f"📉 <b>Risk Check:</b> Стоп на {stop_loss}. Риск позиции: <b>{total_risk_usd:.2f}$</b> (1R)"]
 
         async def send_limit(q, p, r_name):
+            """Ставит одну ногу лестницы и возвращает СЫРОЙ ответ биржи.
+
+            ``None`` означает, что нога размещена НЕ была: нулевой объём или
+            исключение вызова. Иначе возвращается ответ биржи КАК ЕСТЬ, без
+            разбора успеха и без извлечения идентификаторов: доказательство
+            успеха и извлечение идентичности — отдельные ответственности
+            вызывающего кода.
+
+            Операторский лог TP1/TP2/TP3 не меняется: он по-прежнему отражает
+            завершение вызова без исключения, как и до LIVE-FIX8-B.
+            """
             if q <= 0:
-                return False
+                return None
             try:
-                await bybit_call(
+                resp = await bybit_call(
                     session.place_order,
                     category="linear", symbol=symbol, side=close_side,
                     orderType="Limit", qty=str(q), price=str(p),
@@ -405,17 +427,87 @@ async def place_tp_ladder(symbol):
                 )
                 est_profit = q * abs(entry_price - p)
                 logs.append(f"✅ {r_name}: {p} (Vol: {q}) → <b>+{est_profit:.2f}$</b>")
-                return True
+                return resp
             except Exception as ex:
                 logs.append(f"❌ Err {r_name}: {ex}")
-                return False
+                return None
+
+        async def send_tp1(q):
+            """Ставит ногу TP1 и фиксирует её точную durable-идентичность.
+
+            TP1 — ПЕРВАЯ логическая Real-R цель подтверждённого lifecycle; во
+            всех схемах сплита (3/2/1 ноги) она размещается первой и по одной и
+            той же цене ``targets['tp1']``, поэтому деградация схемы логический
+            уровень ноги не меняет.
+
+            Порядок доказательств строго разделён:
+
+            1. вызов размещения завершился;
+            2. ответ биржи ДОКАЗАННО успешен — ``envelope_ok`` (единый контракт
+               конверта проекта: ``type(retCode) is int and retCode == 0``);
+            3. из уже доказанного ответа извлекается точная идентичность;
+            4. только после этого пишется durable evidence.
+
+            Отсутствие исключения успехом НЕ считается: ``bybit_call`` конверт не
+            проверяет и ненулевой ``retCode`` в исключение не превращает, поэтому
+            ответ вида ``retCode=10001`` с ``result.orderId`` durable-идентичность
+            создать не может. Ответ без точного ``orderId``/``orderLinkId``
+            идентичностью тоже не становится: выдуманная идентичность позже
+            приписала бы сделке исполнение чужого ордера. Отсутствие
+            канонического доказательства lifecycle (ручная/внешняя позиция)
+            означает неизвестного родителя — evidence не пишется вовсе
+            (fail-closed).
+
+            Размещение ног от этой проверки не зависит: недоказанный конверт
+            снимает только evidence, а повторных записей на бирже здесь нет.
+
+            Evidence инертно: ни милестоун, ни Risk Cut, ни Auto-BE оно не
+            включает. Сбой записи журнала только логируется — повторять уже
+            принятую биржей запись нельзя.
+            """
+            resp = await send_limit(q, targets['tp1'], "TP1 (1R)")
+            if resp is None or plan is None:
+                return resp
+            if not envelope_ok(resp):
+                logging.warning(
+                    "Auto-TP %s: ответ на размещение TP1 не доказан как успешный "
+                    "(retCode=%r) — durable evidence не записано",
+                    sym, read_ret_code(resp),
+                )
+                return resp
+            ids = extract_order_ids(resp)
+            event = build_tp1_ladder_event(
+                symbol=sym,
+                side=plan.get("side"),
+                position_idx=plan.get("position_idx"),
+                entry_order_id=plan.get("order_id"),
+                entry_order_link_id=plan.get("order_link_id"),
+                tp_order_id=ids.get("order_id"),
+                tp_order_link_id=ids.get("order_link_id"),
+                tp_price=targets['tp1'],
+                tp_qty=q,
+            )
+            if not event:
+                logging.warning(
+                    "Auto-TP %s: точная идентичность TP1 не доказана — durable "
+                    "evidence не записано", sym,
+                )
+                return resp
+            try:
+                written = await asyncio.to_thread(append_event, event)
+            except Exception as exc:
+                logging.error("Auto-TP %s: evidence TP1 не записано: %s", sym, exc)
+                return resp
+            if not written:
+                logging.error("Auto-TP %s: evidence TP1 не записано", sym)
+            return resp
 
         # 7. Выбираем схему сплита с учётом minOrderQty
         qty_30 = round(math.floor((total_qty * 0.30) / qty_step) * qty_step, 6)
         if qty_30 >= min_order_qty:
             # Стандартная 3-ступенчатая схема: 30% / 30% / остаток
             qty_rem = round(total_qty - qty_30 - qty_30, 6)
-            await send_limit(qty_30, targets['tp1'], "TP1 (1R)")
+            await send_tp1(qty_30)
             await send_limit(qty_30, targets['tp2'], "TP2 (2R)")
             await send_limit(qty_rem, targets['tp3'], "TP3 (3R)")
             legs_note = ""
@@ -424,13 +516,13 @@ async def place_tp_ladder(symbol):
             qty_half = round(math.floor((total_qty * 0.50) / qty_step) * qty_step, 6)
             if qty_half >= min_order_qty:
                 qty_rem2 = round(total_qty - qty_half, 6)
-                await send_limit(qty_half, targets['tp1'], "TP1 (1R)")
+                await send_tp1(qty_half)
                 await send_limit(qty_rem2, targets['tp2'], "TP2 (2R)")
                 legs_note = " (degraded: qty too small for 3 legs → placed 2)"
                 logs.append("⚠️ Позиция слишком маленькая для 3 TP: поставлено 2 ордера.")
             else:
                 # 1 уровень: вся позиция на TP1
-                await send_limit(total_qty, targets['tp1'], "TP1 (1R)")
+                await send_tp1(total_qty)
                 legs_note = " (degraded: qty too small to split → placed 1)"
                 logs.append("⚠️ Позиция слишком маленькая для сплита: поставлен 1 TP-ордер.")
 
