@@ -53,6 +53,7 @@ from core.journal import (
     get_exit_binding_candidates,
     get_exit_binding_events,
     get_auto_protection_evidence,
+    actual_initial_r_from_evidence,
     entry_side_to_position_side,
     normalize_durable_order_identifier,
     append_position_confirmation,
@@ -473,10 +474,24 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
             ):
                 continue
 
-            # Исходные risk и qty берутся только из подтверждённого lifecycle.
-            # После частичного закрытия текущий qty меньше, но цена 1R неизменна.
-            risk_usd = plan["planned_risk_usdt"]
-            dist_1r_price = risk_usd / plan["qty"]
+            # Каноническая неизменная величина исходного R: фактический avg
+            # entry ↔ неизменный первичный защитный SL подтверждённого
+            # lifecycle. Ни planned_risk_usdt / qty, ни перенесённый текущий SL
+            # знаменателем milestone-R не являются. После частичного закрытия
+            # текущий qty меньше, но ценовая дистанция 1R остаётся неизменной.
+            actual_r = actual_initial_r_from_evidence(plan)
+            if actual_r is None:
+                # Подтверждённый lifecycle без доказанной канонической геометрии
+                # (нулевой, неверносторонний или неконечный R): fail-closed по
+                # этому символу. Молчаливый откат на planned_risk_usdt / qty
+                # запрещён; изоляция по символам сохраняется — прочие валидные
+                # позиции продолжают оцениваться.
+                logging.warning(
+                    "Auto-BE: %s пропущен — неизменный исходный R не доказан "
+                    "(fail-closed)", sym,
+                )
+                continue
+            dist_1r_price = float(actual_r.price)
 
             # 2. Считаем текущий PnL в R
             if is_long:

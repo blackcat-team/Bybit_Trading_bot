@@ -194,6 +194,7 @@ def test_exact_confirmed_lifecycle_proves_original_plan(monkeypatch, tmp_path):
             "side": "Buy",
             "qty": 10.0,
             "entry": 76.25,
+            "initial_sl": journal.Decimal("99"),
             "planned_risk_usdt": 10.0,
             "position_idx": 0,
             "sl_bindings": {"sl-1": journal.Decimal("99")},

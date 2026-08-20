@@ -75,6 +75,7 @@ import math
 import os
 import threading
 import time
+from collections import namedtuple
 from decimal import Decimal, InvalidOperation
 
 from core.config import (
@@ -695,6 +696,10 @@ def get_auto_protection_evidence() -> dict:
                     "entry": None,
                     "planned_risk_usdt": risk,
                     "position_idx": None,
+                    # Неизменный первичный защитный SL: фиксируется один раз в
+                    # POSITION_CONFIRMED и служит знаменателем actual immutable
+                    # initial R. Перенос/перепривязка SL его не меняет.
+                    "initial_sl": None,
                     "sl_bindings": {},
                     "anchored": False,
                     "pending_change": None,
@@ -751,6 +756,11 @@ def get_auto_protection_evidence() -> dict:
                         "trigger": anchor_trigger,
                     }
                     current["anchored"] = True
+                    # Иммутабельный якорь исходного R: снимается один раз здесь и
+                    # далее не переписывается ни PROTECTION_CHANGE, ни
+                    # EXIT_ORDER_BOUND — перенос/перепривязка SL знаменатель R не
+                    # меняет.
+                    current["initial_sl"] = anchor_trigger
 
             elif event_type == PROTECTION_CHANGE:
                 current = lifecycles.get(symbol)
@@ -886,6 +896,7 @@ def get_auto_protection_evidence() -> dict:
             "side": info["side"],
             "qty": info["qty"],
             "entry": info["entry"],
+            "initial_sl": info["initial_sl"],
             "planned_risk_usdt": info["planned_risk_usdt"],
             "position_idx": info["position_idx"],
             "sl_bindings": {
@@ -905,6 +916,72 @@ def get_auto_protection_evidence() -> dict:
         and info.get("anchored") is True
         and bool(info.get("order_id"))
     }
+
+
+# ---------------------------------------------------------------------------
+# Каноническая неизменная величина исходного R (actual immutable initial R)
+# ---------------------------------------------------------------------------
+
+# Единый контракт данных фактического неизменного исходного R. ``price`` — это
+# ценовая дистанция 1R (Decimal), ``usdt`` — фактический исходный риск позиции в
+# USDT (Decimal). Оба потребителя защиты используют одно это определение, чтобы
+# не расходиться в семантике R для одного и того же подтверждённого lifecycle.
+ActualInitialR = namedtuple("ActualInitialR", ("price", "usdt"))
+
+
+def actual_initial_r_from_evidence(plan):
+    """Каноническая неизменная величина исходного R подтверждённого lifecycle.
+
+    Единственный источник — доказанная конфирмация:
+
+      * фактический avg entry — ``POSITION_CONFIRMED.avg_entry_price``
+        (поле ``entry`` строгой проекции :func:`get_auto_protection_evidence`);
+      * неизменный первичный защитный SL — anchor ``initial_sl_trigger``
+        (поле ``initial_sl``), зафиксированный один раз в момент
+        POSITION_CONFIRMED.
+
+    Канонически::
+
+        R_price = |confirmed_entry - confirmed_initial_sl|
+        R_usdt  = R_price * confirmed_initial_qty
+
+    Последующий перенос/перепривязка SL (Auto-BE, Risk Cut, трейлинг, rebound,
+    ручной сдвиг) знаменатель R НЕ меняет: ``initial_sl`` иммутабелен.
+
+    Возвращает :class:`ActualInitialR` (Decimal ``price`` и Decimal ``usdt``)
+    либо ``None`` (fail-closed), когда каноническая геометрия отсутствует,
+    malformed, нулевая, неконечная или имеет неверную сторону:
+
+      LONG / Buy   требует ``initial_sl < entry``;
+      SHORT / Sell требует ``initial_sl > entry``.
+
+    ``planned_risk_usdt`` знаменателем фактического R не является и здесь не
+    используется: planned risk остаётся отдельной метрикой исходного замысла.
+    """
+    if not isinstance(plan, dict):
+        return None
+    entry = _proven_positive_decimal(plan.get("entry"))
+    initial_sl = _proven_positive_decimal(plan.get("initial_sl"))
+    qty = _proven_positive_decimal(plan.get("qty"))
+    if entry is None or initial_sl is None or qty is None:
+        return None
+    side = plan.get("side")
+    if side == "Buy":
+        if not initial_sl < entry:
+            return None
+        r_price = entry - initial_sl
+    elif side == "Sell":
+        if not initial_sl > entry:
+            return None
+        r_price = initial_sl - entry
+    else:
+        return None
+    if not r_price.is_finite() or r_price <= 0:
+        return None
+    r_usdt = r_price * qty
+    if not r_usdt.is_finite() or r_usdt <= 0:
+        return None
+    return ActualInitialR(price=r_price, usdt=r_usdt)
 
 
 class _OwnershipUnproven(Exception):

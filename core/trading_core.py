@@ -5,16 +5,24 @@
 (`calculate_targets`), управления дневным лимитом (`check_daily_limit`) и
 асинхронного выставления TP-ордеров (`place_tp_ladder`).
 """
+import asyncio
 import logging
 import math
 import time
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pybit.unified_trading import HTTP
 from core.config import (
     BYBIT_API_KEY, BYBIT_API_SECRET, IS_DEMO,
     DAILY_LOSS_LIMIT, USER_RISK_USD
 )
 from core.bybit_call import bybit_call
+from core.exit_binding import find_continuation_position_row
+from core.journal import (
+    actual_initial_r_from_evidence,
+    get_auto_protection_evidence,
+    normalize_symbol,
+)
 from core.utils import safe_float
 
 # --- 1. Инициализация Сессии Bybit ---
@@ -226,11 +234,62 @@ def check_daily_limit():
         return False, 0.0
 
 
-async def place_tp_ladder(symbol):
+def _tp_ladder_proven_position(sym, plan, rows, live_pos):
+    """Строка снимка, доказанно являющаяся текущей позицией lifecycle, либо None.
+
+    Идентичность доказывает общий примитив владения
+    :func:`core.exit_binding.find_continuation_position_row` — тот же контракт,
+    по которому авто-защита признаёт remaining-позицию своей: точные ``symbol``,
+    ``side``, ``positionIdx`` и authoritative ``avgPrice`` конфирмации,
+    remaining-объём не больше исходного исполненного и ровно одна подходящая
+    строка в снимке (неоднозначность доказательством не является).
+
+    Совпадения ``side`` + ``positionIdx`` недостаточно: устаревший, ручной или
+    внешний lifecycle того же инструмента разделяет их с новой позицией, и по
+    такому совпадению чужой позиции присвоился бы неизменный R прошлой сделки.
+    Именно поэтому обязательна точная authoritative цена входа конфирмации.
+
+    Дополнительно проверяется, что доказанная строка — это ровно та строка, по
+    которой будут выставлены reduce-only TP: доказательство про одну позицию не
+    имеет права авторизовать запись по другой.
+
+    Отдельное доказательство защитного child здесь не требуется: TP-лестница не
+    изменяет SL и после LIVE-FIX8-A не берёт R из текущего стопа, поэтому
+    состояние SL в идентичность текущей позиции не входит. Auto-BE проверяет
+    binding потому, что именно он перезаписывает SL.
     """
-    Ставит тейки (TP1, TP2, TP3) на основе РЕАЛЬНОГО положения Стоп-лосса в позиции.
-    Теперь R считается от живого StopLoss, а не от теоретического.
-    Деградирует до 2 или 1 TP-ордера если позиция слишком маленькая для сплита.
+    try:
+        original_qty = Decimal(str(plan.get("qty")))
+        avg_entry = Decimal(str(plan.get("entry")))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    proven = find_continuation_position_row(
+        rows,
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=plan.get("position_idx"),
+        original_qty=original_qty,
+        avg_price=avg_entry,
+    )
+    if proven is None or proven is not live_pos:
+        return None
+    return proven
+
+
+async def place_tp_ladder(symbol):
+    """Ставит тейки (TP1, TP2, TP3) от актуального неизменного исходного R.
+
+    Для доказанной позиции подтверждённого bot-owned lifecycle знаменатель R —
+    каноническая неизменная геометрия (доказанный avg entry ↔ неизменный
+    первичный защитный SL), а не текущий (возможно перенесённый/перепривязанный)
+    SL позиции: иначе сдвинутый в БУ/трейлинг стоп исказил бы исходный R.
+
+    Если каноническое доказательство lifecycle существует, но текущая позиция не
+    доказана как эта же позиция, поведение fail-closed: TP не выставляются и
+    молчаливого возврата к прежней семантике «R от текущего SL» не происходит.
+    Прежний контракт сохраняется только там, где канонического доказательства
+    нет вовсе (ручная/внешняя позиция).
+    Деградирует до 2 или 1 TP-ордера, если позиция слишком маленькая для сплита.
     """
     try:
         # 1. Получаем живую позицию
@@ -250,11 +309,57 @@ async def place_tp_ladder(symbol):
         if total_qty <= 0 or entry_price <= 0:
             return "❌ Не удалось выставить Auto-TPs: отсутствуют данные позиции/стопа."
 
-        if stop_loss == 0:
-            return "⚠️ В позиции НЕТ Стоп-лосса! Я не могу посчитать 1R."
+        # 3. Определяем знаменатель 1R (ценовую дистанцию) и базу целей.
+        # Для доказанной позиции подтверждённого lifecycle R берётся из
+        # канонической неизменной геометрии (доказанный avg entry ↔ неизменный
+        # первичный SL), а НЕ из текущего SL: перенесённый/перепривязанный стоп
+        # не имеет права переопределить исходный R.
+        r_price_dist = None
+        r_basis_entry = entry_price
 
-        # 3. Считаем РЕАЛЬНЫЙ риск (R)
-        r_price_dist = abs(entry_price - stop_loss)
+        evidence = await asyncio.to_thread(get_auto_protection_evidence)
+        sym = normalize_symbol(symbol)
+        plan = evidence.get(sym)
+        if plan is not None:
+            # Каноническое доказательство существует: с этого момента путь
+            # только один. Либо текущая позиция доказанно та же самая, либо
+            # fail-closed — молчаливый откат к прежней семантике «R от текущего
+            # SL» здесь запрещён, иначе устаревший lifecycle тихо превратился бы
+            # в «ручную позицию» и получил бы неверный R.
+            if _tp_ladder_proven_position(sym, plan, positions, my_pos) is None:
+                logging.warning(
+                    "Auto-TP %s: текущая позиция не доказана как позиция "
+                    "подтверждённого lifecycle (fail-closed)", sym,
+                )
+                return (
+                    "❌ Не удалось выставить Auto-TPs: текущая позиция не "
+                    "доказана как позиция подтверждённой сделки (fail-closed).\n"
+                    "Проверьте позицию на Bybit вручную."
+                )
+            actual_r = actual_initial_r_from_evidence(plan)
+            if actual_r is None:
+                # Подтверждённый lifecycle без доказанной канонической геометрии
+                # (нулевой, неверносторонний или неконечный R): fail-closed.
+                # Нельзя ни ставить TP по неверному R, ни молча откатываться на
+                # текущий (возможно перенесённый) SL.
+                return (
+                    "❌ Не удалось выставить Auto-TPs: неизменный первичный SL "
+                    "подтверждённой позиции не доказан (fail-closed)."
+                )
+            r_price_dist = float(actual_r.price)
+            # База целей — доказанный avg entry конфирмации (иммутабельный),
+            # а не потенциально сдвинувшийся avgPrice текущего снимка.
+            r_basis_entry = float(plan["entry"])
+
+        if r_price_dist is None:
+            # Канонического доказательства нет вовсе (ручная/внешняя позиция):
+            # сохраняется прежний контракт 1R от текущего SL.
+            if stop_loss == 0:
+                return "⚠️ В позиции НЕТ Стоп-лосса! Я не могу посчитать 1R."
+            r_price_dist = abs(entry_price - stop_loss)
+            r_basis_entry = entry_price
+
+        # Риск текущего остатка позиции (для отображения): live qty * 1R.
         total_risk_usd = total_qty * r_price_dist
 
         # 4. Считаем цели по цене
@@ -262,13 +367,13 @@ async def place_tp_ladder(symbol):
         is_long = side == "Buy"
 
         if is_long:
-            targets['tp1'] = entry_price + (1.0 * r_price_dist)
-            targets['tp2'] = entry_price + (2.0 * r_price_dist)
-            targets['tp3'] = entry_price + (3.0 * r_price_dist)
+            targets['tp1'] = r_basis_entry + (1.0 * r_price_dist)
+            targets['tp2'] = r_basis_entry + (2.0 * r_price_dist)
+            targets['tp3'] = r_basis_entry + (3.0 * r_price_dist)
         else:
-            targets['tp1'] = entry_price - (1.0 * r_price_dist)
-            targets['tp2'] = entry_price - (2.0 * r_price_dist)
-            targets['tp3'] = entry_price - (3.0 * r_price_dist)
+            targets['tp1'] = r_basis_entry - (1.0 * r_price_dist)
+            targets['tp2'] = r_basis_entry - (2.0 * r_price_dist)
+            targets['tp3'] = r_basis_entry - (3.0 * r_price_dist)
 
         # 5. Инфо по инструменту
         _info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=symbol)
