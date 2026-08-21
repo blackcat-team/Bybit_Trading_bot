@@ -166,6 +166,18 @@ def test_pybit_session_and_used_endpoint_kwargs_are_inert(runtime_clients):
                 session.get_tickers,
                 {"category": "linear", "symbol": "BTCUSDT"},
             ),
+            # Production-real источник исторического markPrice (LIVE-FIX8-C2):
+            # закреплённый pybit обязан отдавать этот endpoint с ровно теми
+            # kwargs, которыми его вызывает наблюдатель.
+            (
+                session.get_mark_price_kline,
+                {
+                    "category": "linear",
+                    "symbol": "BTCUSDT",
+                    "interval": "1",
+                    "limit": 1000,
+                },
+            ),
             (
                 session.get_executions,
                 {"category": "linear", "symbol": "BTCUSDT", "limit": 1},
@@ -236,6 +248,7 @@ def test_pybit_session_and_used_endpoint_kwargs_are_inert(runtime_clients):
                 "get_closed_pnl",
                 "get_instruments_info",
                 "get_tickers",
+                "get_mark_price_kline",
                 "get_executions",
                 "place_order",
                 "cancel_order",

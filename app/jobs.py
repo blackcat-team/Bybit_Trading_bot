@@ -47,6 +47,8 @@ from core.journal import (
     PROTECTION_SOURCE_AUTO_BE,
     PROTECTION_SOURCE_RISK_CUT,
     MILESTONE_1R,
+    MARK_2R_SOURCE_CLOSED_KLINE,
+    MARK_2R_SOURCE_CURRENT_POSITION,
     get_position_lifecycles,
     normalize_symbol,
     check_and_quarantine_sources,
@@ -56,6 +58,7 @@ from core.journal import (
     get_auto_protection_evidence,
     get_tp_ladder_fill_events,
     actual_initial_r_from_evidence,
+    canonical_2r_target_from_evidence,
     entry_side_to_position_side,
     normalize_durable_order_identifier,
     append_position_confirmation,
@@ -84,6 +87,29 @@ from core.exit_binding import (
     proven_tp_ladder_fill,
     read_stop_order_kind,
     tp1_fill_key,
+)
+# Чистый контракт доказательств канонического уровня 2R (LIVE-FIX8-C2):
+# терминальность точного входного ордера, полный набор его исполнений,
+# строгий разбор mark-price свечей и правило ПОЛНОСТЬЮ закрытой пост-якорной
+# минуты. Сетевых вызовов и записи в нём нет — только классификация уже
+# полученных ответов и построение durable-событий.
+from core.r2_evidence import (
+    EXECUTION_PAGE_BUDGET,
+    EXECUTION_PAGE_LIMIT,
+    MARK_PRICE_KLINE_CATEGORY,
+    MARK_PRICE_KLINE_INTERVAL_MINUTE,
+    MARK_PRICE_KLINE_LIMIT,
+    PAGE_DONE,
+    PAGE_MALFORMED,
+    build_entry_anchor_event,
+    build_mark_2r_event,
+    build_r2_milestone_event,
+    parse_mark_price_kline,
+    proven_closed_candle_2r,
+    proven_current_mark_2r,
+    proven_entry_execution_anchor,
+    proven_terminal_entry_order,
+    read_page_cursor,
 )
 from core.utils import safe_float
 # Полная выборка closed-PnL одного интервала с единственным контрактом
@@ -2043,6 +2069,374 @@ async def _materialize_r1_milestone(sym: str, plan: dict) -> None:
         logging.error("1R milestone не записан для %s", sym)
 
 
+# ---------------------------------------------------------------------------
+# LIVE-FIX8-C2: durable временной якорь входа и факт markPrice на уровне 2R
+# ---------------------------------------------------------------------------
+#
+# Слой ТОЛЬКО собирает доказательства. Отсюда не вызываются set_trading_stop,
+# place_order, cancel_order и amend_order, не пишутся PROTECTION_CHANGE /
+# EXIT_ORDER_BOUND и не создаётся никакого «verified action» состояния: решение о
+# том, как sticky-милестоуны управляют защитой, принадлежит LIVE-FIX8-D.
+#
+# Границы чтений на один eligible lifecycle за один цикл:
+#   * пока durable якоря нет — 1 точный get_order_history + не более
+#     EXECUTION_PAGE_BUDGET страниц get_executions;
+#   * текущий markPrice берётся из ОБЩЕГО снимка позиций цикла (нового
+#     per-symbol get_positions не добавляется);
+#   * не более ОДНОГО get_mark_price_kline;
+#   * как только якорь durable — чтений исполнений ради якоря больше нет;
+#   * как только durable факт рынка 2R записан — market-history чтений для этого
+#     lifecycle больше нет вовсе.
+
+
+async def _fetch_entry_terminal_state(sym: str, plan: dict):
+    """Терминальное состояние ТОЧНОГО входного ордера либо ``None``.
+
+    Один read-only ``get_order_history`` по точной идентичности входа. Конверт
+    проходит тот же строгий контракт, что и остальные снимки; классификацию
+    делает чистый :func:`core.r2_evidence.proven_terminal_entry_order`, поэтому
+    ни ``cumExecQty``, ни размер позиции, ни прошедшее время терминальность не
+    доказывают.
+    """
+    order_id = normalize_durable_order_identifier(plan.get("order_id"))
+    order_link_id = normalize_durable_order_identifier(plan.get("order_link_id"))
+    if not order_id and not order_link_id:
+        return None
+
+    kwargs = {"category": "linear", "symbol": sym, "limit": 50}
+    if order_id:
+        kwargs["orderId"] = order_id
+    else:
+        kwargs["orderLinkId"] = order_link_id
+
+    try:
+        resp = await bybit_call(session.get_order_history, **kwargs)
+    except Exception as exc:
+        raise _SnapshotUnknown(
+            f"get_order_history недоступен для входа {sym}: {exc}"
+        ) from None
+
+    rows = _require_result_rows(resp, "get_order_history entry anchor")
+    return proven_terminal_entry_order(
+        rows, symbol=sym, order_id=order_id, order_link_id=order_link_id
+    )
+
+
+async def _fetch_entry_executions(sym: str, order_id: str):
+    """Все страницы исполнений точного входа либо ``None`` при аномалии.
+
+    Пагинация ОГРАНИЧЕНА явным конечным бюджетом
+    :data:`~core.r2_evidence.EXECUTION_PAGE_BUDGET`: неограниченного
+    ``while``-цикла здесь нет. ``None`` (то есть якорь NOT_PROVEN) даёт любая
+    аномалия продолжения — malformed курсор, повтор того же курсора, пустая
+    страница с заявленным продолжением и исчерпание бюджета страниц при всё ещё
+    заявленном продолжении. Заявлять полноту при исчерпанном бюджете запрещено.
+    """
+    rows: list = []
+    cursor = ""
+    seen_cursors: set = set()
+
+    for _page in range(EXECUTION_PAGE_BUDGET):
+        kwargs = {
+            "category": "linear",
+            "symbol": sym,
+            "orderId": order_id,
+            "limit": EXECUTION_PAGE_LIMIT,
+        }
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            resp = await bybit_call(session.get_executions, **kwargs)
+        except Exception as exc:
+            raise _SnapshotUnknown(
+                f"get_executions недоступен для {sym}: {exc}"
+            ) from None
+
+        page_rows = _require_result_rows(resp, "get_executions entry anchor")
+        state, next_cursor = read_page_cursor(resp.get("result"))
+        if state == PAGE_MALFORMED:
+            return None
+        rows.extend(page_rows)
+        if state == PAGE_DONE:
+            return rows
+        if not page_rows:
+            # Пустая страница с заявленным продолжением — аномалия ответа.
+            return None
+        if next_cursor in seen_cursors:
+            # Повторяющийся курсор: продолжение недостоверно.
+            return None
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+    # Бюджет страниц исчерпан, а биржа всё ещё заявляет продолжение.
+    return None
+
+
+async def _prove_entry_anchor(sym: str, plan: dict):
+    """Durable временной якорь входа (exchange-мс) либо ``None``.
+
+    Якорь доказывается ровно так, как требует контракт среза, и только целиком:
+
+      * точный owned входной ордер перечитан authoritative и имеет ПОЛОЖИТЕЛЬНЫЙ
+        терминальный статус (будущих исполнений быть не может);
+      * полный набор исполнений ИМЕННО этого ордера прочитан ограниченной
+        пагинацией, каждая строка — реальный ``Trade`` с durable ``execId``,
+        положительным ``execQty`` и валидным целым ``execTime``;
+      * сумма дедуплицированных ``execQty`` совпала и с authoritative
+        ``cumExecQty`` ордера, и с подтверждённым объёмом lifecycle;
+      * ``entry_final_exec_time_ms = max(execTime)`` записан durable как целое.
+
+    Любая недоказанность оставляет якорь отсутствующим: локальное время,
+    ``createdTime``/``updatedTime`` и метки журнала подстановке не подлежат.
+    """
+    order_id = normalize_durable_order_identifier(plan.get("order_id"))
+    if not order_id:
+        return None
+    confirmed_qty = to_positive_decimal(plan.get("qty"))
+    if confirmed_qty is None:
+        return None
+
+    terminal = await _fetch_entry_terminal_state(sym, plan)
+    if terminal is None:
+        logging.info(
+            "2R anchor NOT_PROVEN: symbol=%s reason=entry_order_not_terminal", sym
+        )
+        return None
+
+    rows = await _fetch_entry_executions(sym, order_id)
+    if rows is None:
+        logging.warning(
+            "2R anchor NOT_PROVEN: symbol=%s reason=execution_pagination_unproven "
+            "page_budget=%s",
+            sym, EXECUTION_PAGE_BUDGET,
+        )
+        return None
+
+    anchor_ms = proven_entry_execution_anchor(
+        rows,
+        symbol=sym,
+        order_id=order_id,
+        order_link_id=plan.get("order_link_id"),
+        cum_exec_qty=terminal["cum_exec_qty"],
+        confirmed_qty=confirmed_qty,
+    )
+    if anchor_ms is None:
+        logging.info(
+            "2R anchor NOT_PROVEN: symbol=%s reason=execution_set_unproven", sym
+        )
+        return None
+
+    event = build_entry_anchor_event(
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=plan.get("position_idx"),
+        entry_order_id=order_id,
+        entry_order_link_id=plan.get("order_link_id"),
+        entry_final_exec_time_ms=anchor_ms,
+    )
+    if not event:
+        return None
+    if not await asyncio.to_thread(append_event, event):
+        logging.error("2R entry anchor не записан для %s", sym)
+        return None
+    logging.info(
+        "2R entry anchor durable: symbol=%s entryOrderId=%s orderStatus=%s "
+        "entryFinalExecTimeMs=%s",
+        sym, order_id, terminal["order_status"], anchor_ms,
+    )
+    return anchor_ms
+
+
+async def _append_mark_2r_event(sym: str, event: dict) -> bool:
+    """Durable-запись факта markPrice на уровне 2R (без exchange-записи)."""
+    if not event:
+        return False
+    if not await asyncio.to_thread(append_event, event):
+        logging.error("2R market evidence не записано для %s", sym)
+        return False
+    logging.info(
+        "2R market evidence durable: symbol=%s source=%s target2R=%s",
+        sym, event.get("mark_2r_source"), event.get("target_2r"),
+    )
+    return True
+
+
+async def _observe_current_mark_2r(
+    sym: str, plan: dict, position_rows: list, target_2r
+) -> bool:
+    """Прямое доказательство 2R по ОБЩЕМУ снимку позиций цикла.
+
+    Нового чтения позиций не выполняется: строка берётся из уже полученного
+    снимка и опознаётся существующим примитивом владения после сокращения TP1
+    (:func:`core.exit_binding.find_continuation_position_row`), поэтому чужая,
+    ручная или устаревшая позиция доказательством стать не может.
+
+    Читается только ``markPrice``; ``lastPrice``, ``indexPrice`` и цена сделки
+    подстановке не подлежат. Доказывается ровно текущее наблюдение: пропущенное
+    историческое пересечение этим путём не восстанавливается.
+    """
+    original_qty = to_positive_decimal(plan.get("qty"))
+    avg_entry = to_positive_decimal(plan.get("entry"))
+    if original_qty is None or avg_entry is None:
+        return False
+
+    position = find_continuation_position_row(
+        position_rows,
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=plan.get("position_idx"),
+        original_qty=original_qty,
+        avg_price=avg_entry,
+    )
+    if position is None:
+        return False
+
+    mark = proven_current_mark_2r(
+        position, side=plan.get("side"), target_2r=target_2r
+    )
+    if mark is None:
+        return False
+
+    return await _append_mark_2r_event(sym, build_mark_2r_event(
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=plan.get("position_idx"),
+        entry_order_id=plan.get("order_id"),
+        entry_order_link_id=plan.get("order_link_id"),
+        target_2r=target_2r,
+        mark_2r_source=MARK_2R_SOURCE_CURRENT_POSITION,
+        observed_mark_price=mark,
+    ))
+
+
+async def _observe_kline_2r(sym: str, plan: dict, anchor_ms, target_2r) -> bool:
+    """РОВНО ОДИН ограниченный read mark-price свечей за цикл для lifecycle.
+
+    Источник production-real: ``get_mark_price_kline`` (``category="linear"``,
+    ``interval="1"``). Catch-up цикла и пагинации истории в C2-1 нет намеренно,
+    поэтому покрытие может быть неполным: непокрытые интервалы остаются
+    NOT_PROVEN и «проверено, пересечения не было» из них НЕ следует.
+
+    Доказательством считается только ПОЛНОСТЬЮ закрытая свеча, начавшаяся не
+    раньше durable exchange-якоря входа, чья закрытость подтверждена наличием
+    строки следующей минуты в ТОМ ЖЕ валидированном ответе. Локальные часы
+    процесса не используются.
+    """
+    try:
+        resp = await bybit_call(
+            session.get_mark_price_kline,
+            category=MARK_PRICE_KLINE_CATEGORY,
+            symbol=sym,
+            interval=MARK_PRICE_KLINE_INTERVAL_MINUTE,
+            limit=MARK_PRICE_KLINE_LIMIT,
+        )
+    except Exception as exc:
+        raise _SnapshotUnknown(
+            f"get_mark_price_kline недоступен для {sym}: {exc}"
+        ) from None
+
+    if not isinstance(resp, dict):
+        raise _SnapshotUnknown(
+            f"get_mark_price_kline: неожиданный тип ответа {type(resp).__name__}"
+        )
+    _require_ok_ret_code(resp, "get_mark_price_kline")
+
+    candles = parse_mark_price_kline(resp.get("result"), symbol=sym)
+    if candles is None:
+        logging.warning(
+            "2R kline NOT_PROVEN: symbol=%s reason=mark_price_kline_unproven", sym
+        )
+        return False
+
+    proven = proven_closed_candle_2r(
+        candles,
+        side=plan.get("side"),
+        target_2r=target_2r,
+        anchor_ms=anchor_ms,
+    )
+    if proven is None:
+        # Пересечение не доказано ЭТИМ ответом. Это не утверждение о том, что
+        # пересечения не было: первая перекрывающая якорь минута и непокрытые
+        # интервалы остаются недоказанными.
+        return False
+
+    return await _append_mark_2r_event(sym, build_mark_2r_event(
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=plan.get("position_idx"),
+        entry_order_id=plan.get("order_id"),
+        entry_order_link_id=plan.get("order_link_id"),
+        target_2r=target_2r,
+        mark_2r_source=MARK_2R_SOURCE_CLOSED_KLINE,
+        candle_start_ms=proven["candle_start_ms"],
+        candle_extreme_price=proven["candle_extreme_price"],
+    ))
+
+
+async def _observe_r2_evidence(sym: str, plan: dict, position_rows: list) -> None:
+    """Ограниченный конвейер доказательств 2R для ОДНОГО lifecycle за цикл.
+
+    Порядок причинно обязателен: каноническая цель → durable временной якорь
+    входа → durable факт рынка. Пока якорь не доказан, наблюдение markPrice не
+    выполняется вовсе: без exchange-времени входа нельзя отличить свечу,
+    начавшуюся после входа, от свечи, перекрывающей его.
+
+    Прямое наблюдение текущего markPrice выполняется первым, потому что оно
+    бесплатно (общий снимок позиций уже получен). Только если оно 2R не
+    доказало, делается РОВНО ОДИН read истории mark-price.
+    """
+    target_2r = canonical_2r_target_from_evidence(plan)
+    if target_2r is None:
+        logging.warning(
+            "2R: %s пропущен — каноническая цель 2R не доказана (fail-closed)", sym
+        )
+        return
+
+    anchor_ms = plan.get("entry_final_exec_time_ms")
+    if anchor_ms is None:
+        anchor_ms = await _prove_entry_anchor(sym, plan)
+        if anchor_ms is None:
+            # Без durable якоря C2-обработка этого lifecycle на цикл прекращается.
+            return
+
+    if await _observe_current_mark_2r(sym, plan, position_rows, target_2r):
+        return
+    await _observe_kline_2r(sym, plan, anchor_ms, target_2r)
+
+
+async def _materialize_r2_milestone(sym: str, plan: dict) -> None:
+    """Материализует durable 2R-милестоун из уже durable факта рынка.
+
+    Journal-only: дополнительного чтения Bybit НЕ требуется, потому что и
+    временной якорь входа, и факт markPrice на уровне 2R уже durable. Это же —
+    ограниченный путь восстановления после краха между записью факта и записью
+    милестоуна: следующий цикл достраивает милестоун из журнала, и повторный
+    market-history read для превращения уже durable факта в ``r2_proven`` не
+    нужен.
+
+    Милестоун только фиксирует факт достижения уровня 2R. Отсюда НЕ вызываются
+    ``set_trading_stop`` / ``place_order`` / ``cancel_order`` / ``amend_order`` и
+    НЕ пишутся ``PROTECTION_CHANGE`` / ``EXIT_ORDER_BOUND``: политика Auto-BE и
+    Risk Cut на sticky-милестоуны в этом срезе не мигрируется.
+    """
+    event = build_r2_milestone_event(
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=plan.get("position_idx"),
+        entry_order_id=plan.get("order_id"),
+        entry_order_link_id=plan.get("order_link_id"),
+    )
+    if not event:
+        return
+    if await asyncio.to_thread(append_event, event):
+        logging.info(
+            "2R milestone durable: symbol=%s entryOrderId=%s",
+            sym, plan.get("order_id") or "-",
+        )
+    else:
+        logging.error("2R milestone не записан для %s", sym)
+
+
 async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
     """Поддерживает causal SL continuation, historical TP audit и факт TP1.
 
@@ -2073,6 +2467,23 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
     Bybit и является ограниченным путём восстановления после краха между фактом
     TP1 и милестоуном. Милестоун защиту не включает и exchange-запись не
     вызывает; текущая политика Risk Cut / Auto-BE на sticky-1R не мигрируется.
+
+    LIVE-FIX8-C2 добавляет ещё один ограниченный шаг доказательств — уровень 2R
+    (см. :func:`_observe_r2_evidence`). Порядок фиксирован:
+
+      A. если durable факт markPrice на уровне 2R уже есть, а милестоун ещё нет —
+         он материализуется JOURNAL-ONLY, без единого чтения биржи;
+      B. если 2R уже доказан — C2-чтений для этого lifecycle нет вовсе;
+      C. если 1R доказан, 2R нет и durable временного якоря входа нет — делается
+         ограниченная authoritative-попытка его доказать; без якоря C2-обработка
+         этого lifecycle на цикл прекращается;
+      D. при доказанном якоре текущий markPrice берётся из ОБЩЕГО снимка позиций
+         цикла — новый per-symbol get_positions не добавляется;
+      E. если прямое наблюдение 2R не доказало — выполняется РОВНО ОДИН read
+         mark-price свечей для этого lifecycle в этом цикле.
+
+    Между каждой durable-записью состояние остаётся crash-safe, а C2 не вызывает
+    ни одной записи на биржу.
     """
     try:
         anchored = await asyncio.to_thread(get_auto_protection_evidence)
@@ -2103,7 +2514,33 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
         for milestone_sym, milestone_plan in milestone_pending.items():
             await _materialize_r1_milestone(milestone_sym, milestone_plan)
 
-        if not continuations and not tp_candidates and not tp1_pending:
+        # C2 шаг A: милестоун 2R достраивается journal-only из уже durable факта
+        # рынка. Ни одного C2-чтения биржи здесь не требуется, поэтому крах между
+        # фактом и милестоуном восстановим без повторного market-history read.
+        r2_milestone_pending = {
+            sym: plan for sym, plan in anchored.items()
+            if plan.get("mark_2r_fact") is True
+            and not plan.get("milestones", {}).get("r2_proven", False)
+        }
+        for r2_sym, r2_plan in r2_milestone_pending.items():
+            await _materialize_r2_milestone(r2_sym, r2_plan)
+
+        # C2 шаги B/C: наблюдение выполняется только для exact lifecycle, где 1R
+        # доказан, 2R ещё нет и durable факта рынка ещё нет. Уже доказанный 2R и
+        # уже durable факт C2-чтений не вызывают.
+        r2_pending = {
+            sym: plan for sym, plan in anchored.items()
+            if plan.get("milestones", {}).get("r1_proven", False) is True
+            and plan.get("milestones", {}).get("r2_proven", False) is False
+            and plan.get("mark_2r_fact") is not True
+        }
+
+        if (
+            not continuations
+            and not tp_candidates
+            and not tp1_pending
+            and not r2_pending
+        ):
             return
 
         try:
@@ -2121,8 +2558,25 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
             if sym in open_symbols
         ]
         tp1_symbols = [sym for sym in tp1_pending if sym in open_symbols]
-        if not pending and not tp1_symbols:
+        r2_symbols = [sym for sym in r2_pending if sym in open_symbols]
+        if not pending and not tp1_symbols and not r2_symbols:
             return
+
+        # C2 шаги C-E выполняются до связывания выходов, чтобы недоказанный
+        # журнал связей не отменял сбор независимых доказательств 2R. Общий
+        # снимок позиций переиспользуется: нового чтения позиций здесь нет.
+        for r2_sym in r2_symbols:
+            try:
+                await _observe_r2_evidence(
+                    r2_sym, r2_pending[r2_sym], position_rows
+                )
+            except _SnapshotUnknown as unknown:
+                # Недоказанное чтение одного инструмента не отменяет обработку
+                # остальных и уже durable evidence не отменяет.
+                logging.warning(
+                    "2R evidence: %s пропущен (UNKNOWN evidence): %s",
+                    r2_sym, unknown,
+                )
 
         if pending:
             try:

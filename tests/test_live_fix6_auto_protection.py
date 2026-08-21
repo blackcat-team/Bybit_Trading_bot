@@ -201,9 +201,16 @@ def test_exact_confirmed_lifecycle_proves_original_plan(monkeypatch, tmp_path):
             "anchored": True,
             "pending_change": None,
             "tp1": None,
-            # Новый lifecycle начинается без доказанных милестоунов защиты
-            # (LIVE-FIX8-C1): 1R доказывается только точным исполнением TP1.
-            "milestones": {"r1_proven": False},
+            # Новый lifecycle начинается без durable временного якоря входа и
+            # без доказанного факта рынка 2R (LIVE-FIX8-C2): якорь доказывается
+            # только полным набором исполнений точного входа, а факт — только
+            # authoritative markPrice.
+            "entry_final_exec_time_ms": None,
+            "mark_2r_fact": False,
+            # Новый lifecycle начинается без доказанных милестоунов защиты:
+            # 1R доказывается только точным исполнением TP1 (LIVE-FIX8-C1), а
+            # 2R — только durable якорем и фактом markPrice (LIVE-FIX8-C2).
+            "milestones": {"r1_proven": False, "r2_proven": False},
         }
     }
 

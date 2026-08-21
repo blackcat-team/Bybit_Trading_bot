@@ -739,8 +739,13 @@ async def test_milestone_survives_tp1_disappearing_from_open_orders(
 ):
     """C19/C20. Исчезновение TP1 из открытых ордеров durable 1R не снимает.
 
-    Снимок открытых ордеров пуст, история ноги больше не читается — милестоун
+    Снимок открытых ордеров пуст, история ноги TP1 больше не читается — милестоун
     остаётся доказанным, потому что он durable, а не выводимый из снимка.
+
+    Единственное точное чтение истории в этом цикле принадлежит уже другому,
+    аддитивному слою (LIVE-FIX8-C2): доказанный 1R делает lifecycle кандидатом на
+    доказательство временного якоря входа. Оно читает ВХОДНОЙ ордер, а не ногу
+    TP1, и на durable-состояние 1R не влияет.
     """
     calls = await _run_exit_binding(
         monkeypatch, tmp_path,
@@ -750,7 +755,7 @@ async def test_milestone_survives_tp1_disappearing_from_open_orders(
         history=[],
     )
 
-    assert calls["history"] == []
+    assert [call.get("orderId") for call in calls["history"]] == ["entry-1"]
     assert _r1() is True
     # И повторных милестоун-событий не появилось.
     assert len(_milestone_events()) == 1
@@ -907,7 +912,7 @@ def test_durable_milestone_is_reconstructed_directly_after_restart(
     # Повторный разбор того же durable-файла (как после перезапуска процесса).
     second = _plan()["milestones"]
 
-    assert first == second == {"r1_proven": True}
+    assert first == second == {"r1_proven": True, "r2_proven": False}
 
 
 @pytest.mark.asyncio
@@ -979,24 +984,35 @@ async def test_proven_milestone_causes_no_auto_be_or_risk_cut_write(
 
 
 def test_no_risk_cut_verified_state_is_introduced():
-    """F32b. C1 не вводит ни RISK_CUT_VERIFIED, ни AUTO_BE_VERIFIED."""
+    """F32b. Милестоун не вводит ни RISK_CUT_VERIFIED, ни AUTO_BE_VERIFIED.
+
+    Разделение состояний остаётся прежним: 1R_PROVEN / 2R_PROVEN — это
+    доказательства достижения уровня, а НЕ доказательства выполненного действия
+    защиты. Состояний завершённого действия в журнале не существует, и обратного
+    перехода «милестоун больше не достигнут» тоже нет.
+    """
     for name in (
-        "RISK_CUT_VERIFIED", "AUTO_BE_VERIFIED", "MILESTONE_2R",
+        "RISK_CUT_VERIFIED", "AUTO_BE_VERIFIED",
         "PROTECTION_MILESTONE_UNREACHED",
     ):
         assert not hasattr(journal, name)
 
 
-def test_no_2r_milestone_is_claimed(monkeypatch, tmp_path):
-    """L. Не реализованный +2R доказанным не выглядит и не присутствует."""
+def test_r2_milestone_is_never_claimed_without_its_own_evidence(
+    monkeypatch, tmp_path
+):
+    """L. Доказанный 1R сам по себе +2R доказанным не делает.
+
+    Состояние милестоунов содержит оба уровня раздельно, и 2R остаётся
+    недоказанным, пока у него нет СВОЕГО нижележащего evidence (durable
+    временной якорь входа плюс durable факт markPrice на уровне 2R).
+    """
     _write_events(monkeypatch, tmp_path, *_PROVEN)
     milestones = _plan()["milestones"]
 
-    # Ровно одно известное состояние; placeholder'а «r2_proven: False», который
-    # можно спутать с evidence о +2R, здесь нет.
-    assert milestones == {"r1_proven": True}
-    assert "r2_proven" not in milestones
+    assert milestones == {"r1_proven": True, "r2_proven": False}
     assert journal.MILESTONE_1R == "1R"
+    assert journal.MILESTONE_2R == "2R"
 
 
 def test_milestone_event_carries_minimal_factual_context(monkeypatch, tmp_path):
@@ -1060,8 +1076,11 @@ def test_milestone_builder_refuses_unproven_input(kwargs, reason):
 async def test_tp1_observer_read_bound_is_unchanged(monkeypatch, tmp_path):
     """G38. Граница чтений наблюдателя TP1 не изменилась.
 
-    Ровно один точный read истории до первого доказанного факта и ни одного
-    после; материализация милестоуна собственных чтений не добавляет.
+    Ровно один точный read истории ноги TP1 до первого доказанного факта и ни
+    одного после; материализация милестоуна собственных чтений не добавляет.
+
+    Третий цикл читает историю уже по ВХОДНОМУ ордеру: это аддитивный слой
+    LIVE-FIX8-C2 (временной якорь входа), а не повторное наблюдение ноги TP1.
     """
     first = await _run_exit_binding(
         monkeypatch, tmp_path,
@@ -1083,7 +1102,8 @@ async def test_tp1_observer_read_bound_is_unchanged(monkeypatch, tmp_path):
         "limit": 50,
     }]
     assert second["history"] == []
-    assert third["history"] == []
+    # Ногу TP1 больше не читает никто.
+    assert [call.get("orderId") for call in third["history"]] == ["entry-1"]
     # Милестоун появился на цикле ПОСЛЕ того, как факт стал durable.
     assert len(_milestone_events()) == 1
     assert _r1() is True

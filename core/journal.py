@@ -47,16 +47,35 @@
                       только факт исполнения; вывод о милестоуне (1R/2R) оно
                       не делает и защиту не включает.
                       Lifecycle не меняет и терминальным не является.
+  ENTRY_EXECUTION_ANCHOR_PROVEN — durable неизменный ВРЕМЕННОЙ якорь входа:
+                      exchange-время последнего исполнения точного входного
+                      ордера этого lifecycle (max(execTime) полного точного
+                      набора исполнений) в миллисекундах эпохи биржи. Доказан
+                      только authoritative-чтением: терминальный статус самого
+                      ордера плюс полный, сверенный по объёму набор его
+                      исполнений. Локальные метки времени (ts события,
+                      entry_event_ts, createdTime/updatedTime) якорем не
+                      являются. Lifecycle не меняет и терминальным не является.
+  MARK_PRICE_2R_OBSERVED — durable ФАКТ authoritative-наблюдения markPrice на
+                      каноническом уровне 2R этого lifecycle. Источник
+                      различается явно: текущий снимок позиции
+                      (current_position_mark) либо ПОЛНОСТЬЮ закрытая минутная
+                      свеча mark-price (closed_mark_price_kline). Событие
+                      фиксирует только факт рынка: милестоун из него не
+                      выводится, защита не включается и exchange-запись не
+                      вызывается. Lifecycle не меняет и терминальным не является.
   PROTECTION_MILESTONE_PROVEN — durable монотонный (sticky) милестоун защиты
-                      подтверждённого lifecycle (LIVE-FIX8-C1: только 1R). Само
-                      событие authoritative НЕ является: при строгой
-                      реконструкции милестоун доказан лишь когда в журнале того
-                      же exact lifecycle есть и нижележащее evidence — для 1R это
-                      факт ненулевого исполнения точной ноги TP1
-                      (TP_LADDER_FILL_OBSERVED). Милестоун защиту НЕ включает и
-                      exchange-запись не вызывает; текущая цена, размер позиции и
-                      planned_risk_usdt его не задают. Lifecycle не меняет и
-                      терминальным не является.
+                      подтверждённого lifecycle (1R и 2R). Само событие
+                      authoritative НЕ является: при строгой реконструкции
+                      милестоун доказан лишь когда в журнале того же exact
+                      lifecycle есть и нижележащее evidence — для 1R это факт
+                      ненулевого исполнения точной ноги TP1
+                      (TP_LADDER_FILL_OBSERVED), а для 2R — durable временной
+                      якорь входа (ENTRY_EXECUTION_ANCHOR_PROVEN) И durable факт
+                      рынка (MARK_PRICE_2R_OBSERVED), записанные РАНЬШЕ него.
+                      Милестоун защиту НЕ включает и exchange-запись не вызывает;
+                      текущая цена, размер позиции и planned_risk_usdt его не
+                      задают. Lifecycle не меняет и терминальным не является.
 
 Чтение хронологии по инструменту — get_trade_timeline(): read-only, порядок
 физических строк JSONL, недоказанное evidence отображается как UNKNOWN.
@@ -156,6 +175,14 @@ TP_LADDER_FILL_OBSERVED = "TP_LADDER_FILL_OBSERVED"
 # при наличии нижележащего evidence того же exact lifecycle (для 1R — факт
 # ненулевого исполнения точной ноги TP1).
 PROTECTION_MILESTONE_PROVEN = "PROTECTION_MILESTONE_PROVEN"
+# Durable неизменный ВРЕМЕННОЙ якорь входа: exchange-время последнего исполнения
+# точного входного ордера lifecycle. Как и предыдущие аудиторские события,
+# позицию не открывает и не закрывает, в TERMINAL_EVENTS не входит и в
+# get_position_lifecycles не обрабатывается.
+ENTRY_EXECUTION_ANCHOR_PROVEN = "ENTRY_EXECUTION_ANCHOR_PROVEN"
+# Durable ФАКТ authoritative-наблюдения markPrice на каноническом уровне 2R.
+# Тоже lifecycle-neutral: это evidence о рынке, а не милестоун и не защита.
+MARK_PRICE_2R_OBSERVED = "MARK_PRICE_2R_OBSERVED"
 
 # Канонический уровень ноги Real-R лестницы. LIVE-FIX8-B знает только TP1 —
 # ПЕРВУЮ логическую Real-R цель подтверждённого lifecycle. Значение участвует в
@@ -175,18 +202,39 @@ TP_LADDER_SOURCE_PLACE_ORDER = "place_order"
 TP_FILL_SOURCE_ORDER_HISTORY = "get_order_history"
 
 # Канонические идентификаторы милестоунов защиты (поле ``milestone`` события
-# PROTECTION_MILESTONE_PROVEN). LIVE-FIX8-C1 знает только 1R — ПЕРВУЮ Real-R
-# цель. 2R намеренно отсутствует: его production-real доказательство принадлежит
-# отдельному слою (LIVE-FIX8-C2), а обобщённая структура милестоунов не должна
-# выдавать не реализованный +2R за доказанный. Значение участвует в проверке:
-# событие с любым иным milestone доказанным милестоуном 1R не становится.
+# PROTECTION_MILESTONE_PROVEN): ПЕРВАЯ Real-R цель (1R) и вторая (2R). Значение
+# участвует в проверке: событие с любым иным milestone доказанным милестоуном не
+# становится, а evidence одного милестоуна другой не доказывает.
 MILESTONE_1R = "1R"
+MILESTONE_2R = "2R"
 
 # Единственный допустимый источник доказательства милестоуна 1R: durable-факт
 # ненулевого исполнения точной ноги TP1 этого lifecycle
 # (TP_LADDER_FILL_OBSERVED). Текущая цена, markPrice, размер позиции, произвольный
 # reduce-only fill и planned_risk_usdt источником милестоуна не являются.
 MILESTONE_SOURCE_TP1_FILL = "tp1_fill"
+
+# Единственный допустимый источник доказательства милестоуна 2R: durable ФАКТ
+# authoritative-наблюдения markPrice на каноническом уровне 2R
+# (MARK_PRICE_2R_OBSERVED) того же lifecycle. Исполнение TP2/TP3, planned risk,
+# текущий remaining size и локальное время источником милестоуна не являются.
+MILESTONE_SOURCE_MARK_PRICE_2R = "mark_price_2r"
+
+# Единственный допустимый источник durable временного якоря входа: authoritative
+# история исполнений ТОЧНОГО входного ордера. Ни ENTRY_PLACED.ts, ни
+# POSITION_CONFIRMED.ts, ни createdTime/updatedTime источником не являются.
+ENTRY_ANCHOR_SOURCE_EXECUTION_HISTORY = "get_executions"
+
+# Канонические источники durable факта 2R. Различаются намеренно: текущее
+# наблюдение markPrice доказывает только САМО СЕБЯ, а полностью закрытая
+# минутная свеча mark-price доказывает исторический экстремум уже закрытой
+# минуты. Ни один из них не утверждает полноту покрытия истории.
+MARK_2R_SOURCE_CURRENT_POSITION = "current_position_mark"
+MARK_2R_SOURCE_CLOSED_KLINE = "closed_mark_price_kline"
+MARK_2R_SOURCES = (
+    MARK_2R_SOURCE_CURRENT_POSITION,
+    MARK_2R_SOURCE_CLOSED_KLINE,
+)
 
 # Исходы сверки РОДИТЕЛЬСКОГО lifecycle для evidence TP-лестницы. Три исхода
 # различаются намеренно: «другой родитель» безопасно игнорируется, а
@@ -695,17 +743,49 @@ def get_auto_protection_evidence() -> dict:
     не включается, а terminal/устаревший lifecycle в результат не попадает и
     потому свой TP1 новой позиции того же символа не передаёт.
 
+    ``entry_final_exec_time_ms`` — durable неизменный ВРЕМЕННОЙ якорь входа
+    (``int`` миллисекунд эпохи биржи) либо ``None``. Он появляется только из
+    ``ENTRY_EXECUTION_ANCHOR_PROVEN`` того же exact lifecycle с доказанным
+    источником :data:`ENTRY_ANCHOR_SOURCE_EXECUTION_HISTORY`. Два РАЗНЫХ
+    durable-значения якоря одного lifecycle — противоречие журнала: выбрать
+    «последнее» или «раннее» нельзя, поэтому lifecycle становится недоказанным.
+    Локальное время (``ts``, ``entry_event_ts``), ``createdTime`` и
+    ``updatedTime`` якорем не являются и сюда не подставляются.
+
+    ``mark_2r_fact`` — durable ФАКТ authoritative-наблюдения markPrice на
+    каноническом уровне 2R (``MARK_PRICE_2R_OBSERVED``). Он доверяется только
+    когда временной якорь входа уже durable ФИЗИЧЕСКИ РАНЬШЕ этого события,
+    записанный ``target_2r`` в точности равен канонической цели, пересчитанной
+    из неизменной геометрии lifecycle (:func:`canonical_2r_target_from_evidence`),
+    источник входит в :data:`MARK_2R_SOURCES`, а наблюдённая цена действительно
+    достигла цели. Для свечного источника дополнительно требуется
+    ``candle_start_ms >= entry_final_exec_time_ms``.
+
     ``milestones`` — durable монотонное состояние милестоунов защиты этого
-    lifecycle: сейчас ``{"r1_proven": bool}``. ``r1_proven`` становится ``True``
-    ТОЛЬКО когда в журнале того же exact lifecycle есть и durable-событие
-    ``PROTECTION_MILESTONE_PROVEN`` (``milestone == MILESTONE_1R``), и
-    нижележащее authoritative-evidence — доказанное ненулевое исполнение точной
-    ноги TP1 (``tp1["exec_qty"]``). Одного текста «1R» без исполнения TP1
-    недостаточно (fail-closed). Милестоун sticky: ретрейс цены, перенос/
-    перепривязка SL, исчезновение TP1 из открытых ордеров и перезапуск его не
-    сбрасывают, потому что он выводится только из durable-событий, а не из
-    текущей цены. Наличие милестоуна защиту НЕ включает и exchange-запись не
-    вызывает. Не реализованный +2R здесь отсутствует и остаётся недоказанным.
+    lifecycle: ``{"r1_proven": bool, "r2_proven": bool}``.
+
+    ``r1_proven`` становится ``True`` ТОЛЬКО когда в журнале того же exact
+    lifecycle есть и durable-событие ``PROTECTION_MILESTONE_PROVEN``
+    (``milestone == MILESTONE_1R``), и нижележащее authoritative-evidence —
+    доказанное ненулевое исполнение точной ноги TP1 (``tp1["exec_qty"]``).
+    Одного текста «1R» без исполнения TP1 недостаточно (fail-closed).
+
+    ``r2_proven`` становится ``True`` ТОЛЬКО когда в журнале того же exact
+    lifecycle физически РАНЬШЕ милестоуна ``milestone == MILESTONE_2R`` (с
+    источником :data:`MILESTONE_SOURCE_MARK_PRICE_2R`) уже записаны И durable
+    временной якорь входа, И durable факт рынка ``mark_2r_fact``. Милестоун,
+    оказавшийся раньше своего факта, доверенным задним числом НЕ становится.
+
+    ``r2_proven == False`` означает РОВНО ОДНО: «2R не доказан authoritative».
+    Это НЕ утверждение «2R не достигался»: первая перекрывающая якорь минута и
+    непокрытые историей интервалы остаются принципиально недоказуемыми, и
+    выдавать их за «проверено, пересечения не было» запрещено.
+
+    Милестоуны sticky и монотонны: ретрейс цены, перенос/перепривязка SL,
+    исчезновение TP1 или TP2/TP3 из открытых ордеров, неудачное чтение биржи и
+    перезапуск их не сбрасывают, потому что они выводятся только из
+    durable-событий, а не из текущей цены. Обратного перехода не существует.
+    Наличие милестоуна защиту НЕ включает и exchange-запись не вызывает.
     """
     lifecycles: dict = {}
 
@@ -879,11 +959,18 @@ def get_auto_protection_evidence() -> dict:
                     # новый lifecycle, поэтому TP1 прошлой сделки того же
                     # символа сюда не наследуется.
                     "tp1": None,
+                    # Durable неизменный временной якорь входа
+                    # (exchange-время последнего исполнения точного входа) и
+                    # durable факт рынка 2R. Новый вход всегда начинает новый
+                    # lifecycle, поэтому якорь и факт прошлой сделки того же
+                    # символа сюда не наследуются.
+                    "entry_anchor": None,
+                    "mark_2r_fact": False,
                     # Durable монотонное состояние милестоунов защиты этого
                     # lifecycle. Новый lifecycle начинается без доказанных
-                    # милестоунов, поэтому 1R прошлой сделки того же символа
-                    # сюда не переходит. r2 намеренно отсутствует (не C1).
-                    "milestones": {"r1_proven": False},
+                    # милестоунов, поэтому 1R/2R прошлой сделки того же символа
+                    # сюда не переходят.
+                    "milestones": {"r1_proven": False, "r2_proven": False},
                 }
                 if qty is None or risk is None:
                     lifecycles[symbol]["state"] = "UNPROVEN"
@@ -1146,17 +1233,142 @@ def get_auto_protection_evidence() -> dict:
                 # же ордера, а повтор того же наблюдения противоречия не даёт.
                 tp1["exec_qty"] = exec_qty
 
-            elif event_type == PROTECTION_MILESTONE_PROVEN:
+            elif event_type == ENTRY_EXECUTION_ANCHOR_PROVEN:
                 current = lifecycles.get(symbol)
-                tp1 = current.get("tp1") if current is not None else None
                 if (
                     current is None
                     or current.get("state") != CONFIRMED
                     or not current.get("anchored")
-                    or tp1 is None
                 ):
-                    # Милестоун без активного подтверждённого lifecycle с durable
-                    # идентичностью TP1 сам к lifecycle не прикрепляется.
+                    # Якорь без активного подтверждённого lifecycle сам к
+                    # lifecycle не прикрепляется.
+                    continue
+                parent = _tp1_parent_match(ev, current)
+                if parent == _TP_PARENT_CONFLICT:
+                    # Durable-идентификаторы одного и того же входа противоречат.
+                    current["state"] = "UNPROVEN"
+                    continue
+                if parent != _TP_PARENT_MATCH:
+                    continue
+                anchor_ms = read_exchange_epoch_ms(
+                    ev.get("entry_final_exec_time_ms")
+                )
+                if (
+                    anchor_ms is None
+                    or ev.get("anchor_source")
+                    != ENTRY_ANCHOR_SOURCE_EXECUTION_HISTORY
+                ):
+                    # Недоказанное время или иной источник якорем не являются;
+                    # якорь остаётся отсутствующим (NOT_PROVEN), а не «нулевым».
+                    continue
+                known_anchor = current.get("entry_anchor")
+                if known_anchor is not None and known_anchor != anchor_ms:
+                    # Два РАЗНЫХ durable-якоря одного lifecycle: выбрать между
+                    # ними («последний», «самый ранний») нельзя — это
+                    # противоречие журнала, и оно fail-closed.
+                    current["state"] = "UNPROVEN"
+                    continue
+                # Повтор того же значения идемпотентен; доказанный якорь
+                # неизменен для этого lifecycle.
+                current["entry_anchor"] = anchor_ms
+
+            elif event_type == MARK_PRICE_2R_OBSERVED:
+                current = lifecycles.get(symbol)
+                if (
+                    current is None
+                    or current.get("state") != CONFIRMED
+                    or not current.get("anchored")
+                    or current.get("entry_anchor") is None
+                ):
+                    # Причинный порядок обязателен: факт рынка без УЖЕ durable
+                    # временного якоря входа доверенным не становится и задним
+                    # числом не легализуется появившимся позже якорем.
+                    continue
+                parent = _tp1_parent_match(ev, current)
+                if parent == _TP_PARENT_CONFLICT:
+                    current["state"] = "UNPROVEN"
+                    continue
+                if parent != _TP_PARENT_MATCH:
+                    continue
+                target = _plan_amount(ev, "target_2r", _proven_positive_decimal)
+                canonical = canonical_2r_target_from_evidence(current)
+                source = ev.get("mark_2r_source")
+                if (
+                    target is None
+                    or canonical is None
+                    or target != canonical
+                    or source not in MARK_2R_SOURCES
+                ):
+                    # Цель, не равная канонической (пересчитанной из неизменной
+                    # геометрии этого lifecycle), доказательством 2R не является:
+                    # иначе «удобная» цель сделала бы proof дешевле.
+                    continue
+                if source == MARK_2R_SOURCE_CURRENT_POSITION:
+                    observed = _plan_amount(
+                        ev, "observed_mark_price", _proven_positive_decimal
+                    )
+                    if observed is None or not mark_price_crossed_2r(
+                        current["side"], observed, canonical
+                    ):
+                        continue
+                else:
+                    candle_start = read_exchange_epoch_ms(ev.get("candle_start_ms"))
+                    extreme = _plan_amount(
+                        ev, "candle_extreme_price", _proven_positive_decimal
+                    )
+                    if (
+                        candle_start is None
+                        or candle_start < current["entry_anchor"]
+                        or extreme is None
+                        or not mark_price_crossed_2r(
+                            current["side"], extreme, canonical
+                        )
+                    ):
+                        # Свеча, начавшаяся раньше якоря, перекрывает момент
+                        # входа и историческим доказательством быть не может.
+                        continue
+                # Sticky-факт: повтор того же наблюдения противоречия не даёт, а
+                # последующий ретрейс уже записанный факт не отменяет.
+                current["mark_2r_fact"] = True
+
+            elif event_type == PROTECTION_MILESTONE_PROVEN:
+                current = lifecycles.get(symbol)
+                if (
+                    current is None
+                    or current.get("state") != CONFIRMED
+                    or not current.get("anchored")
+                ):
+                    # Милестоун без активного подтверждённого lifecycle сам к
+                    # lifecycle не прикрепляется.
+                    continue
+                if ev.get("milestone") == MILESTONE_2R:
+                    parent = _tp1_parent_match(ev, current)
+                    if parent == _TP_PARENT_CONFLICT:
+                        current["state"] = "UNPROVEN"
+                        continue
+                    if parent != _TP_PARENT_MATCH:
+                        continue
+                    if (
+                        ev.get("milestone_source") != MILESTONE_SOURCE_MARK_PRICE_2R
+                        or current.get("entry_anchor") is None
+                        or current.get("mark_2r_fact") is not True
+                    ):
+                        # Объявление 2R без нижележащего durable факта рынка (и
+                        # без durable временного якоря) НЕ доверяется. Причинный
+                        # порядок: якорь → факт → милестоун. Милестоун,
+                        # оказавшийся раньше факта, доверенным задним числом не
+                        # становится: появившийся позже факт уже принятое по
+                        # этому событию решение не переписывает.
+                        continue
+                    # Sticky/монотонно: доказанный 2R остаётся доказанным.
+                    # Ретрейс, перенос/перепривязка SL, отмена TP2/TP3, неудачное
+                    # чтение и перезапуск его не сбрасывают. Обратного перехода
+                    # не существует; милестоун защиту НЕ включает.
+                    current["milestones"]["r2_proven"] = True
+                    continue
+                tp1 = current.get("tp1")
+                if tp1 is None:
+                    # Милестоун 1R без durable-идентичности TP1 не прикрепляется.
                     continue
                 parent = _tp1_parent_match(ev, current)
                 if parent == _TP_PARENT_CONFLICT:
@@ -1231,9 +1443,17 @@ def get_auto_protection_evidence() -> dict:
             # фактом её исполнения (``exec_qty``), либо None. Само наличие
             # evidence защиту не включает и милестоун не объявляет.
             "tp1": dict(info["tp1"]) if isinstance(info["tp1"], dict) else None,
+            # Durable неизменный временной якорь входа (exchange-мс) либо None,
+            # и durable факт рынка 2R. Оба — только evidence: защиту они не
+            # включают и exchange-запись не вызывают.
+            "entry_final_exec_time_ms": info["entry_anchor"],
+            "mark_2r_fact": info["mark_2r_fact"],
             # Durable монотонное состояние милестоунов защиты. r1_proven доказан
             # только при наличии и durable-события милестоуна, и нижележащего
-            # факта исполнения TP1 того же lifecycle; иначе False. Само наличие
+            # факта исполнения TP1 того же lifecycle; r2_proven — только при
+            # наличии durable якоря, durable факта рынка 2R и милестоуна,
+            # записанного ПОСЛЕ них; иначе False. ``r2_proven == False``
+            # означает «2R не доказан», а не «2R не достигался». Само наличие
             # милестоуна защиту не включает и exchange-запись не вызывает.
             "milestones": dict(info["milestones"]),
         }
@@ -1312,6 +1532,104 @@ def actual_initial_r_from_evidence(plan):
     if not r_usdt.is_finite() or r_usdt <= 0:
         return None
     return ActualInitialR(price=r_price, usdt=r_usdt)
+
+
+# ---------------------------------------------------------------------------
+# Каноническая цель 2R и каноническое сравнение markPrice с ней
+# ---------------------------------------------------------------------------
+
+# Множитель канонической цели второго Real-R уровня. Значение целое: умножение
+# Decimal на int точное, а float-множитель внёс бы ошибку представления в цель,
+# от которой зависит доказательство 2R.
+_TARGET_2R_MULTIPLIER = 2
+
+
+def canonical_2r_target_from_evidence(plan):
+    """Каноническая цена уровня 2R подтверждённого lifecycle либо ``None``.
+
+    Единственный источник — та же неизменная геометрия, что задаёт канонический
+    исходный R (:func:`actual_initial_r_from_evidence`): фактический avg entry
+    конфирмации и НЕИЗМЕННЫЙ первичный защитный SL. Канонически::
+
+        R_price   = |confirmed_entry - confirmed_initial_sl|
+        LONG:  target_2r = confirmed_entry + 2 * R_price
+        SHORT: target_2r = confirmed_entry - 2 * R_price
+
+    Ни ``planned_risk_usdt``, ни ПЕРЕНЕСЁННЫЙ текущий SL, ни остаточный риск, ни
+    цена TP2/TP3 целью не являются и здесь не используются: перенос SL (Auto-BE,
+    Risk Cut, трейлинг, rebound, ручной сдвиг) уровень 2R не переопределяет.
+
+    Значение не округляется и не нормализуется по ``tickSize``: нормализация
+    сдвинула бы цель в сторону, где доказательство становится ДЕШЕВЛЕ, а цена
+    цели обязана остаться канонической. Все вычисления идут в ``Decimal``.
+
+    ``None`` (fail-closed) возвращается, когда канонической геометрии нет, она
+    malformed, неверносторонняя, а также когда цель для SHORT оказалась бы
+    неположительной: недоказанная цель обязана остаться недоказанной.
+    """
+    actual_r = actual_initial_r_from_evidence(plan)
+    if actual_r is None:
+        return None
+    entry = _proven_positive_decimal(plan.get("entry"))
+    if entry is None:
+        return None
+    distance = _TARGET_2R_MULTIPLIER * actual_r.price
+    side = plan.get("side")
+    if side == "Buy":
+        target = entry + distance
+    elif side == "Sell":
+        target = entry - distance
+    else:
+        return None
+    if not target.is_finite() or target <= 0:
+        return None
+    return target
+
+
+def mark_price_crossed_2r(side, price, target) -> bool:
+    """True только когда доказанная цена достигла канонической цели 2R.
+
+    Единственное каноническое сравнение уровня 2R во всём проекте: LONG требует
+    ``price >= target``, SHORT — ``price <= target``. Сравнение точное и
+    выполняется в ``Decimal``; допуск, эпсилон и «почти достигнуто» здесь
+    запрещены. Недоказанная сторона или не-``Decimal`` значение дают ``False``:
+    unknown != proven.
+    """
+    if not isinstance(price, Decimal) or not isinstance(target, Decimal):
+        return False
+    if not price.is_finite() or not target.is_finite():
+        return False
+    if side == "Buy":
+        return price >= target
+    if side == "Sell":
+        return price <= target
+    return False
+
+
+def read_exchange_epoch_ms(raw):
+    """Доказанное целое время эпохи БИРЖИ в миллисекундах либо ``None``.
+
+    Bybit отдаёт ``execTime``/``startTime`` строкой целых миллисекунд, поэтому
+    доказательством считается ровно ``int`` (не ``bool``) либо строка из одних
+    десятичных цифр. Значение обязано быть строго положительным.
+
+    ``float`` и ``Decimal`` отклоняются намеренно: преобразование времени через
+    ``float`` теряет точность на миллисекундах, а именно эта точность отличает
+    свечу, начавшуюся ПОСЛЕ якоря входа, от свечи, перекрывающей его. По той же
+    причине не принимаются ``"1e3"``, ``"1.0"``, значение с пробелами внутри,
+    знак, пустая строка и любое нецифровое представление.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text or not text.isdecimal():
+            return None
+        value = int(text)
+        return value if value > 0 else None
+    return None
 
 
 class _OwnershipUnproven(Exception):
