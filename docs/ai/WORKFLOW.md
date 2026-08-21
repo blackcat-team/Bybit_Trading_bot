@@ -57,6 +57,25 @@ Review the original task contract and actual diff for scope, safety invariants, 
 
 A new focused-review finding is admissible only when it is a concrete, proven runtime or safety defect. A material change to safety-critical code requires independent review.
 
+## Status semantics
+
+These eight statuses are normative for every report, roadmap entry, and handoff. They are separate states, never synonyms for each other.
+
+| Status | Meaning | Does not imply |
+| --- | --- | --- |
+| `CODE READY` | Implementation is ready for independent QA. | Anything beyond that. |
+| `QA GREEN` | Independent QA accepted the candidate against the current contract. | Architect acceptance, commit, push, or deploy. |
+| `ACCEPTED` | The architect/control plane accepted the result for its stated scope. | Commit, push, or deploy. |
+| `COMMITTED` | The accepted content exists in a Git commit. | Push. |
+| `PUSHED` | The commit is confirmed on the canonical remote. | Deploy. |
+| `DEPLOYED` | The intended production version has been installed/activated on the target server. | Runtime correctness. |
+| `RUNTIME VERIFIED` | Authorized runtime evidence has verified the deployed artifact. | `LIVE ACCEPTED`. |
+| `LIVE ACCEPTED` | The required production/live acceptance has explicitly completed and been accepted. | — |
+
+**Normative invariant: no status automatically implies the next status.** Each state needs its own evidence and its own decision. Claim only the states actually proven; an unproven state is reported as `NO / NOT PROVEN`, never as an implied or pending success.
+
+This model weakens no existing boundary: merging is not deploying (see [Release boundary](#release-boundary)), QA evidence authorizes neither commit nor deployment, and commit, merge, release review, deployment, and runtime verification each require their own explicit authorization. Commit, push, deploy, and server operation stay outside agent authority — see [Access boundaries](../../AGENTS.md#access-boundaries). The current project status chain is recorded in [ROADMAP.md](ROADMAP.md#authoritative-current-state).
+
 ## Release boundary
 
 Merging a stage does not deploy it. The production server is not updated after every commit. Related stages may be batched, reviewed together before deployment, and followed by runtime verification. The current batching policy is in [ROADMAP.md](ROADMAP.md).
