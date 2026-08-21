@@ -40,6 +40,9 @@ from core.journal import (
     EXIT_KIND_SL,
     EXIT_KIND_TP,
     EXIT_ORDER_BOUND,
+    MILESTONE_1R,
+    MILESTONE_SOURCE_TP1_FILL,
+    PROTECTION_MILESTONE_PROVEN,
     TP_FILL_SOURCE_ORDER_HISTORY,
     TP_LADDER_FILL_OBSERVED,
     TP_LADDER_PLACED,
@@ -774,3 +777,84 @@ def tp1_fill_key(ev):
     ):
         return None
     return (symbol, entry_id, leg_id, leg_link, TP_LEVEL_TP1, idx, filled)
+
+
+# ---------------------------------------------------------------------------
+# Durable милестоун защиты из уже durable-evidence (LIVE-FIX8-C1)
+# ---------------------------------------------------------------------------
+#
+# Милестоун — это НЕ новое наблюдение биржи, а материализация уже доказанного
+# факта: durable-исполнение точной ноги TP1 этого lifecycle означает, что
+# канонический уровень 1R был достигнут. Поэтому builder ничего не читает с
+# биржи и не решает политику защиты — он лишь строит durable-событие милестоуна
+# из уже проверенной идентичности. Доверие к событию решает строгая
+# реконструкция журнала: без нижележащего факта исполнения TP1 милестоун
+# authoritative не становится.
+
+
+def build_milestone_event(
+    *,
+    symbol,
+    side,
+    position_idx,
+    entry_order_id,
+    entry_order_link_id,
+    tp_order_id,
+    tp_order_link_id,
+    milestone,
+) -> dict:
+    """Durable-событие милестоуна защиты. ``{}`` — не доказано или не поддержано.
+
+    Записывается только лицевая идентичность милестоуна: символ, сторона и
+    ``positionIdx`` позиции, точная идентичность родительского входа и точная
+    ссылка на ногу TP1 (``tp_order_id`` и/или ``tp_order_link_id``), плюс
+    канонический ``milestone`` и его источник. LIVE-FIX8-C1 умеет доказывать
+    только :data:`~core.journal.MILESTONE_1R`; любой другой ``milestone``
+    (например будущий 2R) здесь fail-closed → ``{}``, чтобы не выдать не
+    реализованный милестоун за записанный.
+
+    ``side`` — сторона ПОЗИЦИИ и входа (как в :func:`build_tp1_fill_event`).
+    Событие ничего не «ремонтирует» и милестоун сам по себе authoritative не
+    делает: доверяет ему только строгая реконструкция журнала при наличии
+    нижележащего durable-факта исполнения точной ноги TP1 того же lifecycle.
+    Никакой цены, markPrice или planned_risk_usdt: они милестоуном не являются.
+    """
+    if milestone != MILESTONE_1R:
+        # C1 доказывает ровно один милестоун. Неизвестный/ещё не реализованный
+        # милестоун durable-событием не становится.
+        return {}
+    normalized_symbol = normalize_symbol(symbol)
+    normalized_side = normalize_side(side)
+    idx = read_position_idx(position_idx)
+    entry_id = normalize_durable_order_identifier(entry_order_id)
+    leg_id = normalize_durable_order_identifier(tp_order_id)
+    leg_link = normalize_durable_order_identifier(tp_order_link_id)
+    if (
+        not normalized_symbol
+        or not normalized_side
+        or idx is None
+        or not entry_id
+        or (not leg_id and not leg_link)
+    ):
+        return {}
+
+    event = {
+        "event": PROTECTION_MILESTONE_PROVEN,
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "position_idx": idx,
+        "entry_order_id": entry_id,
+        "milestone": MILESTONE_1R,
+        "milestone_source": MILESTONE_SOURCE_TP1_FILL,
+        # Точная ссылка на ногу TP1: reducer сверяет её с durable-идентичностью
+        # TP1 этого lifecycle. tp_level фиксирует, что ссылка именно на TP1.
+        "tp_level": TP_LEVEL_TP1,
+    }
+    entry_link = normalize_durable_order_identifier(entry_order_link_id)
+    if entry_link:
+        event["entry_order_link_id"] = entry_link
+    if leg_id:
+        event["tp_order_id"] = leg_id
+    if leg_link:
+        event["tp_order_link_id"] = leg_link
+    return event

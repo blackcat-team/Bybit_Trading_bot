@@ -201,6 +201,9 @@ def test_exact_confirmed_lifecycle_proves_original_plan(monkeypatch, tmp_path):
             "anchored": True,
             "pending_change": None,
             "tp1": None,
+            # Новый lifecycle начинается без доказанных милестоунов защиты
+            # (LIVE-FIX8-C1): 1R доказывается только точным исполнением TP1.
+            "milestones": {"r1_proven": False},
         }
     }
 

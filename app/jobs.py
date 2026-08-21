@@ -46,6 +46,7 @@ from core.journal import (
     EXIT_BINDING_ORIGIN_PROTECTION_CHANGE,
     PROTECTION_SOURCE_AUTO_BE,
     PROTECTION_SOURCE_RISK_CUT,
+    MILESTONE_1R,
     get_position_lifecycles,
     normalize_symbol,
     check_and_quarantine_sources,
@@ -72,6 +73,7 @@ from core.write_verify import WRITE_ACCEPTED, read_position_idx, to_positive_dec
 from core.exit_binding import (
     binding_key,
     build_binding_event,
+    build_milestone_event,
     build_tp1_fill_event,
     closing_side,
     find_protective_exit_order_id,
@@ -1999,6 +2001,48 @@ async def _observe_tp1_fill(sym: str, plan: dict, known: set) -> None:
         logging.error("TP1 fill evidence не записано для %s", sym)
 
 
+async def _materialize_r1_milestone(sym: str, plan: dict) -> None:
+    """Материализует durable 1R-милестоун из уже durable-факта исполнения TP1.
+
+    Journal-only: дополнительного чтения Bybit НЕ требуется, потому что
+    authoritative-факт ненулевого исполнения точной ноги TP1 уже durable
+    (LIVE-FIX8-B). Это же — ограниченный путь восстановления после краха между
+    записью факта TP1 и записью милестоуна: следующий цикл достраивает милестоун
+    из журнала, а не из истории биржи, и exchange-fill row повторно не нужен.
+
+    Милестоун только фиксирует факт достижения уровня 1R. Отсюда НЕ вызываются
+    ``set_trading_stop`` / ``place_order`` / ``cancel_order`` / ``amend_order`` и
+    НЕ пишутся ``PROTECTION_CHANGE`` / ``EXIT_ORDER_BOUND`` / Risk Cut: Risk Cut и
+    Auto-BE на sticky-1R в C1 не мигрируются. Строгая реконструкция доверится
+    милестоуну лишь при наличии нижележащего durable-факта исполнения TP1, а
+    вызывающий отбирает символы по ``exec_qty`` и ``r1_proven``, поэтому уже
+    доказанный милестоун повторно не пишется (идемпотентно, без лог-спама).
+    """
+    tp1 = plan.get("tp1")
+    if not isinstance(tp1, dict):
+        return
+    event = build_milestone_event(
+        symbol=sym,
+        side=plan.get("side"),
+        position_idx=plan.get("position_idx"),
+        entry_order_id=plan.get("order_id"),
+        entry_order_link_id=plan.get("order_link_id"),
+        tp_order_id=tp1.get("order_id"),
+        tp_order_link_id=tp1.get("order_link_id"),
+        milestone=MILESTONE_1R,
+    )
+    if not event:
+        return
+    if await asyncio.to_thread(append_event, event):
+        logging.info(
+            "1R milestone durable: symbol=%s entryOrderId=%s tpOrderId=%s",
+            sym, plan.get("order_id") or "-",
+            tp1.get("order_id") or tp1.get("order_link_id") or "-",
+        )
+    else:
+        logging.error("1R milestone не записан для %s", sym)
+
+
 async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
     """Поддерживает causal SL continuation, historical TP audit и факт TP1.
 
@@ -2022,6 +2066,13 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
     записанной durable TP1-идентичностью и только пока этот факт не записан.
     Новый poller для этого не добавляется, и защита от такого evidence не
     включается.
+
+    Ещё одним journal-only шагом (см. :func:`_materialize_r1_milestone`)
+    материализуется durable милестоун 1R для lifecycle, у которого факт
+    исполнения TP1 уже durable, а милестоун ещё не доказан. Этот шаг не читает
+    Bybit и является ограниченным путём восстановления после краха между фактом
+    TP1 и милестоуном. Милестоун защиту не включает и exchange-запись не
+    вызывает; текущая политика Risk Cut / Auto-BE на sticky-1R не мигрируется.
     """
     try:
         anchored = await asyncio.to_thread(get_auto_protection_evidence)
@@ -2038,6 +2089,20 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
             if isinstance(plan.get("tp1"), dict)
             and plan["tp1"].get("exec_qty") is None
         }
+        # Милестоун 1R материализуется journal-only из уже durable-факта
+        # исполнения TP1, пока он ещё не доказан. Причинный порядок соблюдён: в
+        # том же цикле, где факт TP1 только что записан, anchored ещё показывал
+        # exec_qty=None, поэтому милестоун достраивается СЛЕДУЮЩИМ ограниченным
+        # циклом (и после перезапуска) — это и есть путь восстановления.
+        milestone_pending = {
+            sym: plan for sym, plan in anchored.items()
+            if isinstance(plan.get("tp1"), dict)
+            and plan["tp1"].get("exec_qty") is not None
+            and not plan.get("milestones", {}).get("r1_proven", False)
+        }
+        for milestone_sym, milestone_plan in milestone_pending.items():
+            await _materialize_r1_milestone(milestone_sym, milestone_plan)
+
         if not continuations and not tp_candidates and not tp1_pending:
             return
 

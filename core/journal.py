@@ -47,6 +47,16 @@
                       только факт исполнения; вывод о милестоуне (1R/2R) оно
                       не делает и защиту не включает.
                       Lifecycle не меняет и терминальным не является.
+  PROTECTION_MILESTONE_PROVEN — durable монотонный (sticky) милестоун защиты
+                      подтверждённого lifecycle (LIVE-FIX8-C1: только 1R). Само
+                      событие authoritative НЕ является: при строгой
+                      реконструкции милестоун доказан лишь когда в журнале того
+                      же exact lifecycle есть и нижележащее evidence — для 1R это
+                      факт ненулевого исполнения точной ноги TP1
+                      (TP_LADDER_FILL_OBSERVED). Милестоун защиту НЕ включает и
+                      exchange-запись не вызывает; текущая цена, размер позиции и
+                      planned_risk_usdt его не задают. Lifecycle не меняет и
+                      терминальным не является.
 
 Чтение хронологии по инструменту — get_trade_timeline(): read-only, порядок
 физических строк JSONL, недоказанное evidence отображается как UNKNOWN.
@@ -139,6 +149,13 @@ TP_LADDER_PLACED   = "TP_LADDER_PLACED"
 # Durable ФАКТ исполнения точной ноги TP-лестницы. Тоже lifecycle-neutral:
 # это evidence об исполнении конкретного ордера, а не милестоун и не защита.
 TP_LADDER_FILL_OBSERVED = "TP_LADDER_FILL_OBSERVED"
+# Durable монотонный (sticky) милестоун защиты подтверждённого lifecycle. Как и
+# предыдущие аудиторские события, позицию не открывает и не закрывает, в
+# TERMINAL_EVENTS не входит и в get_position_lifecycles не обрабатывается. Само
+# по себе authoritative НЕ является: строгая реконструкция доверяет ему только
+# при наличии нижележащего evidence того же exact lifecycle (для 1R — факт
+# ненулевого исполнения точной ноги TP1).
+PROTECTION_MILESTONE_PROVEN = "PROTECTION_MILESTONE_PROVEN"
 
 # Канонический уровень ноги Real-R лестницы. LIVE-FIX8-B знает только TP1 —
 # ПЕРВУЮ логическую Real-R цель подтверждённого lifecycle. Значение участвует в
@@ -156,6 +173,20 @@ TP_LADDER_SOURCE_PLACE_ORDER = "place_order"
 # строка authoritative истории ордеров этого самого ордера. Уменьшение размера
 # позиции, текущая цена и любой reduce-only fill доказательством не являются.
 TP_FILL_SOURCE_ORDER_HISTORY = "get_order_history"
+
+# Канонические идентификаторы милестоунов защиты (поле ``milestone`` события
+# PROTECTION_MILESTONE_PROVEN). LIVE-FIX8-C1 знает только 1R — ПЕРВУЮ Real-R
+# цель. 2R намеренно отсутствует: его production-real доказательство принадлежит
+# отдельному слою (LIVE-FIX8-C2), а обобщённая структура милестоунов не должна
+# выдавать не реализованный +2R за доказанный. Значение участвует в проверке:
+# событие с любым иным milestone доказанным милестоуном 1R не становится.
+MILESTONE_1R = "1R"
+
+# Единственный допустимый источник доказательства милестоуна 1R: durable-факт
+# ненулевого исполнения точной ноги TP1 этого lifecycle
+# (TP_LADDER_FILL_OBSERVED). Текущая цена, markPrice, размер позиции, произвольный
+# reduce-only fill и planned_risk_usdt источником милестоуна не являются.
+MILESTONE_SOURCE_TP1_FILL = "tp1_fill"
 
 # Исходы сверки РОДИТЕЛЬСКОГО lifecycle для evidence TP-лестницы. Три исхода
 # различаются намеренно: «другой родитель» безопасно игнорируется, а
@@ -663,6 +694,18 @@ def get_auto_protection_evidence() -> dict:
     ``None``. Это только evidence: милестоун из него здесь не выводится, защита
     не включается, а terminal/устаревший lifecycle в результат не попадает и
     потому свой TP1 новой позиции того же символа не передаёт.
+
+    ``milestones`` — durable монотонное состояние милестоунов защиты этого
+    lifecycle: сейчас ``{"r1_proven": bool}``. ``r1_proven`` становится ``True``
+    ТОЛЬКО когда в журнале того же exact lifecycle есть и durable-событие
+    ``PROTECTION_MILESTONE_PROVEN`` (``milestone == MILESTONE_1R``), и
+    нижележащее authoritative-evidence — доказанное ненулевое исполнение точной
+    ноги TP1 (``tp1["exec_qty"]``). Одного текста «1R» без исполнения TP1
+    недостаточно (fail-closed). Милестоун sticky: ретрейс цены, перенос/
+    перепривязка SL, исчезновение TP1 из открытых ордеров и перезапуск его не
+    сбрасывают, потому что он выводится только из durable-событий, а не из
+    текущей цены. Наличие милестоуна защиту НЕ включает и exchange-запись не
+    вызывает. Не реализованный +2R здесь отсутствует и остаётся недоказанным.
     """
     lifecycles: dict = {}
 
@@ -836,6 +879,11 @@ def get_auto_protection_evidence() -> dict:
                     # новый lifecycle, поэтому TP1 прошлой сделки того же
                     # символа сюда не наследуется.
                     "tp1": None,
+                    # Durable монотонное состояние милестоунов защиты этого
+                    # lifecycle. Новый lifecycle начинается без доказанных
+                    # милестоунов, поэтому 1R прошлой сделки того же символа
+                    # сюда не переходит. r2 намеренно отсутствует (не C1).
+                    "milestones": {"r1_proven": False},
                 }
                 if qty is None or risk is None:
                     lifecycles[symbol]["state"] = "UNPROVEN"
@@ -1098,6 +1146,52 @@ def get_auto_protection_evidence() -> dict:
                 # же ордера, а повтор того же наблюдения противоречия не даёт.
                 tp1["exec_qty"] = exec_qty
 
+            elif event_type == PROTECTION_MILESTONE_PROVEN:
+                current = lifecycles.get(symbol)
+                tp1 = current.get("tp1") if current is not None else None
+                if (
+                    current is None
+                    or current.get("state") != CONFIRMED
+                    or not current.get("anchored")
+                    or tp1 is None
+                ):
+                    # Милестоун без активного подтверждённого lifecycle с durable
+                    # идентичностью TP1 сам к lifecycle не прикрепляется.
+                    continue
+                parent = _tp1_parent_match(ev, current)
+                if parent == _TP_PARENT_CONFLICT:
+                    # Durable-идентификаторы одного и того же входа противоречат:
+                    # это противоречие журнала, а не «другой родитель».
+                    current["state"] = "UNPROVEN"
+                    continue
+                if parent != _TP_PARENT_MATCH:
+                    continue
+                leg_ids = _tp1_leg_ids(ev)
+                if (
+                    ev.get("milestone") != MILESTONE_1R
+                    or ev.get("milestone_source") != MILESTONE_SOURCE_TP1_FILL
+                    or leg_ids is None
+                    or leg_ids[0] != tp1["order_id"]
+                    or leg_ids[1] != tp1["order_link_id"]
+                ):
+                    # Милестоун другого уровня/источника или без точной ссылки на
+                    # ногу TP1 ЭТОГО lifecycle доверенным милестоуном не является.
+                    continue
+                if tp1.get("exec_qty") is None:
+                    # Объявление милестоуна без нижележащего authoritative-факта
+                    # ненулевого исполнения точной ноги TP1 НЕ доверяется
+                    # (fail-closed). Причинный порядок: durable-факт TP1 обязан
+                    # предшествовать милестоуну. Милестоун, оказавшийся раньше
+                    # факта, доверенным задним числом не становится: появившийся
+                    # позже факт уже принятое по этому событию решение не
+                    # переписывает.
+                    continue
+                # Sticky/монотонно: доказанный 1R остаётся доказанным. Ретрейс
+                # цены, перенос/перепривязка SL, исчезновение TP1 из открытых
+                # ордеров, перезапуск и повтор милестоуна его не сбрасывают —
+                # он выводится только из durable-событий, а не из текущей цены.
+                current["milestones"]["r1_proven"] = True
+
             elif event_type in TERMINAL_EVENTS:
                 current = lifecycles.get(symbol)
                 if current is None:
@@ -1137,6 +1231,11 @@ def get_auto_protection_evidence() -> dict:
             # фактом её исполнения (``exec_qty``), либо None. Само наличие
             # evidence защиту не включает и милестоун не объявляет.
             "tp1": dict(info["tp1"]) if isinstance(info["tp1"], dict) else None,
+            # Durable монотонное состояние милестоунов защиты. r1_proven доказан
+            # только при наличии и durable-события милестоуна, и нижележащего
+            # факта исполнения TP1 того же lifecycle; иначе False. Само наличие
+            # милестоуна защиту не включает и exchange-запись не вызывает.
+            "milestones": dict(info["milestones"]),
         }
         for symbol, info in lifecycles.items()
         if info.get("state") == CONFIRMED
