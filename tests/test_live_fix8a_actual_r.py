@@ -117,6 +117,91 @@ def _rebound_sl(
     }
 
 
+def _r1_evidence(
+    symbol="ETHUSDT", *, order_id="entry-1", side="Buy", idx=0,
+    tp_order_id="tp-1", tp_price="101", tp_qty="3",
+):
+    """Durable sticky-1R: точная нога TP1, её исполнение и сам милестоун.
+
+    Право на автоматическое действие защиты даёт только он (LIVE-FIX8-D), а к
+    каноническому знаменателю R это evidence отношения не имеет: геометрия
+    остаётся неизменной геометрией конфирмации.
+    """
+    return (
+        {
+            "event": journal.TP_LADDER_PLACED,
+            "symbol": symbol,
+            "side": side,
+            "position_idx": idx,
+            "entry_order_id": order_id,
+            "tp_level": journal.TP_LEVEL_TP1,
+            "tp_price": tp_price,
+            "tp_qty": tp_qty,
+            "tp_order_id": tp_order_id,
+            "tp_source": journal.TP_LADDER_SOURCE_PLACE_ORDER,
+        },
+        {
+            "event": journal.TP_LADDER_FILL_OBSERVED,
+            "symbol": symbol,
+            "side": side,
+            "position_idx": idx,
+            "entry_order_id": order_id,
+            "tp_level": journal.TP_LEVEL_TP1,
+            "tp_order_id": tp_order_id,
+            "exec_qty": tp_qty,
+            "fill_source": journal.TP_FILL_SOURCE_ORDER_HISTORY,
+        },
+        {
+            "event": journal.PROTECTION_MILESTONE_PROVEN,
+            "symbol": symbol,
+            "side": side,
+            "position_idx": idx,
+            "entry_order_id": order_id,
+            "tp_level": journal.TP_LEVEL_TP1,
+            "tp_order_id": tp_order_id,
+            "milestone": journal.MILESTONE_1R,
+            "milestone_source": journal.MILESTONE_SOURCE_TP1_FILL,
+        },
+    )
+
+
+def _r2_evidence(
+    symbol="ETHUSDT", *, order_id="entry-1", side="Buy", idx=0,
+    target_2r="102", observed="102.5", anchor_ms=1_700_000_130_000,
+):
+    """Durable sticky-2R: временной якорь входа, факт markPrice и милестоун."""
+    return (
+        {
+            "event": journal.ENTRY_EXECUTION_ANCHOR_PROVEN,
+            "symbol": symbol,
+            "side": side,
+            "position_idx": idx,
+            "entry_order_id": order_id,
+            "entry_final_exec_time_ms": anchor_ms,
+            "anchor_source": journal.ENTRY_ANCHOR_SOURCE_EXECUTION_HISTORY,
+        },
+        {
+            "event": journal.MARK_PRICE_2R_OBSERVED,
+            "symbol": symbol,
+            "side": side,
+            "position_idx": idx,
+            "entry_order_id": order_id,
+            "target_2r": target_2r,
+            "mark_2r_source": journal.MARK_2R_SOURCE_CURRENT_POSITION,
+            "observed_mark_price": observed,
+        },
+        {
+            "event": journal.PROTECTION_MILESTONE_PROVEN,
+            "symbol": symbol,
+            "side": side,
+            "position_idx": idx,
+            "entry_order_id": order_id,
+            "milestone": journal.MILESTONE_2R,
+            "milestone_source": journal.MILESTONE_SOURCE_MARK_PRICE_2R,
+        },
+    )
+
+
 def _write_events(monkeypatch, tmp_path, *events):
     monkeypatch.setattr(journal, "JOURNAL_FILE", tmp_path / "trade_journal.jsonl")
     monkeypatch.setattr(journal, "DATA_DIR", tmp_path)
@@ -155,7 +240,12 @@ def _sl_order(
 
 
 def _ethfi_events(*, initial_sl=ETHFI_INITIAL_SL, anchored=True):
-    """Durable-доказательства реальной production SHORT-сделки ETHFIUSDT."""
+    """Durable-доказательства реальной production SHORT-сделки ETHFIUSDT.
+
+    Включают sticky-1R: без доказанного милестоуна автоматическое действие
+    защиты не разрешено вовсе (LIVE-FIX8-D), а проверяется здесь именно
+    канонический знаменатель R.
+    """
     return (
         _entry(
             "ETHFIUSDT", side="SHORT", qty=ETHFI_QTY,
@@ -165,6 +255,7 @@ def _ethfi_events(*, initial_sl=ETHFI_INITIAL_SL, anchored=True):
             "ETHFIUSDT", side="SHORT", qty=ETHFI_QTY, avg_entry=ETHFI_ENTRY,
             initial_sl_trigger=initial_sl, anchored=anchored,
         ),
+        *_r1_evidence("ETHFIUSDT", side="Sell", tp_price="0.505"),
     )
 
 
@@ -314,11 +405,11 @@ async def test_long_milestone_threshold_uses_actual_immutable_r(
         monkeypatch, tmp_path,
         [_position(mark="101.2")],
         # planned_risk 20 при qty 10 → прежний знаменатель 2.0 ≠ геометрия 1.0.
-        [_entry(risk="20"), _confirmed()],
+        [_entry(risk="20"), _confirmed(), *_r1_evidence()],
     )
 
-    # 1.2R по фактическому R → Risk Cut: LONG оставляет 0.3R риска,
-    # entry - 0.3 * 1.0 = 99.7. Прежний знаменатель дал бы 0.6R и не сработал.
+    # Risk Cut по доказанному sticky-1R: LONG оставляет 0.3R риска,
+    # entry - 0.3 * 1.0 = 99.7. Прежний знаменатель дал бы другой уровень.
     assert [row["stopLoss"] for row in writes] == ["99.7"]
 
 
@@ -382,13 +473,13 @@ async def test_auto_be_after_rebind_still_uses_original_r(monkeypatch, tmp_path)
     writes = await _run_job(
         monkeypatch, tmp_path,
         [_position(mark="102.5", stop="99.7")],
-        [_entry(risk="20"), _confirmed(), _protection_change(),
-         _rebound_sl(risk="20")],
+        [_entry(risk="20"), _confirmed(), *_r1_evidence(), *_r2_evidence(),
+         _protection_change(), _rebound_sl(risk="20")],
         orders=[_sl_order(exit_id="sl-2", trigger="99.7")],
     )
 
-    # 2R от исходного R=1.0 → БУ + 0.05R = 100.05. От перенесённого SL (0.3)
-    # порог 2R не был бы достигнут, а planned/qty дал бы другой уровень.
+    # Auto-BE от исходного R=1.0 → БУ + 0.05R = 100.05. От перенесённого SL
+    # (0.3) уровень был бы другим, а planned/qty дал бы третий.
     assert [row["stopLoss"] for row in writes] == ["100.05"]
 
 
@@ -496,8 +587,12 @@ async def test_wrong_side_geometry_never_writes_and_isolates_symbols(
             _entry("BADUSDT", order_id="bad-1", risk="20"),
             _confirmed("BADUSDT", order_id="bad-1",
                        initial_sl_order_id="bad-sl", initial_sl_trigger="101"),
+            # Оба lifecycle доказали sticky-1R, поэтому проверяется именно
+            # геометрия, а не право на действие.
+            *_r1_evidence("BADUSDT", order_id="bad-1", tp_order_id="bad-tp"),
             _entry("ETHUSDT", risk="20"),
             _confirmed(),
+            *_r1_evidence(),
         ],
         orders=[
             _sl_order("BADUSDT", exit_id="bad-sl", trigger="101"),
@@ -545,25 +640,33 @@ async def test_tp_ladder_and_auto_protection_agree_on_actual_r(
     monkeypatch, tmp_path
 ):
     """Оба потребителя защиты используют одну ценовую дистанцию R."""
-    events = _ethfi_events()
-    _write_events(monkeypatch, tmp_path, *events)
+    # Отдельные каталоги журнала: лестница пишет СВОИ события TP-ног, и они не
+    # должны конкурировать с инъецированным durable-доказательством 1R,
+    # которое даёт право на автоматическое действие защиты.
+    ladder_dir = tmp_path / "ladder"
+    protection_dir = tmp_path / "protection"
+    ladder_dir.mkdir(parents=True, exist_ok=True)
+    protection_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_events(monkeypatch, ladder_dir, *_ethfi_events())
     plan = journal.get_auto_protection_evidence()["ETHFIUSDT"]
     r_price = journal.actual_initial_r_from_evidence(plan).price
     entry = Decimal(ETHFI_ENTRY)
 
     orders, _ = await _run_tp_ladder(
-        monkeypatch, tmp_path,
+        monkeypatch, ladder_dir,
         _position(
             "ETHFIUSDT", side="Sell", qty=ETHFI_QTY, entry=ETHFI_ENTRY,
             mark="0.5045", stop="0.508",
         ),
     )
     writes = await _run_job(
-        monkeypatch, tmp_path,
+        monkeypatch, protection_dir,
         [_position(
             "ETHFIUSDT", side="Sell", qty=ETHFI_QTY, entry=ETHFI_ENTRY,
             mark="0.50487563", stop=ETHFI_INITIAL_SL,
         )],
+        _ethfi_events(),
         orders=[_sl_order("ETHFIUSDT", side="Buy", trigger=ETHFI_INITIAL_SL)],
         tick="0.0001",
     )

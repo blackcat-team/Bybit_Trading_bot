@@ -1800,28 +1800,25 @@ async def test_proving_2r_causes_zero_exchange_writes(
 
 
 @pytest.mark.asyncio
-async def test_proven_r2_does_not_change_auto_be_or_risk_cut_policy(
+async def test_sticky_r2_drives_auto_be_with_unchanged_geometry(
     monkeypatch, tmp_path
 ):
-    """I67. Политика Auto-BE / Risk Cut от sticky-2R не изменилась.
+    """I67. Sticky-2R даёт право на Auto-BE, геометрия при этом прежняя.
 
-    Действие по-прежнему определяется ТЕКУЩИМ R по цене, а не милестоуном:
-    миграция принадлежит LIVE-FIX8-D.
+    Действие определяется durable милестоуном, а не текущим R по цене: при
+    доказанном 2R Auto-BE выполняется даже когда текущая цена ниже прежнего
+    порога, и уровень остаётся прежним (БУ + 0.05R от неизменного исходного R).
     """
     proven = (*_R1_LONG, _anchor(), _mark_2r(), _milestone_2r())
 
-    # Ниже действующих порогов записи нет, хотя 2R уже sticky-доказан.
-    quiet = await _run_auto_be(
+    # Цена ниже прежних порогов, но sticky-2R уже доказан → Auto-BE 100.05.
+    writes = await _run_auto_be(
         monkeypatch, tmp_path, [_position(qty="7", mark="100.4")], proven,
     )
-    assert quiet == []
+    assert [row["stopLoss"] for row in writes] == ["100.05"]
     assert _r2() is True
-
-    # На пороге Risk Cut запрошен ровно тот же уровень, что и без 2R-evidence.
-    writes = await _run_auto_be(
-        monkeypatch, tmp_path, [_position(qty="7", mark="101.2")],
-    )
-    assert [row["stopLoss"] for row in writes] == ["99.7"]
+    # Устаревший Risk Cut при доказанном 2R не выполняется.
+    assert "99.7" not in [row["stopLoss"] for row in writes]
 
 
 # =========================================================================

@@ -82,6 +82,74 @@ def _sl_binding(
     return event
 
 
+def _r1_evidence(
+    symbol="ETHUSDT", *, entry_order_id="entry-1", side="Buy", idx=0,
+    tp_order_id="tp-1", tp_price="101", tp_qty="3",
+):
+    """Durable sticky-1R: точная нога TP1, её исполнение и сам милестоун.
+
+    Право на автоматическое действие защиты даёт только durable милестоун
+    (LIVE-FIX8-D); геометрию уровня он не задаёт.
+    """
+    return (
+        {
+            "event": journal.TP_LADDER_PLACED,
+            "symbol": symbol, "side": side, "position_idx": idx,
+            "entry_order_id": entry_order_id,
+            "tp_level": journal.TP_LEVEL_TP1,
+            "tp_price": tp_price, "tp_qty": tp_qty,
+            "tp_order_id": tp_order_id,
+            "tp_source": journal.TP_LADDER_SOURCE_PLACE_ORDER,
+        },
+        {
+            "event": journal.TP_LADDER_FILL_OBSERVED,
+            "symbol": symbol, "side": side, "position_idx": idx,
+            "entry_order_id": entry_order_id,
+            "tp_level": journal.TP_LEVEL_TP1,
+            "tp_order_id": tp_order_id, "exec_qty": tp_qty,
+            "fill_source": journal.TP_FILL_SOURCE_ORDER_HISTORY,
+        },
+        {
+            "event": journal.PROTECTION_MILESTONE_PROVEN,
+            "symbol": symbol, "side": side, "position_idx": idx,
+            "entry_order_id": entry_order_id,
+            "tp_level": journal.TP_LEVEL_TP1, "tp_order_id": tp_order_id,
+            "milestone": journal.MILESTONE_1R,
+            "milestone_source": journal.MILESTONE_SOURCE_TP1_FILL,
+        },
+    )
+
+
+def _r2_evidence(
+    symbol="ETHUSDT", *, entry_order_id="entry-1", side="Buy", idx=0,
+    target_2r="102", observed="102.5", anchor_ms=1_700_000_130_000,
+):
+    """Durable sticky-2R: временной якорь входа, факт markPrice и милестоун."""
+    return (
+        {
+            "event": journal.ENTRY_EXECUTION_ANCHOR_PROVEN,
+            "symbol": symbol, "side": side, "position_idx": idx,
+            "entry_order_id": entry_order_id,
+            "entry_final_exec_time_ms": anchor_ms,
+            "anchor_source": journal.ENTRY_ANCHOR_SOURCE_EXECUTION_HISTORY,
+        },
+        {
+            "event": journal.MARK_PRICE_2R_OBSERVED,
+            "symbol": symbol, "side": side, "position_idx": idx,
+            "entry_order_id": entry_order_id, "target_2r": target_2r,
+            "mark_2r_source": journal.MARK_2R_SOURCE_CURRENT_POSITION,
+            "observed_mark_price": observed,
+        },
+        {
+            "event": journal.PROTECTION_MILESTONE_PROVEN,
+            "symbol": symbol, "side": side, "position_idx": idx,
+            "entry_order_id": entry_order_id,
+            "milestone": journal.MILESTONE_2R,
+            "milestone_source": journal.MILESTONE_SOURCE_MARK_PRICE_2R,
+        },
+    )
+
+
 def _write_events(monkeypatch, tmp_path, *events):
     monkeypatch.setattr(journal, "JOURNAL_FILE", tmp_path / "trade_journal.jsonl")
     monkeypatch.setattr(journal, "DATA_DIR", tmp_path)
@@ -97,8 +165,15 @@ def _current_lifecycle(symbol="ETHUSDT"):
 
 def _position(
     symbol="ETHUSDT", *, qty="10", mark="101.5", idx=0, side="Buy",
-    entry="100", stop="99",
+    entry="100", stop="99", take_profit="",
 ):
+    """Строка позиции в форме production-payload Bybit.
+
+    ``takeProfit`` присутствует всегда, как и в реальном ответе
+    ``get_positions``: пустое значение — это доказанное утверждение биржи
+    «второго уровня защиты нет», и именно его сохранность проверяет
+    authoritative readback после переноса SL.
+    """
     return {
         "symbol": symbol,
         "side": side,
@@ -107,6 +182,7 @@ def _position(
         "avgPrice": entry,
         "markPrice": mark,
         "stopLoss": stop,
+        "takeProfit": take_profit,
     }
 
 
@@ -211,6 +287,10 @@ def test_exact_confirmed_lifecycle_proves_original_plan(monkeypatch, tmp_path):
             # 1R доказывается только точным исполнением TP1 (LIVE-FIX8-C1), а
             # 2R — только durable якорем и фактом markPrice (LIVE-FIX8-C2).
             "milestones": {"r1_proven": False, "r2_proven": False},
+            # И без унаследованного состояния ДЕЙСТВИЯ защиты (LIVE-FIX8-D):
+            # ни незавершённой попытки, ни завершения прошлой сделки того же
+            # символа новый lifecycle не получает.
+            "protection_action": {"pending": None, "verified": None},
         }
     }
 
@@ -256,6 +336,12 @@ async def test_market_reference_entry_is_replaced_by_authoritative_fill_entry(
     assert journal.read_events(event_type=journal.POSITION_CONFIRMED)[0][
         "avg_entry_price"
     ] == "1888.25"
+    # Право на Risk Cut даёт durable sticky-1R (LIVE-FIX8-D); проверяется здесь
+    # именно то, что знаменателем стал authoritative avg entry 1888.25.
+    _write_events(
+        monkeypatch, tmp_path,
+        *_r1_evidence(tp_price="1898.25", tp_qty="0.03"),
+    )
     writes = await _run_job(
         monkeypatch, tmp_path,
         [_position(qty="0.1", entry="1888.25", mark="1898.75", stop="1878.25")],
@@ -395,7 +481,7 @@ async def test_risk_cut_uses_exact_original_risk_without_global_fallback(
     writes = await _run_job(
         monkeypatch, tmp_path,
         [_position(mark="101.5")],
-        [_entry(), _confirmed(), _sl_binding()],
+        [_entry(), _confirmed(), _sl_binding(), *_r1_evidence()],
         risk_lookup=forbidden,
     )
     assert writes == [{
@@ -409,21 +495,38 @@ async def test_auto_be_uses_exact_original_risk_at_two_r(monkeypatch, tmp_path):
     writes = await _run_job(
         monkeypatch, tmp_path,
         [_position(mark="102.5")],
-        [_entry(), _confirmed(), _sl_binding()],
+        [_entry(), _confirmed(), _sl_binding(), *_r1_evidence(), *_r2_evidence()],
     )
     assert writes[0]["stopLoss"] == "100.05"
 
 
 @pytest.mark.asyncio
 async def test_partial_close_keeps_original_one_r_and_two_r_prices(monkeypatch, tmp_path):
-    events = [_entry(), _confirmed(), _sl_binding()]
-    one_r_writes = await _run_job(monkeypatch, tmp_path, [_position(qty="10", mark="101.5")], events)
-    partial_one_r_writes = await _run_job(
-        monkeypatch, tmp_path, [_position(qty="5", mark="101.5")], events
+    """Частичное закрытие исходные цены 1R и 2R не сдвигает.
+
+    Каждый прогон получает свой каталог журнала: durable-состояние действия
+    защиты (LIVE-FIX8-D) lifecycle-local, и оно не должно протекать между
+    независимыми проверками геометрии.
+    """
+    base = [_entry(), _confirmed(), _sl_binding(), *_r1_evidence()]
+    two_r = [*base, *_r2_evidence()]
+
+    async def _run(name, position, events):
+        case_dir = tmp_path / name
+        case_dir.mkdir(parents=True, exist_ok=True)
+        return await _run_job(monkeypatch, case_dir, [position], events)
+
+    one_r_writes = await _run(
+        "one_r", _position(qty="10", mark="101.5"), base
     )
-    two_r_writes = await _run_job(monkeypatch, tmp_path, [_position(qty="10", mark="102.5")], events)
-    partial_two_r_writes = await _run_job(
-        monkeypatch, tmp_path, [_position(qty="5", mark="102.5")], events
+    partial_one_r_writes = await _run(
+        "partial_one_r", _position(qty="5", mark="101.5"), base
+    )
+    two_r_writes = await _run(
+        "two_r", _position(qty="10", mark="102.5"), two_r
+    )
+    partial_two_r_writes = await _run(
+        "partial_two_r", _position(qty="5", mark="102.5"), two_r
     )
     assert one_r_writes[0]["stopLoss"] == partial_one_r_writes[0]["stopLoss"] == "99.7"
     assert two_r_writes[0]["stopLoss"] == partial_two_r_writes[0]["stopLoss"] == "100.05"
@@ -436,16 +539,19 @@ async def test_manual_or_unproven_position_never_writes(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_ambiguous_exchange_identity_never_writes(monkeypatch, tmp_path):
+    """Неоднозначная текущая позиция запись запрещает даже при праве на действие."""
     assert await _run_job(
         monkeypatch, tmp_path, [_position(qty="5"), _position(qty="5")],
-        [_entry(), _confirmed(), _sl_binding()],
+        [_entry(), _confirmed(), _sl_binding(), *_r1_evidence()],
     ) == []
 
 
 @pytest.mark.asyncio
 async def test_old_lifecycle_cannot_adopt_new_same_geometry_position(monkeypatch, tmp_path):
+    """Чужой защитный child не даёт владения даже при доказанном милестоуне."""
     events = [_entry(order_id="old"), _confirmed(order_id="old"),
-              _sl_binding(entry_order_id="old", exit_order_id="old-sl")]
+              _sl_binding(entry_order_id="old", exit_order_id="old-sl"),
+              *_r1_evidence(entry_order_id="old", tp_order_id="old-tp")]
     assert await _run_job(
         monkeypatch, tmp_path, [_position()], events,
         orders=[_sl_order(exit_id="new-sl")],
@@ -540,6 +646,9 @@ async def test_changed_protection_waits_for_exact_rebinding(
     confirmed = journal.read_events(event_type=journal.POSITION_CONFIRMED)
     assert confirmed[0]["initial_sl_order_id"] == "sl-1"
 
+    # Право на Risk Cut даёт durable sticky-1R (LIVE-FIX8-D).
+    _write_events(monkeypatch, tmp_path, *_r1_evidence())
+
     position["size"] = remaining_qty
     position["markPrice"] = "101.5"
 
@@ -550,15 +659,23 @@ async def test_changed_protection_waits_for_exact_rebinding(
     sl_order["orderId"] = "sl-2"
     sl_order["triggerPrice"] = "99.7"
 
+    # Пока защитный child не перепривязан, второго переноса нет: незавершённая
+    # попытка разрешается readback-first и доказывает уже стоящий уровень.
     position["markPrice"] = "102.5"
     await jobs.auto_breakeven_job(context)
     assert len(writes) == 1
+    verified = journal.read_events(event_type=journal.PROTECTION_ACTION_VERIFIED)
+    assert verified[-1]["verification_source"] == (
+        journal.PROTECTION_VERIFIED_BY_CURRENT_STATE
+    )
 
     await jobs.exit_binding_job(context)
     rebound = journal.read_events(event_type=journal.EXIT_ORDER_BOUND)
     assert rebound[-1]["entry_order_id"] == "entry-1"
     assert rebound[-1]["exit_order_id"] == "sl-2"
 
+    # 2R доказан позже — только тогда Auto-BE становится желаемым действием.
+    _write_events(monkeypatch, tmp_path, *_r2_evidence())
     await jobs.auto_breakeven_job(context)
     assert [row["stopLoss"] for row in writes] == ["99.7", "100.05"]
 

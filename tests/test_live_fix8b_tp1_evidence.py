@@ -1047,13 +1047,46 @@ async def test_tp1_evidence_alone_triggers_no_protection_write(
 async def test_existing_auto_be_still_writes_with_tp1_evidence_present(
     monkeypatch, tmp_path
 ):
-    """40b. Существующее поведение Auto-BE при наличии TP1-evidence не изменилось."""
+    """40b. Геометрия Auto-BE при наличии TP1-evidence не изменилась.
+
+    Право на действие теперь даёт durable sticky-милестоун (LIVE-FIX8-D), но
+    сам уровень остаётся прежним: БУ + 0.05R от неизменного исходного R.
+    """
+    milestone_1r = {
+        "event": journal.PROTECTION_MILESTONE_PROVEN,
+        "symbol": "ETHUSDT", "side": "Buy", "position_idx": 0,
+        "entry_order_id": "entry-1", "tp_level": journal.TP_LEVEL_TP1,
+        "tp_order_id": "tp-1", "milestone": journal.MILESTONE_1R,
+        "milestone_source": journal.MILESTONE_SOURCE_TP1_FILL,
+    }
+    anchor = {
+        "event": journal.ENTRY_EXECUTION_ANCHOR_PROVEN,
+        "symbol": "ETHUSDT", "side": "Buy", "position_idx": 0,
+        "entry_order_id": "entry-1",
+        "entry_final_exec_time_ms": 1_700_000_130_000,
+        "anchor_source": journal.ENTRY_ANCHOR_SOURCE_EXECUTION_HISTORY,
+    }
+    mark_2r = {
+        "event": journal.MARK_PRICE_2R_OBSERVED,
+        "symbol": "ETHUSDT", "side": "Buy", "position_idx": 0,
+        "entry_order_id": "entry-1", "target_2r": "102",
+        "mark_2r_source": journal.MARK_2R_SOURCE_CURRENT_POSITION,
+        "observed_mark_price": "102.5",
+    }
+    milestone_2r = {
+        "event": journal.PROTECTION_MILESTONE_PROVEN,
+        "symbol": "ETHUSDT", "side": "Buy", "position_idx": 0,
+        "entry_order_id": "entry-1", "milestone": journal.MILESTONE_2R,
+        "milestone_source": journal.MILESTONE_SOURCE_MARK_PRICE_2R,
+    }
+
     writes = await _run_auto_be(
         monkeypatch, tmp_path, [_position(qty="7", mark="102.5")],
-        [_entry(), _confirmed(), _tp1_placed(), _tp1_filled()],
+        [_entry(), _confirmed(), _tp1_placed(), _tp1_filled(), milestone_1r,
+         anchor, mark_2r, milestone_2r],
     )
 
-    # 2R по неизменному исходному R → БУ + 0.05R, как и без TP1-evidence.
+    # Auto-BE от неизменного исходного R → БУ + 0.05R, как и до миграции.
     assert [row["stopLoss"] for row in writes] == ["100.05"]
 
 

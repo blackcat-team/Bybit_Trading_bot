@@ -163,6 +163,49 @@ def _milestone(symbol="ETHUSDT", *, entry_order_id="entry-1",
     return event
 
 
+def _anchor_2r(symbol="ETHUSDT", *, entry_order_id="entry-1", side="Buy", idx=0,
+               anchor_ms=1_700_000_130_000):
+    """Durable временной якорь входа (предусловие sticky-2R, LIVE-FIX8-C2)."""
+    return {
+        "event": journal.ENTRY_EXECUTION_ANCHOR_PROVEN,
+        "symbol": symbol,
+        "side": side,
+        "position_idx": idx,
+        "entry_order_id": entry_order_id,
+        "entry_final_exec_time_ms": anchor_ms,
+        "anchor_source": journal.ENTRY_ANCHOR_SOURCE_EXECUTION_HISTORY,
+    }
+
+
+def _mark_2r(symbol="ETHUSDT", *, entry_order_id="entry-1", side="Buy", idx=0,
+             target="102", observed="102.5"):
+    """Durable факт authoritative markPrice на каноническом уровне 2R."""
+    return {
+        "event": journal.MARK_PRICE_2R_OBSERVED,
+        "symbol": symbol,
+        "side": side,
+        "position_idx": idx,
+        "entry_order_id": entry_order_id,
+        "target_2r": target,
+        "mark_2r_source": journal.MARK_2R_SOURCE_CURRENT_POSITION,
+        "observed_mark_price": observed,
+    }
+
+
+def _milestone_2r(symbol="ETHUSDT", *, entry_order_id="entry-1", side="Buy",
+                  idx=0):
+    """Durable sticky-милестоун 2R (его источник — только факт markPrice)."""
+    return {
+        "event": journal.PROTECTION_MILESTONE_PROVEN,
+        "symbol": symbol,
+        "side": side,
+        "position_idx": idx,
+        "entry_order_id": entry_order_id,
+        "milestone": journal.MILESTONE_2R,
+        "milestone_source": journal.MILESTONE_SOURCE_MARK_PRICE_2R,
+    }
+
+
 def _protection_change(symbol="ETHUSDT", *, order_id="entry-1", side="Buy",
                        idx=0, change_id="chg-1", previous_exit_order_id="sl-1",
                        previous_trigger="99", requested_trigger="99.7"):
@@ -698,15 +741,16 @@ async def test_price_retrace_never_erases_proven_milestone(
     """C16. Ретрейс цены ниже 1R доказанный милестоун не снимает.
 
     Милестоун восстанавливается только из durable-событий, поэтому текущая цена
-    после доказательства к его реконструкции отношения не имеет.
+    после доказательства к его реконструкции отношения не имеет. Ровно поэтому
+    sticky-1R остаётся правом на Risk Cut и после ретрейса (LIVE-FIX8-D): уровень
+    считается от неизменного исходного R, а не от текущей цены.
     """
     writes = await _run_auto_be(
         monkeypatch, tmp_path, [_position(qty="7", mark=mark)], _PROVEN,
     )
 
     assert _r1() is True
-    # И политика защиты от милестоуна по-прежнему не зависит (C1 её не мигрирует).
-    assert writes == []
+    assert [row["stopLoss"] for row in writes] == ["99.7"]
 
 
 def test_moved_sl_never_erases_or_redefines_milestone(monkeypatch, tmp_path):
@@ -966,36 +1010,54 @@ async def test_materializing_milestone_causes_no_exchange_write(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mark", ["100.2", "100.4", "100.9"])
-async def test_proven_milestone_causes_no_auto_be_or_risk_cut_write(
+async def test_proven_milestone_drives_risk_cut_not_current_price(
     monkeypatch, tmp_path, mark
 ):
-    """F33/J. Доказанный 1R сам по себе Risk Cut / Auto-BE не запускает.
+    """F33/J. Доказанный 1R запускает Risk Cut независимо от текущей цены.
 
-    Текущая политика по-прежнему смотрит на текущий R по цене, а не на sticky
-    милестоун: миграция принадлежит LIVE-FIX8-D.
+    В C1 милестоун был инертен, в LIVE-FIX8-D он стал ЕДИНСТВЕННЫМ источником
+    права на действие. Текущая цена в решении больше не участвует: все три
+    значения markPrice ниже прежнего порога 1R, а уровень один и тот же —
+    entry - 0.3R от неизменного исходного R.
     """
     writes = await _run_auto_be(
         monkeypatch, tmp_path, [_position(qty="7", mark=mark)], _PROVEN,
     )
 
-    assert writes == []
+    assert [row["stopLoss"] for row in writes] == ["99.7"]
     assert _r1() is True
-    assert journal.read_events(event_type=journal.PROTECTION_CHANGE) == []
+    # Принятый ответ биржи выполненным действием не является: durable-аудит
+    # принятого ответа есть, а authoritative-завершения — нет.
+    assert len(journal.read_events(event_type=journal.PROTECTION_CHANGE)) == 1
+    assert journal.read_events(
+        event_type=journal.PROTECTION_ACTION_VERIFIED
+    ) == []
+    assert len(journal.read_events(
+        event_type=journal.PROTECTION_ACTION_PENDING
+    )) == 1
 
 
-def test_no_risk_cut_verified_state_is_introduced():
-    """F32b. Милестоун не вводит ни RISK_CUT_VERIFIED, ни AUTO_BE_VERIFIED.
+def test_action_state_is_separate_from_milestone_state():
+    """F32b. Милестоун и ДЕЙСТВИЕ защиты остаются разными состояниями.
 
-    Разделение состояний остаётся прежним: 1R_PROVEN / 2R_PROVEN — это
-    доказательства достижения уровня, а НЕ доказательства выполненного действия
-    защиты. Состояний завершённого действия в журнале не существует, и обратного
-    перехода «милестоун больше не достигнут» тоже нет.
+    LIVE-FIX8-D вводит durable состояние действия, но оно отдельное:
+    ``1R_PROVEN`` / ``2R_PROVEN`` — evidence достигнутого ЦЕНОВОГО УРОВНЯ, а
+    ``PROTECTION_ACTION_*`` — evidence СОСТОЯНИЯ ЗАЩИТЫ. Милестоун из действия
+    не выводится, обратного перехода «милестоун больше не достигнут» нет, и
+    отдельных имён вида ``RISK_CUT_VERIFIED`` в журнале не появилось.
     """
     for name in (
         "RISK_CUT_VERIFIED", "AUTO_BE_VERIFIED",
         "PROTECTION_MILESTONE_UNREACHED",
     ):
         assert not hasattr(journal, name)
+    # Действие защиты имеет свои события и свой словарь видов.
+    assert journal.PROTECTION_ACTION_PENDING == "PROTECTION_ACTION_PENDING"
+    assert journal.PROTECTION_ACTION_VERIFIED == "PROTECTION_ACTION_VERIFIED"
+    assert journal.PROTECTION_ACTION_MILESTONE == {
+        journal.PROTECTION_SOURCE_RISK_CUT: journal.MILESTONE_1R,
+        journal.PROTECTION_SOURCE_AUTO_BE: journal.MILESTONE_2R,
+    }
 
 
 def test_r2_milestone_is_never_claimed_without_its_own_evidence(
@@ -1146,13 +1208,14 @@ def test_live_fix8b_tp1_evidence_meaning_is_unchanged(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_existing_auto_protection_policy_is_not_migrated(
+async def test_action_geometry_is_unchanged_after_migration(
     monkeypatch, tmp_path
 ):
-    """G40/J. Существующая политика Auto-BE / Risk Cut в C1 не изменилась.
+    """G40/J. Геометрия Risk Cut и Auto-BE после миграции не изменилась.
 
-    Пороги по-прежнему считаются от канонического R по текущей цене, и наличие
-    доказанного sticky-1R их не сдвигает ни в одну сторону.
+    Меняется только ИСТОЧНИК права на действие: sticky-милестоун вместо
+    переходного R по текущей цене. Сами уровни остаются прежними — Risk Cut
+    ``entry - 0.3R`` и Auto-BE ``БУ + 0.05R`` от неизменного исходного R.
     """
     # Отдельные каталоги журнала: первый прогон сам пишет PROTECTION_CHANGE, и
     # его состояние не должно протекать во вторую половину проверки.
@@ -1161,18 +1224,19 @@ async def test_existing_auto_protection_policy_is_not_migrated(
     risk_dir.mkdir(parents=True, exist_ok=True)
     be_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1.2R по текущей цене → прежний Risk Cut (entry - 0.3R = 99.7).
+    # Доказан только 1R → прежний Risk Cut (entry - 0.3R = 99.7).
     risk_cut = await _run_auto_be(
         monkeypatch, risk_dir, [_position(qty="7", mark="101.2")], _PROVEN,
     )
     assert [row["stopLoss"] for row in risk_cut] == ["99.7"]
     assert _r1() is True
 
-    # 2R по текущей цене → прежний Auto-BE (БУ + 0.05R = 100.05).
+    # Доказан 2R → прежний Auto-BE (БУ + 0.05R = 100.05), Risk Cut устарел.
     auto_be = await _run_auto_be(
         monkeypatch, be_dir,
         [_position(qty="7", mark="102.5", stop="99.7")],
-        (*_PROVEN, _protection_change(), _rebound_sl()),
+        (*_PROVEN, _anchor_2r(), _mark_2r(), _milestone_2r(),
+         _protection_change(), _rebound_sl()),
         orders=[_sl_order(exit_id="sl-2", trigger="99.7")],
     )
     assert [row["stopLoss"] for row in auto_be] == ["100.05"]

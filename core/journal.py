@@ -76,6 +76,46 @@
                       Милестоун защиту НЕ включает и exchange-запись не вызывает;
                       текущая цена, размер позиции и planned_risk_usdt его не
                       задают. Lifecycle не меняет и терминальным не является.
+  PROTECTION_ACTION_PENDING — durable ПРЕД-ЗАПИСНОЕ намерение автоматического
+                      действия защиты (Risk Cut или Auto-BE) конкретного
+                      подтверждённого lifecycle: точная идентичность входа и
+                      позиции, вид действия, запрошенный уровень SL, sticky
+                      милестоун-основание и локальный ``attempt_id`` для
+                      корреляции повторных попыток. Пишется ДО вызова
+                      set_trading_stop; без него запись на биржу не выполняется.
+                      Само по себе событие НЕ утверждает ни принятия запроса
+                      биржей, ни выполнения действия: это только зафиксированное
+                      намерение, по которому следующий цикл обязан сначала
+                      выполнить authoritative-readback.
+                      Lifecycle не меняет и терминальным не является.
+  PROTECTION_ACTION_VERIFIED — durable AUTHORITATIVE завершение действия защиты
+                      ровно того же lifecycle и той же попытки (``attempt_id``):
+                      фактический уровень SL прочитан с биржи и оказался
+                      запрошенным либо более защитным. Источник различается
+                      явно: readback после собственной записи
+                      (:data:`PROTECTION_VERIFIED_BY_WRITE_READBACK`) либо
+                      доказанное текущее состояние биржи без новой записи
+                      (:data:`PROTECTION_VERIFIED_BY_CURRENT_STATE`).
+                      Принятый ответ Bybit сам по себе этим событием НЕ
+                      является и им не подменяется. Историческое завершение
+                      текущую правду биржи не заменяет: более поздняя регрессия
+                      SL снова делает политику применимой.
+                      Lifecycle не меняет и терминальным не является.
+  PROTECTION_ACTION_RESOLVED — durable НЕ-успешное разрешение ровно той же
+                      попытки: authoritative-чтение того же lifecycle доказало,
+                      что запрошенная защита на бирже ОТСУТСТВУЕТ
+                      (``outcome = NOT_APPLIED``, поле ``observed_stop_loss``
+                      строго слабее запрошенного). Событие ссылается на точную
+                      идентичность входа и позиции, ``attempt_id``,
+                      ``action_kind``, ``requested_stop_loss`` и — когда принятый
+                      ответ существовал — на ``protection_change_id`` того самого
+                      незавершённого ``PROTECTION_CHANGE``.
+                      Только оно снимает конкуренцию прежнего незавершённого
+                      автоматического изменения, чтобы успешное восстановление не
+                      делало собственный lifecycle недоказанным. Ни завершением,
+                      ни доказательством наличия защиты событие не является;
+                      «таймаут» и «потерянный ответ» им не оформляются.
+                      Lifecycle не меняет и терминальным не является.
 
 Чтение хронологии по инструменту — get_trade_timeline(): read-only, порядок
 физических строк JSONL, недоказанное evidence отображается как UNKNOWN.
@@ -183,6 +223,22 @@ ENTRY_EXECUTION_ANCHOR_PROVEN = "ENTRY_EXECUTION_ANCHOR_PROVEN"
 # Durable ФАКТ authoritative-наблюдения markPrice на каноническом уровне 2R.
 # Тоже lifecycle-neutral: это evidence о рынке, а не милестоун и не защита.
 MARK_PRICE_2R_OBSERVED = "MARK_PRICE_2R_OBSERVED"
+# Durable ПРЕД-ЗАПИСНОЕ намерение автоматического действия защиты и durable
+# AUTHORITATIVE завершение ровно этой попытки. Как и предыдущие аудиторские
+# события, оба позицию не открывают и не закрывают, в TERMINAL_EVENTS не входят и
+# в get_position_lifecycles не обрабатываются. Они описывают ДЕЙСТВИЕ защиты и
+# его состояние — в отличие от милестоунов, которые описывают достигнутый
+# ценовой УРОВЕНЬ. Смешивать эти два вида evidence запрещено: завершённое
+# действие милестоун не создаёт и не отменяет.
+PROTECTION_ACTION_PENDING = "PROTECTION_ACTION_PENDING"
+PROTECTION_ACTION_VERIFIED = "PROTECTION_ACTION_VERIFIED"
+# Durable НЕ-успешное разрешение ровно той же попытки: authoritative-чтение
+# доказало, что запрошенная защита на бирже отсутствует. Только оно снимает
+# конкуренцию прежнего незавершённого автоматического PROTECTION_CHANGE и
+# позволяет более поздней законной попытке стать новым текущим изменением.
+# Завершением действия событие НЕ является и PROTECTION_ACTION_VERIFIED не
+# подменяет.
+PROTECTION_ACTION_RESOLVED = "PROTECTION_ACTION_RESOLVED"
 
 # Канонический уровень ноги Real-R лестницы. LIVE-FIX8-B знает только TP1 —
 # ПЕРВУЮ логическую Real-R цель подтверждённого lifecycle. Значение участвует в
@@ -283,6 +339,46 @@ AUTO_PROTECTION_SOURCES = (
     PROTECTION_SOURCE_AUTO_BE,
     PROTECTION_SOURCE_RISK_CUT,
 )
+
+# Канонические виды автоматического действия защиты (поле ``action_kind``
+# событий PROTECTION_ACTION_PENDING / PROTECTION_ACTION_VERIFIED). Словарь тот
+# же, что у protection_source: одно и то же действие не имеет права называться
+# в журнале двумя разными способами.
+PROTECTION_ACTION_KINDS = AUTO_PROTECTION_SOURCES
+
+# Единственное допустимое соответствие действия защиты его sticky-милестоуну.
+# Risk Cut разрешён только доказанным 1R, Auto-BE — только доказанным 2R.
+# Текущая цена, текущий R по markPrice и текущий remaining size основанием
+# действия не являются.
+PROTECTION_ACTION_MILESTONE = {
+    PROTECTION_SOURCE_RISK_CUT: MILESTONE_1R,
+    PROTECTION_SOURCE_AUTO_BE:  MILESTONE_2R,
+}
+
+# Канонические источники доказательства завершения действия защиты. Различаются
+# намеренно: ``write_readback`` означает, что запись выполнил бот и её результат
+# доказан authoritative-чтением, а ``current_state_satisfied`` — что требуемая
+# (или более защитная) защита уже существует на бирже и НОВАЯ запись не
+# выполнялась. Принятый ответ Bybit ни одним из них не является.
+PROTECTION_VERIFIED_BY_WRITE_READBACK = "write_readback"
+PROTECTION_VERIFIED_BY_CURRENT_STATE = "current_state_satisfied"
+PROTECTION_VERIFICATION_SOURCES = (
+    PROTECTION_VERIFIED_BY_WRITE_READBACK,
+    PROTECTION_VERIFIED_BY_CURRENT_STATE,
+)
+
+# Канонический исход НЕ-успешного разрешения попытки. Единственный допустимый:
+# authoritative-чтение доказало, что запрошенная защита на бирже отсутствует.
+# «Истёк таймаут», «ответ потерян» и «прошло время» исходом не являются — они
+# оставляют попытку неизвестной.
+PROTECTION_OUTCOME_NOT_APPLIED = "NOT_APPLIED"
+PROTECTION_RESOLUTION_OUTCOMES = (PROTECTION_OUTCOME_NOT_APPLIED,)
+
+# Поле состояния милестоуна, соответствующее канонической метке милестоуна.
+_MILESTONE_STATE_FIELD = {
+    MILESTONE_1R: "r1_proven",
+    MILESTONE_2R: "r2_proven",
+}
 
 # Терминальные события: после любого из них символ больше не отслеживается,
 # пока не появится новое ENTRY_PLACED.
@@ -786,6 +882,46 @@ def get_auto_protection_evidence() -> dict:
     перезапуск их не сбрасывают, потому что они выводятся только из
     durable-событий, а не из текущей цены. Обратного перехода не существует.
     Наличие милестоуна защиту НЕ включает и exchange-запись не вызывает.
+
+    ``protection_action`` — состояние автоматического ДЕЙСТВИЯ защиты этого
+    lifecycle: ``{"pending": {...} | None, "verified": {...} | None}``.
+
+    ``pending`` появляется только из ``PROTECTION_ACTION_PENDING`` того же exact
+    lifecycle с доказанными ``attempt_id``, ``action_kind`` из
+    :data:`PROTECTION_ACTION_KINDS`, соответствующим ему
+    :data:`PROTECTION_ACTION_MILESTONE` и запрошенным уровнем SL, причём сам
+    милестоун-основание обязан быть УЖЕ доказан. Незавершённая попытка, которую
+    нельзя реконструировать точно, делает lifecycle недоказанным целиком: молча
+    забыть о ней нельзя, иначе следующий цикл выполнил бы новую запись без
+    readback-first восстановления.
+
+    ``verified`` появляется только из ``PROTECTION_ACTION_VERIFIED`` того же
+    exact lifecycle и ТОЙ ЖЕ попытки (``attempt_id`` и ``action_kind`` обязаны
+    совпасть с ``pending``), с доказанным ``verified_stop_loss`` не слабее
+    запрошенного и источником из :data:`PROTECTION_VERIFICATION_SOURCES`.
+    Завершение, оказавшееся раньше своего намерения, доверенным задним числом НЕ
+    становится. Принятый ответ Bybit (``PROTECTION_CHANGE`` с
+    ``write_outcome == accepted-response``) завершением не является и им не
+    подменяется.
+
+    ``PROTECTION_ACTION_RESOLVED`` закрывает ``pending`` как НЕ-успешную попытку
+    и — только при доказанной точной связи — снимает с текущего состояния её
+    незавершённое принятое изменение (``pending_change``). Требуется всё
+    одновременно: тот же exact lifecycle, тот же ``attempt_id`` и ``action_kind``,
+    тот же ``requested_stop_loss``, ``outcome`` из
+    :data:`PROTECTION_RESOLUTION_OUTCOMES`, доказанный ``observed_stop_loss``
+    СТРОГО слабее запрошенного и, когда ``pending_change`` существует, точное
+    совпадение ``protection_change_id`` и запрошенного уровня. Иначе не снимается
+    ничего: строгий конфликтный контракт ``PROTECTION_CHANGE`` остаётся в силе, и
+    посторонняя вторая идентичность изменения по-прежнему делает lifecycle
+    недоказанным. Само разрешение ``verified`` не создаёт и наличие защиты не
+    утверждает.
+
+    Оба поля строго lifecycle-local: новый вход того же символа начинает работу
+    без незавершённой попытки и без завершения прошлой сделки. Милестоуны и
+    состояние действия раздельны намеренно: милестоун — evidence достигнутого
+    ЦЕНОВОГО УРОВНЯ, действие — evidence СОСТОЯНИЯ ЗАЩИТЫ, и одно из другого не
+    выводится.
     """
     lifecycles: dict = {}
 
@@ -971,6 +1107,13 @@ def get_auto_protection_evidence() -> dict:
                     # милестоунов, поэтому 1R/2R прошлой сделки того же символа
                     # сюда не переходят.
                     "milestones": {"r1_proven": False, "r2_proven": False},
+                    # Состояние автоматического ДЕЙСТВИЯ защиты этого lifecycle:
+                    # незавершённая попытка и последнее authoritative-завершение.
+                    # Новый вход всегда начинает новый lifecycle, поэтому ни
+                    # незавершённая попытка, ни завершение прошлой сделки того же
+                    # символа сюда не наследуются и новую позицию «не закрывают».
+                    "protection_pending": None,
+                    "protection_verified": None,
                 }
                 if qty is None or risk is None:
                     lifecycles[symbol]["state"] = "UNPROVEN"
@@ -1404,6 +1547,178 @@ def get_auto_protection_evidence() -> dict:
                 # он выводится только из durable-событий, а не из текущей цены.
                 current["milestones"]["r1_proven"] = True
 
+            elif event_type == PROTECTION_ACTION_PENDING:
+                current = lifecycles.get(symbol)
+                if (
+                    current is None
+                    or current.get("state") != CONFIRMED
+                    or not current.get("anchored")
+                ):
+                    # Намерение без активного подтверждённого lifecycle само к
+                    # lifecycle не прикрепляется и права на запись не создаёт.
+                    continue
+                parent = _tp1_parent_match(ev, current)
+                if parent == _TP_PARENT_CONFLICT:
+                    current["state"] = "UNPROVEN"
+                    continue
+                if parent != _TP_PARENT_MATCH:
+                    continue
+                attempt_id = _proven_order_id(ev.get("attempt_id"), "attempt_id")
+                action_kind = ev.get("action_kind")
+                milestone = ev.get("action_milestone")
+                requested = _plan_amount(
+                    ev, "requested_stop_loss", _proven_positive_decimal
+                )
+                milestone_field = _MILESTONE_STATE_FIELD.get(milestone)
+                if (
+                    not attempt_id
+                    or action_kind not in PROTECTION_ACTION_KINDS
+                    or milestone != PROTECTION_ACTION_MILESTONE.get(action_kind)
+                    or requested is None
+                    or milestone_field is None
+                    or not current["milestones"].get(milestone_field, False)
+                ):
+                    # Незавершённая попытка, которую нельзя реконструировать
+                    # ТОЧНО, молча игнорироваться не имеет права: игнорирование
+                    # разрешило бы новую запись без readback-first восстановления.
+                    # Поэтому весь lifecycle становится недоказанным (fail-closed),
+                    # и автоматических записей по нему не будет вовсе.
+                    current["state"] = "UNPROVEN"
+                    continue
+                # Физически последнее намерение — актуальная незавершённая
+                # попытка: каждая новая попытка пишет свой ``attempt_id``, а
+                # повтор того же намерения идемпотентен.
+                current["protection_pending"] = {
+                    "attempt_id": attempt_id,
+                    "action_kind": action_kind,
+                    "action_milestone": milestone,
+                    "requested_stop_loss": requested,
+                }
+
+            elif event_type == PROTECTION_ACTION_RESOLVED:
+                current = lifecycles.get(symbol)
+                pending = (
+                    current.get("protection_pending") if current is not None else None
+                )
+                if (
+                    current is None
+                    or current.get("state") != CONFIRMED
+                    or not current.get("anchored")
+                    or pending is None
+                ):
+                    # Разрешать нечего: без durable намерения ТОЙ ЖЕ попытки
+                    # событие не описывает ни одной незавершённой записи и права
+                    # снимать чужое состояние не даёт.
+                    continue
+                parent = _tp1_parent_match(ev, current)
+                if parent == _TP_PARENT_CONFLICT:
+                    current["state"] = "UNPROVEN"
+                    continue
+                if parent != _TP_PARENT_MATCH:
+                    continue
+                attempt_id = _proven_order_id(ev.get("attempt_id"), "attempt_id")
+                requested = _plan_amount(
+                    ev, "requested_stop_loss", _proven_positive_decimal
+                )
+                observed = _plan_amount(
+                    ev, "observed_stop_loss", _proven_positive_decimal
+                )
+                if (
+                    not attempt_id
+                    or attempt_id != pending["attempt_id"]
+                    or ev.get("action_kind") != pending["action_kind"]
+                    or requested is None
+                    or requested != pending["requested_stop_loss"]
+                    or ev.get("outcome") not in PROTECTION_RESOLUTION_OUTCOMES
+                    or observed is None
+                    or protection_at_least_as_strong(
+                        current["side"], observed, requested
+                    )
+                ):
+                    # Разрешение чужой попытки, другого действия, другого
+                    # запрошенного уровня, неизвестного исхода либо заявление
+                    # «не применилось» при фактической защите НЕ СЛАБЕЕ
+                    # запрошенной доверенным не является. Ничего не снимается:
+                    # неоднозначное обязано остаться неоднозначным.
+                    continue
+                change = current.get("pending_change")
+                change_id = _proven_order_id(
+                    ev.get("protection_change_id"), "protection_change_id"
+                )
+                if change is None:
+                    if change_id:
+                        # Заявлено разрешение конкретного принятого изменения,
+                        # которого у этого lifecycle нет: связь не доказана.
+                        continue
+                elif (
+                    not change_id
+                    or change_id != change["change_id"]
+                    or change["requested_trigger"] != requested
+                ):
+                    # Точная связь с ЕДИНСТВЕННЫМ незавершённым принятым
+                    # изменением не доказана — оно продолжает конкурировать, и
+                    # строгий конфликтный контракт остаётся в силе.
+                    continue
+                # Незавершённая попытка закрыта как НЕ-успешная. Вместе с ней
+                # перестаёт быть текущим и её принятое изменение: применять
+                # нечего, перепривязывать нечего, поэтому более поздняя законная
+                # попытка того же lifecycle конфликтом с ним не является.
+                # Завершением действия это НЕ является: protection_verified не
+                # выставляется, и заявить существование запрошенной защиты
+                # событие не может.
+                current["protection_pending"] = None
+                if change is not None:
+                    current["pending_change"] = None
+
+            elif event_type == PROTECTION_ACTION_VERIFIED:
+                current = lifecycles.get(symbol)
+                pending = (
+                    current.get("protection_pending") if current is not None else None
+                )
+                if (
+                    current is None
+                    or current.get("state") != CONFIRMED
+                    or not current.get("anchored")
+                    or pending is None
+                ):
+                    # Причинный порядок обязателен: завершение без durable
+                    # намерения ТОЙ ЖЕ попытки доверенным не становится и задним
+                    # числом не легализуется.
+                    continue
+                parent = _tp1_parent_match(ev, current)
+                if parent == _TP_PARENT_CONFLICT:
+                    current["state"] = "UNPROVEN"
+                    continue
+                if parent != _TP_PARENT_MATCH:
+                    continue
+                attempt_id = _proven_order_id(ev.get("attempt_id"), "attempt_id")
+                verified = _plan_amount(
+                    ev, "verified_stop_loss", _proven_positive_decimal
+                )
+                if (
+                    not attempt_id
+                    or attempt_id != pending["attempt_id"]
+                    or ev.get("action_kind") != pending["action_kind"]
+                    or verified is None
+                    or ev.get("verification_source")
+                    not in PROTECTION_VERIFICATION_SOURCES
+                    or not protection_at_least_as_strong(
+                        current["side"], verified, pending["requested_stop_loss"]
+                    )
+                ):
+                    # Завершение чужой попытки, другого действия, недоказанного
+                    # уровня, неизвестного источника либо уровня СЛАБЕЕ
+                    # запрошенного завершением не является: неоднозначное
+                    # обязано остаться неоднозначным.
+                    continue
+                current["protection_pending"] = None
+                current["protection_verified"] = {
+                    "attempt_id": attempt_id,
+                    "action_kind": pending["action_kind"],
+                    "verified_stop_loss": verified,
+                    "verification_source": ev.get("verification_source"),
+                }
+
             elif event_type in TERMINAL_EVENTS:
                 current = lifecycles.get(symbol)
                 if current is None:
@@ -1456,6 +1771,22 @@ def get_auto_protection_evidence() -> dict:
             # означает «2R не доказан», а не «2R не достигался». Само наличие
             # милестоуна защиту не включает и exchange-запись не вызывает.
             "milestones": dict(info["milestones"]),
+            # Состояние автоматического ДЕЙСТВИЯ защиты (LIVE-FIX8-D), строго
+            # lifecycle-local: ``pending`` — незавершённая попытка, по которой
+            # следующий цикл ОБЯЗАН сначала выполнить authoritative-readback;
+            # ``verified`` — последнее доказанное завершение. Историческое
+            # завершение текущую правду биржи не заменяет и повторную защиту при
+            # регрессии SL не запрещает.
+            "protection_action": {
+                "pending": (
+                    dict(info["protection_pending"])
+                    if isinstance(info["protection_pending"], dict) else None
+                ),
+                "verified": (
+                    dict(info["protection_verified"])
+                    if isinstance(info["protection_verified"], dict) else None
+                ),
+            },
         }
         for symbol, info in lifecycles.items()
         if info.get("state") == CONFIRMED
@@ -1603,6 +1934,35 @@ def mark_price_crossed_2r(side, price, target) -> bool:
         return price >= target
     if side == "Sell":
         return price <= target
+    return False
+
+
+def protection_at_least_as_strong(side, level, required) -> bool:
+    """True, только когда SL *level* защищает не слабее уровня *required*.
+
+    Единственное каноническое сравнение СИЛЫ защиты во всём проекте. Для LONG
+    (``Buy``) стоп тем сильнее, чем он выше, поэтому требуется
+    ``level >= required``; для SHORT (``Sell``) — ``level <= required``.
+    Сравнение точное и выполняется в ``Decimal``; допуск, эпсилон и «почти то же
+    самое» здесь запрещены.
+
+    Недоказанная сторона, не-``Decimal`` и неконечное значение дают ``False``:
+    unknown != proven, а недоказанное сравнение не имеет права ни объявить уже
+    существующую защиту достаточной, ни разрешить ослабление существующего SL.
+
+    Направление сравнения совпадает с :func:`mark_price_crossed_2r`, но
+    утверждение другое: там речь о достижении ценой уровня прибыли, здесь — о
+    силе защиты позиции. Функции намеренно раздельны, чтобы изменение одного
+    смысла не переопределяло другой.
+    """
+    if not isinstance(level, Decimal) or not isinstance(required, Decimal):
+        return False
+    if not level.is_finite() or not required.is_finite():
+        return False
+    if side == "Buy":
+        return level >= required
+    if side == "Sell":
+        return level <= required
     return False
 
 

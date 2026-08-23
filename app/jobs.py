@@ -46,18 +46,21 @@ from core.journal import (
     EXIT_BINDING_ORIGIN_PROTECTION_CHANGE,
     PROTECTION_SOURCE_AUTO_BE,
     PROTECTION_SOURCE_RISK_CUT,
+    PROTECTION_ACTION_MILESTONE,
+    PROTECTION_VERIFIED_BY_CURRENT_STATE,
+    PROTECTION_VERIFIED_BY_WRITE_READBACK,
     MILESTONE_1R,
     MARK_2R_SOURCE_CLOSED_KLINE,
     MARK_2R_SOURCE_CURRENT_POSITION,
     get_position_lifecycles,
     normalize_symbol,
+    protection_at_least_as_strong,
     check_and_quarantine_sources,
     get_disabled_sources,
     get_exit_binding_candidates,
     get_exit_binding_events,
     get_auto_protection_evidence,
     get_tp_ladder_fill_events,
-    actual_initial_r_from_evidence,
     canonical_2r_target_from_evidence,
     entry_side_to_position_side,
     normalize_durable_order_identifier,
@@ -68,8 +71,52 @@ from core.journal import (
 )
 # Строгий разбор positionIdx и канонический write_outcome берутся из общего
 # контракта доказательств (HIGH-6): идентичность позиции в журнале обязана
-# совпадать с тем, что читатель timeline считает доказанным.
-from core.write_verify import WRITE_ACCEPTED, read_position_idx, to_positive_decimal
+# совпадать с тем, что читатель timeline считает доказанным. Оттуда же взяты
+# статусы и примитивы authoritative-проверки записи защиты — собственного
+# «успех == retCode 0» пути у автоматического действия нет.
+from core.write_verify import (
+    FIELD_SL,
+    FIELD_TP,
+    MALFORMED,
+    MISMATCH,
+    MISSING,
+    READBACK_ATTEMPTS,
+    READBACK_DELAY_SEC,
+    REJECTED,
+    SOURCE_POSITION,
+    UNVERIFIED,
+    VERIFIED,
+    WRITE_ACCEPTED,
+    align_expected,
+    classify_levels,
+    envelope_ok,
+    fmt_level,
+    levels_equal,
+    log_evidence,
+    make_result,
+    proven_rejection_code,
+    read_field_level,
+    read_position_idx,
+    read_ret_code,
+    read_tick,
+    read_tick_size,
+    resolve_write_status,
+    to_positive_decimal,
+    write_outcome_for,
+)
+# Чистая политика автоматического действия защиты по sticky-милестоунам
+# (LIVE-FIX8-D): право на действие, каноническая side-aware геометрия от
+# неизменного исходного R и durable-события намерения/завершения. Сетевых
+# вызовов и записи в ней нет.
+from core.protection_policy import (
+    PROTECTION_ACTION_LABEL,
+    build_protection_pending_event,
+    build_protection_resolved_event,
+    build_protection_verified_event,
+    desired_protection_action,
+    normalized_protection_target,
+    protection_action_needed,
+)
 # Чистый контракт доказательств связывания защитного выхода с риском входа
 # (LIVE-FIX4). Здесь он только применяется к уже полученным снимкам биржи:
 # сетевых вызовов и записи в нём нет.
@@ -293,9 +340,16 @@ def _bybit_error_code(exc: Exception) -> int | None:
 
 
 async def _set_auto_be_stop(
-    symbol: str, target_sl: float, position_idx: int
+    symbol: str, target_sl: str, position_idx: int
 ) -> tuple[bool, bool]:
-    """Set an Auto-BE SL and distinguish a real update from Bybit's benign no-op."""
+    """Set an Auto-BE SL and distinguish a real update from Bybit's benign no-op.
+
+    *target_sl* — уже нормализованный по ``tickSize`` уровень в каноническом
+    текстовом виде (:func:`core.write_verify.fmt_level`). Форматирование
+    выполняется вызывающим кодом намеренно: ровно эта же строка сравнивается с
+    фактом биржи при authoritative-проверке, поэтому запрос и проверка обязаны
+    печатать уровень одинаково.
+    """
     try:
         await bybit_call(
             session.set_trading_stop,
@@ -401,6 +455,383 @@ async def _journal_protection_change(
     return True
 
 
+# ---------------------------------------------------------------------------
+# LIVE-FIX8-D: authoritative завершение автоматического действия защиты
+# ---------------------------------------------------------------------------
+#
+# Принятый ответ set_trading_stop действием НЕ является. Действие считается
+# выполненным только когда фактический уровень SL прочитан с биржи и доказан на
+# ТОЙ ЖЕ позиции. Поэтому здесь два РАЗНЫХ пути доказательства, и их нельзя
+# смешивать:
+#
+#   auto_protection            — проверка собственной только что выполненной записи;
+#   auto_protection_recovery   — readback-first разрешение НЕЗАВЕРШЁННОЙ попытки,
+#                                который сам не выполняет ни одной записи.
+AUTO_PROTECTION_VERIFY_PATH = "auto_protection"
+AUTO_PROTECTION_RECOVERY_PATH = "auto_protection_recovery"
+
+# Исходы разрешения незавершённой попытки.
+#
+#   SATISFIED    — текущее состояние биржи доказанно содержит запрошенную или
+#                  БОЛЕЕ защитную защиту; завершение материализуется journal-only,
+#                  новых записей нет;
+#   NOT_APPLIED  — то же состояние доказанно СЛАБЕЕ запрошенного: прежняя
+#                  неоднозначность разрешена как «не применилось»;
+#   UNKNOWN      — доказательств нет; неизвестное остаётся неизвестным, и новая
+#                  запись запрещена.
+PENDING_SATISFIED = "SATISFIED"
+PENDING_NOT_APPLIED = "NOT_APPLIED"
+PENDING_UNKNOWN = "UNKNOWN"
+
+
+def _classify_auto_protection_state(
+    resp, *, symbol: str, plan: dict, position_idx: int, expected,
+    original_qty: Decimal, original_entry: Decimal, expected_take_profit,
+    tick_raw, attempts: int, path: str,
+) -> dict:
+    """Одна authoritative-классификация фактического SL по снимку позиции.
+
+    ``VERIFIED`` требует ВСЕГО одновременно:
+
+    1. доказанного конверта ответа Bybit;
+    2. доказанного шага цены (сетка сравнения);
+    3. точной идентичности ТОЙ ЖЕ позиции того же lifecycle
+       (:func:`~core.exit_binding.find_continuation_position_row`: symbol, side,
+       positionIdx, remaining > 0, remaining <= original executed qty,
+       authoritative avgPrice);
+    4. фактического SL, равного запрошенному нормализованному уровню;
+    5. доказанной сохранности второго уровня защиты (position TP) относительно
+       pre-write снимка.
+
+    Любая недоказанность даёт ``UNVERIFIED``, а доказанное расхождение —
+    ``MISMATCH``. Недоступность чтения ``MISMATCH`` не становится никогда: это
+    разные утверждения. Дополнительно к контракту :func:`make_result`
+    возвращаются два флага — ``identity_proven`` и ``take_profit_preserved`` —
+    чтобы вызывающий код мог отличить «состояние прочитано, но защита слабее»
+    от «состояние не прочитано вовсе».
+    """
+    side = plan["side"]
+    aligned = expected
+    tick = read_tick(tick_raw)
+    if tick is not None:
+        aligned = align_expected(expected, tick)
+
+    def _result(status, *, actual=None, observed_tp=None, detail="",
+                identity=False, preserved=False):
+        result = make_result(
+            status=status, path=path, symbol=symbol, side=side,
+            position_idx=position_idx, field=FIELD_SL, expected=aligned,
+            actual=actual, attempts=attempts, source=SOURCE_POSITION,
+            requested_take_profit=expected_take_profit,
+            observed_take_profit=observed_tp,
+            write_outcome=None, detail=detail,
+        )
+        result["identity_proven"] = identity
+        result["take_profit_preserved"] = preserved
+        return result
+
+    if tick is None:
+        return _result(UNVERIFIED, detail="шаг цены инструмента (tickSize) не доказан")
+    if not envelope_ok(resp):
+        return _result(
+            UNVERIFIED,
+            detail=f"ответ Bybit не подтверждён: retCode={read_ret_code(resp)}",
+        )
+    result_block = resp.get("result")
+    rows = result_block.get("list") if isinstance(result_block, dict) else None
+    row = find_continuation_position_row(
+        rows, symbol=symbol, side=side, position_idx=position_idx,
+        original_qty=original_qty, avg_price=original_entry,
+    )
+    if row is None:
+        return _result(
+            UNVERIFIED,
+            detail="точная позиция того же lifecycle не доказана при readback",
+        )
+
+    observed_tp = read_field_level(row, FIELD_TP)
+    observed = read_field_level(row, FIELD_SL)
+    # Сохранность второго уровня обязана быть ДОКАЗАНА. Отсутствие ключа и
+    # неразбираемое значение ничего не утверждают: из них не выводится ни
+    # сохранность, ни её нарушение, поэтому итог — UNVERIFIED, а не MISMATCH.
+    if (
+        observed_tp is MISSING or observed_tp is MALFORMED
+        or expected_take_profit is MISSING or expected_take_profit is MALFORMED
+    ):
+        return _result(
+            UNVERIFIED, actual=observed, observed_tp=observed_tp, identity=True,
+            detail="сохранность второго уровня защиты (TP) недоказуема",
+        )
+    preserved = levels_equal(observed_tp, expected_take_profit)
+    status = classify_levels(aligned, observed)
+
+    if status == VERIFIED and not preserved:
+        # Запрошенный SL стоит, но второй уровень защиты доказанно изменился:
+        # заявлять выполненное действие нельзя.
+        return _result(
+            MISMATCH, actual=observed, observed_tp=observed_tp,
+            identity=True, preserved=False,
+            detail="второй уровень защиты (TP) изменился после записи",
+        )
+    return _result(
+        status, actual=observed, observed_tp=observed_tp,
+        identity=True, preserved=preserved,
+        detail=("поле stopLoss отсутствует в ответе" if observed is MISSING else ""),
+    )
+
+
+async def _readback_auto_protection(
+    *, symbol: str, plan: dict, position_idx: int, expected,
+    original_qty: Decimal, original_entry: Decimal, expected_take_profit,
+    tick_raw, path: str,
+) -> dict:
+    """Ограниченный authoritative readback фактического уровня защиты.
+
+    Чтение повторяется не более :data:`READBACK_ATTEMPTS` раз с короткой паузой:
+    изменение могло ещё не отразиться в снимке позиции. Повтор относится ТОЛЬКО
+    к чтению — запись не повторяется и не восстанавливается ни при каком исходе.
+    Цикл прерывается досрочно при доказанном совпадении: повторять нечего.
+    """
+    result = None
+    for attempt in range(1, READBACK_ATTEMPTS + 1):
+        if attempt > 1:
+            await asyncio.sleep(READBACK_DELAY_SEC)
+        try:
+            resp = await bybit_call(
+                session.get_positions, category="linear", symbol=symbol
+            )
+        except Exception as exc:
+            logging.warning(
+                "Auto-protection: %s readback недоступен (попытка %s): %s",
+                symbol, attempt, exc,
+            )
+            resp = None
+        result = _classify_auto_protection_state(
+            resp, symbol=symbol, plan=plan, position_idx=position_idx,
+            expected=expected, original_qty=original_qty,
+            original_entry=original_entry,
+            expected_take_profit=expected_take_profit, tick_raw=tick_raw,
+            attempts=attempt, path=path,
+        )
+        if result["status"] == VERIFIED:
+            return result
+    return result
+
+
+async def _journal_protection_pending(
+    *, plan: dict, symbol: str, position_idx: int, action_kind: str,
+    requested, attempt_id: str,
+) -> bool:
+    """Durable ПРЕД-ЗАПИСНОЕ намерение действия защиты.
+
+    Возвращает True только когда событие действительно записано. False обязывает
+    вызывающий код НЕ выполнять запись на биржу: без durable-намерения
+    неоднозначная запись стала бы невосстановимой — следующий цикл не знал бы,
+    что попытка вообще была, и не выполнил бы readback-first восстановление.
+    """
+    event = build_protection_pending_event(
+        symbol=symbol, side=plan["side"], position_idx=position_idx,
+        entry_order_id=plan.get("order_id"),
+        entry_order_link_id=plan.get("order_link_id"),
+        action_kind=action_kind, requested_stop_loss=requested,
+        attempt_id=attempt_id,
+    )
+    if not event:
+        logging.error(
+            "Auto-protection: %s намерение %s не построено из доказанных фактов — "
+            "записи на биржу не будет", symbol, action_kind,
+        )
+        return False
+    try:
+        written = await asyncio.to_thread(append_event, event)
+    except Exception as exc:
+        logging.error(
+            "Auto-protection: %s durable-намерение %s не записано (%s) — "
+            "записи на биржу не будет", symbol, action_kind, exc,
+        )
+        return False
+    if not written:
+        logging.error(
+            "Auto-protection: %s durable-намерение %s не записано — "
+            "записи на биржу не будет", symbol, action_kind,
+        )
+        return False
+    return True
+
+
+async def _journal_protection_verified(
+    *, plan: dict, symbol: str, position_idx: int, action_kind: str,
+    verified, verification_source: str, attempt_id: str, write_outcome=None,
+) -> bool:
+    """Durable AUTHORITATIVE завершение действия защиты.
+
+    Записывается только по доказанному факту биржи. Сбой записи не откатывает
+    уже выполненное изменение и повторной записи на биржу не вызывает: попытка
+    останется незавершённой, а следующий цикл разрешит её readback-first и,
+    обнаружив требуемую защиту, материализует завершение journal-only.
+    """
+    event = build_protection_verified_event(
+        symbol=symbol, side=plan["side"], position_idx=position_idx,
+        entry_order_id=plan.get("order_id"),
+        entry_order_link_id=plan.get("order_link_id"),
+        action_kind=action_kind, verified_stop_loss=verified,
+        verification_source=verification_source, attempt_id=attempt_id,
+        write_outcome=write_outcome,
+    )
+    if not event:
+        logging.error(
+            "Auto-protection: %s завершение %s не построено из доказанных фактов",
+            symbol, action_kind,
+        )
+        return False
+    try:
+        written = await asyncio.to_thread(append_event, event)
+    except Exception as exc:
+        logging.error(
+            "Auto-protection: %s durable-завершение %s не записано: %s",
+            symbol, action_kind, exc,
+        )
+        return False
+    if not written:
+        logging.error(
+            "Auto-protection: %s durable-завершение %s не записано",
+            symbol, action_kind,
+        )
+        return False
+    return True
+
+
+async def _journal_protection_resolved(
+    *, plan: dict, symbol: str, position_idx: int, action_kind: str,
+    requested, observed, attempt_id: str, protection_change_id,
+) -> bool:
+    """Durable НЕ-успешное разрешение попытки (``outcome = NOT_APPLIED``).
+
+    Возвращает True только когда событие действительно записано. False обязывает
+    вызывающий код НЕ выполнять новую запись: без durable-разрешения прежнее
+    незавершённое принятое изменение остаётся текущим, и более поздняя законная
+    попытка того же lifecycle столкнулась бы с ним по строгому конфликтному
+    контракту, сделав собственный lifecycle недоказанным. Успешное
+    восстановление не имеет права разрушать доверие к своей же сделке.
+    """
+    event = build_protection_resolved_event(
+        symbol=symbol, side=plan["side"], position_idx=position_idx,
+        entry_order_id=plan.get("order_id"),
+        entry_order_link_id=plan.get("order_link_id"),
+        action_kind=action_kind, requested_stop_loss=requested,
+        observed_stop_loss=observed, attempt_id=attempt_id,
+        protection_change_id=protection_change_id,
+    )
+    if not event:
+        logging.error(
+            "Auto-protection: %s разрешение попытки %s не построено из "
+            "доказанных фактов — новой записи не будет", symbol, action_kind,
+        )
+        return False
+    try:
+        written = await asyncio.to_thread(append_event, event)
+    except Exception as exc:
+        logging.error(
+            "Auto-protection: %s durable-разрешение попытки %s не записано (%s) "
+            "— новой записи не будет", symbol, action_kind, exc,
+        )
+        return False
+    if not written:
+        logging.error(
+            "Auto-protection: %s durable-разрешение попытки %s не записано — "
+            "новой записи не будет", symbol, action_kind,
+        )
+        return False
+    return True
+
+
+async def _resolve_pending_protection(
+    *, symbol: str, plan: dict, pending: dict, position_idx: int,
+    original_qty: Decimal, original_entry: Decimal, expected_take_profit,
+    tick_raw,
+) -> str:
+    """Readback-first разрешение незавершённой попытки. Записей на биржу НЕТ.
+
+    Это единственный допустимый первый шаг для lifecycle с незавершённой
+    попыткой: неоднозначная запись не повторяется слепо, а её фактический
+    результат выясняется authoritative-чтением. Возвращает
+    :data:`PENDING_SATISFIED`, :data:`PENDING_NOT_APPLIED` либо
+    :data:`PENDING_UNKNOWN`.
+
+    :data:`PENDING_NOT_APPLIED` возвращается ТОЛЬКО после того, как исход
+    доказанного не-применения записан durable (``PROTECTION_ACTION_RESOLVED``).
+    Пока такого разрешения нет, прежнее незавершённое принятое изменение
+    остаётся текущим, и новая запись запрещена: иначе успешное восстановление
+    само сделало бы свой lifecycle недоказанным по конфликту идентичностей
+    изменения.
+    """
+    requested = pending["requested_stop_loss"]
+    action_kind = pending["action_kind"]
+    attempt_id = pending["attempt_id"]
+    result = await _readback_auto_protection(
+        symbol=symbol, plan=plan, position_idx=position_idx, expected=requested,
+        original_qty=original_qty, original_entry=original_entry,
+        expected_take_profit=expected_take_profit, tick_raw=tick_raw,
+        path=AUTO_PROTECTION_RECOVERY_PATH,
+    )
+    log_evidence(result)
+    observed = result.get("observed_stop_loss")
+
+    if result["status"] == VERIFIED:
+        await _journal_protection_verified(
+            plan=plan, symbol=symbol, position_idx=position_idx,
+            action_kind=action_kind, verified=observed,
+            verification_source=PROTECTION_VERIFIED_BY_CURRENT_STATE,
+            attempt_id=attempt_id,
+        )
+        return PENDING_SATISFIED
+
+    if (
+        result.get("identity_proven")
+        and result.get("take_profit_preserved")
+        and isinstance(observed, Decimal)
+    ):
+        if protection_at_least_as_strong(plan["side"], observed, requested):
+            # Текущая защита СИЛЬНЕЕ запрошенной: требование уже выполнено, и
+            # переписывать её более слабым «запрошенным» уровнем запрещено.
+            await _journal_protection_verified(
+                plan=plan, symbol=symbol, position_idx=position_idx,
+                action_kind=action_kind, verified=observed,
+                verification_source=PROTECTION_VERIFIED_BY_CURRENT_STATE,
+                attempt_id=attempt_id,
+            )
+            return PENDING_SATISFIED
+        # Доказано: запрошенное изменение не применилось. Прежде чем эта
+        # неоднозначность перестанет блокировать новую запись, её исход
+        # обязан стать durable — и вместе с ней перестаёт быть текущим её
+        # принятое изменение.
+        change = plan.get("pending_change")
+        resolved = await _journal_protection_resolved(
+            plan=plan, symbol=symbol, position_idx=position_idx,
+            action_kind=action_kind, requested=requested, observed=observed,
+            attempt_id=attempt_id,
+            protection_change_id=(
+                change.get("change_id") if isinstance(change, dict) else None
+            ),
+        )
+        if not resolved:
+            return PENDING_UNKNOWN
+        logging.warning(
+            "Auto-protection: %s незавершённая попытка %s (%s) разрешена как "
+            "НЕ применившаяся: на бирже %s, запрошено %s",
+            symbol, action_kind, attempt_id, fmt_level(observed),
+            fmt_level(requested),
+        )
+        return PENDING_NOT_APPLIED
+
+    logging.warning(
+        "Auto-protection: %s незавершённая попытка %s (%s) остаётся "
+        "неизвестной — новых записей не будет",
+        symbol, action_kind, attempt_id,
+    )
+    return PENDING_UNKNOWN
+
+
 # --- 1. Heartbeat (Проверка пульса) ---
 async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
     """Пишет аптайм и текущий PnL по всем позам."""
@@ -422,10 +853,27 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
 # --- 2. Auto-Breakeven (Перевод в Безубыток) ---
 async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Авто-трейлинг стопа: ступенчатое подтягивание по R.
+    Автоматическое действие защиты по durable sticky-милестоунам (LIVE-FIX8-D).
 
-    1. Прибыль >= 1R → Risk Cut (стоп в -0.3R).
-    2. Прибыль >= 2R → Безубыток (вход + 0.05R, динамический offset).
+    Право на действие даёт ТОЛЬКО durable милестоун подтверждённого lifecycle:
+
+    1. доказан 2R                 → Auto-BE (вход + 0.05R, динамический offset);
+    2. доказан 1R и НЕ доказан 2R → Risk Cut (стоп в -0.3R).
+
+    Auto-BE имеет приоритет: при доказанном 2R устаревший Risk Cut не
+    выполняется. Переходный текущий R по markPrice правом на действие больше не
+    является — пересечение уровня ценой без милестоуна действия не даёт, а
+    доказанный милестоун остаётся действительным после ретрейса.
+
+    Само действие не считается выполненным по принятому ответу Bybit. Порядок
+    жёсткий и восстановимый после краха в любой точке:
+
+        разрешить незавершённую попытку readback-first
+        → доказать точную текущую позицию и владение
+        → доказать необходимость действия по ТЕКУЩЕЙ защите биржи
+        → записать durable-намерение
+        → РОВНО ОДНА попытка set_trading_stop
+        → authoritative readback решает VERIFIED / MISMATCH / UNVERIFIED / REJECTED
     """
     if not is_trading_enabled(): return
 
@@ -456,8 +904,6 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
             plan = protection_evidence.get(sym)
             if not plan:
                 continue
-            if plan.get("pending_change") is not None:
-                continue
             if side not in ("Buy", "Sell") or plan["side"] != side:
                 continue
             position_idx = read_position_idx(p.get("positionIdx"))
@@ -484,8 +930,6 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
             # Без стопа трейлить нечего
             if current_sl == 0: continue
 
-            is_long = side == "Buy"
-
             # Текущий child SL обязан иметь exact durable binding к entry order
             # этого lifecycle. Геометрия позиции ownership не доказывает.
             sl_level = position_protection_level(p, EXIT_KIND_SL)
@@ -498,12 +942,69 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
                 level=sl_level,
             )
             bound_level = plan["sl_bindings"].get(current_exit_id)
+            binding_proven = (
+                bool(current_exit_id)
+                and bound_level is not None
+                and sl_level is not None
+                and bound_level == sl_level
+            )
+
+            # Желаемое действие определяет ТОЛЬКО durable sticky-милестоун.
+            action_kind = desired_protection_action(plan.get("milestones"))
+            pending_action = (plan.get("protection_action") or {}).get("pending")
+            if action_kind is None and pending_action is None:
+                # Ни доказанного милестоуна, ни незавершённой попытки: делать и
+                # выяснять нечего, и биржу для этого читать незачем.
+                continue
+
+            # Шаг цены нужен и для запроса, и для authoritative-сравнения:
+            # без доказанной сетки ни один уровень на биржу не отправляется.
+            _info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=sym)
+            info = _info_resp['result']['list'][0]
+            tick_raw = read_tick_size(info)
+            if read_tick(tick_raw) is None:
+                logging.warning(
+                    "Auto-protection: %s пропущен — шаг цены инструмента не "
+                    "доказан (fail-closed)", sym,
+                )
+                continue
+            # Сохранность второго уровня защиты доказывается относительно
+            # authoritative pre-write снимка: запрос меняет только stopLoss.
+            expected_take_profit = read_field_level(p, FIELD_TP)
+
+            # --- 1. НЕЗАВЕРШЁННАЯ ПОПЫТКА РАЗРЕШАЕТСЯ ПЕРВОЙ (readback-first) ---
+            resolution = None
+            if pending_action is not None:
+                resolution = await _resolve_pending_protection(
+                    symbol=sym, plan=plan, pending=pending_action,
+                    position_idx=position_idx, original_qty=original_qty,
+                    original_entry=original_entry,
+                    expected_take_profit=expected_take_profit, tick_raw=tick_raw,
+                )
+                if resolution != PENDING_NOT_APPLIED:
+                    # SATISFIED — завершение материализовано journal-only;
+                    # UNKNOWN — неизвестное осталось неизвестным.
+                    # В обоих случаях новых записей на биржу в этом цикле нет.
+                    continue
+
+            # Ожидание точной перепривязки защитного child после уже принятого
+            # переноса SL. Исключение ровно одно: authoritative-чтение выше
+            # доказало, что запрошенное изменение НЕ применилось, и этот исход
+            # уже записан durable (``PROTECTION_ACTION_RESOLVED``). Тогда
+            # перепривязывать нечего, прежнее изменение перестало быть текущим,
+            # и ожидание разрешено этим доказательством — а не «истечением
+            # времени» и не «похожестью цели».
             if (
-                not current_exit_id
-                or bound_level is None
-                or sl_level is None
-                or bound_level != sl_level
+                plan.get("pending_change") is not None
+                and resolution != PENDING_NOT_APPLIED
             ):
+                continue
+            if not binding_proven:
+                continue
+
+            if action_kind is None:
+                # Незавершённая попытка разрешена, но права на новое действие
+                # больше нет: милестоун его не даёт.
                 continue
 
             # Каноническая неизменная величина исходного R: фактический avg
@@ -511,95 +1012,146 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
             # lifecycle. Ни planned_risk_usdt / qty, ни перенесённый текущий SL
             # знаменателем milestone-R не являются. После частичного закрытия
             # текущий qty меньше, но ценовая дистанция 1R остаётся неизменной.
-            actual_r = actual_initial_r_from_evidence(plan)
-            if actual_r is None:
+            target_sl = normalized_protection_target(plan, action_kind, tick_raw)
+            if target_sl is None:
                 # Подтверждённый lifecycle без доказанной канонической геометрии
                 # (нулевой, неверносторонний или неконечный R): fail-closed по
                 # этому символу. Молчаливый откат на planned_risk_usdt / qty
                 # запрещён; изоляция по символам сохраняется — прочие валидные
                 # позиции продолжают оцениваться.
                 logging.warning(
-                    "Auto-BE: %s пропущен — неизменный исходный R не доказан "
-                    "(fail-closed)", sym,
+                    "Auto-protection: %s пропущен — каноническая цель %s не "
+                    "доказана (fail-closed)", sym, action_kind,
                 )
                 continue
-            dist_1r_price = float(actual_r.price)
 
-            # 2. Считаем текущий PnL в R
-            if is_long:
-                price_move = current_price - entry
+            # --- 2. ТЕКУЩАЯ ЗАЩИТА БИРЖИ — ТЕКУЩАЯ ПРАВДА ---
+            # Равный или более защитный текущий SL не переписывается: запись
+            # ради «доказательства действия» запрещена, ослабление — тем более.
+            if not protection_action_needed(side, sl_level, target_sl):
+                continue
+
+            action_tag = PROTECTION_ACTION_LABEL[action_kind]
+            action_milestone = PROTECTION_ACTION_MILESTONE[action_kind]
+            requested_text = fmt_level(target_sl)
+            attempt_id = uuid.uuid4().hex
+
+            # --- 3. DURABLE-НАМЕРЕНИЕ ДО ЗАПИСИ ---
+            if not await _journal_protection_pending(
+                plan=plan, symbol=sym, position_idx=position_idx,
+                action_kind=action_kind, requested=target_sl,
+                attempt_id=attempt_id,
+            ):
+                continue
+
+            # --- 4. РОВНО ОДНА ПОПЫТКА ЗАПИСИ ---
+            write_error = None
+            changed = False
+            try:
+                _, changed = await _set_auto_be_stop(
+                    sym, requested_text, position_idx
+                )
+            except Exception as exc:
+                # Повторная запись не выполняется ни при каком исходе: ответ мог
+                # быть потерян уже после применения изменения на бирже.
+                write_error = exc
+            reject_code = (
+                proven_rejection_code(write_error) if write_error is not None
+                else None
+            )
+            write_rejected = reject_code is not None
+
+            # --- 5. AUTHORITATIVE READBACK РЕШАЕТ ИСХОД ---
+            if write_rejected:
+                # Доказанный business-отказ: запись не применялась, читать
+                # нечего. Заявлять существование запрошенной защиты запрещено.
+                result = make_result(
+                    status=REJECTED, path=AUTO_PROTECTION_VERIFY_PATH,
+                    symbol=sym, side=side, position_idx=position_idx,
+                    field=FIELD_SL, expected=target_sl, attempts=0,
+                    source=SOURCE_POSITION,
+                    write_outcome=write_outcome_for(
+                        REJECTED, write_acknowledged=False, write_rejected=True,
+                    ),
+                    detail=f"Bybit отклонил запись, retCode={reject_code}",
+                )
             else:
-                price_move = entry - current_price
+                result = await _readback_auto_protection(
+                    symbol=sym, plan=plan, position_idx=position_idx,
+                    expected=target_sl, original_qty=original_qty,
+                    original_entry=original_entry,
+                    expected_take_profit=expected_take_profit,
+                    tick_raw=tick_raw, path=AUTO_PROTECTION_VERIFY_PATH,
+                )
+                result["status"] = resolve_write_status(
+                    result["status"], write_error=write_error,
+                    write_rejected=False,
+                )
+                result["write_outcome"] = write_outcome_for(
+                    result["status"], write_acknowledged=(write_error is None),
+                    write_rejected=False,
+                )
+            log_evidence(result)
 
-            current_r = price_move / dist_1r_price
-
-            # 3. Получаем шаг цены (tickSize) для округления
-            _info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=sym)
-            info = _info_resp['result']['list'][0]
-            tick = float(info['priceFilter']['tickSize'])
-
-            new_sl = None
-            action_tag = ""
-
-            # --- ЛОГИКА СТУПЕНЕЙ ---
-
-            # СТУПЕНЬ 2: Прибыль > 2R -> Безубыток + 0.05R
-            if current_r >= 2:
-                # --- ДИНАМИЧЕСКИЙ OFFSET (5% от 1R) ---
-                # Это гораздо лучше, чем 0.1%, так как адаптируется под волатильность монеты
-                offset = dist_1r_price * 0.05
-
-                target_sl = entry + offset if is_long else entry - offset
-
-                # Проверка: двигаем только в лучшую сторону
-                is_improvement = (target_sl > current_sl) if is_long else (target_sl < current_sl)
-
-                if is_improvement:
-                    new_sl = target_sl
-                    action_tag = "AUTO-BE (2R)"
-
-            # СТУПЕНЬ 1: Прибыль > 1R (но меньше 2R) -> Риск -0.3R
-            elif current_r >= 1:
-                # Цель: Оставить риск 0.3R
-                safe_dist = 0.3 * dist_1r_price
-
-                target_sl = entry - safe_dist if is_long else entry + safe_dist
-
-                # Проверка: двигаем только в лучшую сторону
-                is_improvement = (target_sl > current_sl) if is_long else (target_sl < current_sl)
-
-                if is_improvement:
-                    new_sl = target_sl
-                    action_tag = "Risk Cut (-0.3R)"
-
-            # --- ИСПОЛНЕНИЕ ---
-            if new_sl:
-                new_sl = round(round(new_sl / tick) * tick, 6)
-
-                try:
-                    _, changed = await _set_auto_be_stop(sym, new_sl, position_idx)
-                    if not changed:
-                        continue
-                    logging.info(f"♻️ {action_tag}: {sym} SL moved to {new_sl}")
-                    # Durable audit доказанного изменения защиты — до
-                    # уведомления: сбой Telegram не должен стирать след записи.
+            if result["status"] == VERIFIED:
+                logging.info(
+                    "♻️ %s: %s SL authoritative подтверждён на %s",
+                    action_tag, sym, fmt_level(result["observed_stop_loss"]),
+                )
+                if changed:
+                    # Durable audit принятого ответа сохраняет прежний смысл:
+                    # это НЕ доказательство выполненного действия.
                     await _journal_protection_change(
-                        p, action_tag, current_sl, new_sl,
+                        p, action_tag, current_sl, requested_text,
                         plan=plan, previous_exit_order_id=current_exit_id,
                     )
+                await _journal_protection_verified(
+                    plan=plan, symbol=sym, position_idx=position_idx,
+                    action_kind=action_kind,
+                    verified=result["observed_stop_loss"],
+                    verification_source=PROTECTION_VERIFIED_BY_WRITE_READBACK,
+                    attempt_id=attempt_id, write_outcome=result["write_outcome"],
+                )
+                try:
                     await context.bot.send_message(
                         chat_id=ALLOWED_ID,
                         text=(
                             f"{format_header('✅', 'POSITION UPDATED')}\n"
                             f"Position: {h(sym)}\n\n"
                             f"🛡 <b>Защита</b>\n"
-                            f"{format_value_block([('Режим', action_tag), ('PnL', f'{current_r:.1f}R'), ('SL', new_sl)])}\n\n"
+                            f"{format_value_block([('Режим', action_tag), ('Основание', f'{action_milestone} (durable)'), ('SL на бирже', fmt_level(result['observed_stop_loss']))])}\n\n"
                             f"{format_action('контролируйте позицию через /status')}"
                         ),
                         parse_mode='HTML'
                     )
-                except Exception as e:
-                    logging.warning(f"Auto-BE: failed to move SL for {sym}: {e}")
+                except Exception as exc:
+                    logging.warning(
+                        "Auto-protection: уведомление о %s для %s не отправлено: %s",
+                        action_tag, sym, exc,
+                    )
+                continue
+
+            # Неоднозначный, расходящийся или отклонённый исход: запрошенная
+            # защита существующей НЕ объявляется, повторной записи в этой
+            # попытке нет, а незавершённое намерение останется в журнале и будет
+            # разрешено readback-first в следующем цикле.
+            if changed:
+                await _journal_protection_change(
+                    p, action_tag, current_sl, requested_text,
+                    plan=plan, previous_exit_order_id=current_exit_id,
+                )
+            try:
+                await send_alert(
+                    context.bot, ALLOWED_ID, "WARNING", FAIL_CLOSED,
+                    (
+                        f"{action_tag} {sym}: запрошен SL {requested_text}, "
+                        f"фактическое состояние не подтверждено "
+                        f"({result['status']}). Проверьте позицию на Bybit."
+                    ),
+                    dedup_key=f"auto_protection_unverified_{sym}_{attempt_id}",
+                )
+            except Exception:
+                pass
 
     except Exception as e:
         logging.warning(f"Auto-BE Job Error: {e}")
@@ -2038,11 +2590,13 @@ async def _materialize_r1_milestone(sym: str, plan: dict) -> None:
 
     Милестоун только фиксирует факт достижения уровня 1R. Отсюда НЕ вызываются
     ``set_trading_stop`` / ``place_order`` / ``cancel_order`` / ``amend_order`` и
-    НЕ пишутся ``PROTECTION_CHANGE`` / ``EXIT_ORDER_BOUND`` / Risk Cut: Risk Cut и
-    Auto-BE на sticky-1R в C1 не мигрируются. Строгая реконструкция доверится
-    милестоуну лишь при наличии нижележащего durable-факта исполнения TP1, а
-    вызывающий отбирает символы по ``exec_qty`` и ``r1_proven``, поэтому уже
-    доказанный милестоун повторно не пишется (идемпотентно, без лог-спама).
+    НЕ пишутся ``PROTECTION_CHANGE`` / ``EXIT_ORDER_BOUND`` / Risk Cut: право на
+    действие защиты даёт не сам милестоун, а полный шлюз владения, текущего
+    состояния и durable-намерения в :func:`auto_breakeven_job`. Строгая
+    реконструкция доверится милестоуну лишь при наличии нижележащего
+    durable-факта исполнения TP1, а вызывающий отбирает символы по ``exec_qty`` и
+    ``r1_proven``, поэтому уже доказанный милестоун повторно не пишется
+    (идемпотентно, без лог-спама).
     """
     tp1 = plan.get("tp1")
     if not isinstance(tp1, dict):
@@ -2075,8 +2629,9 @@ async def _materialize_r1_milestone(sym: str, plan: dict) -> None:
 #
 # Слой ТОЛЬКО собирает доказательства. Отсюда не вызываются set_trading_stop,
 # place_order, cancel_order и amend_order, не пишутся PROTECTION_CHANGE /
-# EXIT_ORDER_BOUND и не создаётся никакого «verified action» состояния: решение о
-# том, как sticky-милестоуны управляют защитой, принадлежит LIVE-FIX8-D.
+# EXIT_ORDER_BOUND и не создаётся никакого «verified action» состояния: sticky
+# милестоун — evidence достигнутого УРОВНЯ, а состояние ДЕЙСТВИЯ защиты создаёт
+# только auto_breakeven_job после authoritative-readback.
 #
 # Границы чтений на один eligible lifecycle за один цикл:
 #   * пока durable якоря нет — 1 точный get_order_history + не более
@@ -2416,8 +2971,9 @@ async def _materialize_r2_milestone(sym: str, plan: dict) -> None:
 
     Милестоун только фиксирует факт достижения уровня 2R. Отсюда НЕ вызываются
     ``set_trading_stop`` / ``place_order`` / ``cancel_order`` / ``amend_order`` и
-    НЕ пишутся ``PROTECTION_CHANGE`` / ``EXIT_ORDER_BOUND``: политика Auto-BE и
-    Risk Cut на sticky-милестоуны в этом срезе не мигрируется.
+    НЕ пишутся ``PROTECTION_CHANGE`` / ``EXIT_ORDER_BOUND``: решение о действии
+    защиты принимает только :func:`auto_breakeven_job`, и принимает его по
+    полному шлюзу владения, текущего состояния биржи и durable-намерения.
     """
     event = build_r2_milestone_event(
         symbol=sym,
@@ -2465,8 +3021,8 @@ async def exit_binding_job(context: ContextTypes.DEFAULT_TYPE):
     материализуется durable милестоун 1R для lifecycle, у которого факт
     исполнения TP1 уже durable, а милестоун ещё не доказан. Этот шаг не читает
     Bybit и является ограниченным путём восстановления после краха между фактом
-    TP1 и милестоуном. Милестоун защиту не включает и exchange-запись не
-    вызывает; текущая политика Risk Cut / Auto-BE на sticky-1R не мигрируется.
+    TP1 и милестоуном. Сам милестоун защиту не включает и exchange-запись не
+    вызывает: действие защиты выполняет только :func:`auto_breakeven_job`.
 
     LIVE-FIX8-C2 добавляет ещё один ограниченный шаг доказательств — уровень 2R
     (см. :func:`_observe_r2_evidence`). Порядок фиксирован:
