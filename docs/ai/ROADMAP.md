@@ -16,18 +16,19 @@ This block is the authoritative current planning state. It outranks every histor
 **WHERE WE WERE**
 
 - Product roadmap HIGH-1 … HIGH-11: DONE.
-- Safety remediation LIVE-FIX8-A, LIVE-FIX8-B, LIVE-FIX8-C1, LIVE-FIX8-C2: ACCEPTED / COMMITTED / PUSHED.
+- Safety remediation LIVE-FIX8-A, LIVE-FIX8-B, LIVE-FIX8-C1, LIVE-FIX8-C2, LIVE-FIX8-D: ACCEPTED / COMMITTED / PUSHED, with LIVE-FIX8-D at `7dfef42`.
+- LIVE-FIX8-E — the integration / regression / final remediation acceptance checkpoint — was the last remaining remediation unit and had not started.
 
 **WHERE WE ARE**
 
-- Canonical repository checkpoint: `main` and `origin/main` @ `7dfef42` ("feat(protection): add milestone-driven verified auto protection").
-- Active operational focus: completing the [LIVE-FIX8 safety remediation](#current-live-fix8-safety-remediation-track) — not product MID work.
-- LIVE-FIX8-D is repository-complete: CODE READY, QA GREEN, ACCEPTED, COMMITTED and PUSHED at `7dfef42`. Repository-complete is not deployed.
-- LIVE-FIX8-E is the next remediation unit; it has not started.
-- The current fix state, LIVE-FIX8-D included, is **not** deployed, **not** runtime verified and **not** live accepted.
+- Canonical repository checkpoint: `main` and `origin/main` @ `1a82d63` ("test: add LIVE-FIX8 integration acceptance proof").
+- Active operational focus: the [LIVE-FIX8 safety remediation](#current-live-fix8-safety-remediation-track) production [release gate](#mandatory-post-fix-release-gate) — not product MID work.
+- LIVE-FIX8-E is repository-complete: CODE READY, QA GREEN, ACCEPTED, COMMITTED and PUSHED at `1a82d63`. Repository-complete is not deployed.
+- With LIVE-FIX8-E accepted, the whole LIVE-FIX8 remediation — units A, B, C1, C2, D and E — is now REPOSITORY-COMPLETE: every unit is ACCEPTED / COMMITTED / PUSHED.
+- The current fix state, LIVE-FIX8-E included, is **not** deployed, **not** runtime verified and **not** live accepted.
 - MID has not started, and no MID item may be opened while the [release gate](#mandatory-post-fix-release-gate) is incomplete.
 
-Status chain of the accepted state at `7dfef42`:
+Status chain of the accepted, repository-complete LIVE-FIX8 remediation (units A–E) at `1a82d63`:
 
 | Status | Value |
 | --- | --- |
@@ -44,14 +45,16 @@ Each status is defined normatively in [WORKFLOW.md](WORKFLOW.md#status-semantics
 
 **WHERE WE GO NEXT**
 
-1. LIVE-FIX8-E — integration / regression / final remediation acceptance checkpoint; its contract is issued separately by the architect.
-2. Commit and push the accepted, completed remediation state.
-3. Deploy that accepted state to the production server.
-4. Runtime verification and any required live verification, separately authorized.
+The next action is no longer an implementation unit: LIVE-FIX8-E is accepted, committed and pushed at `1a82d63`, and the earlier "implement E, then commit and push" steps are complete. The next operational phase is the [mandatory post-fix release gate](#mandatory-post-fix-release-gate):
+
+1. Deploy the accepted, repository-complete LIVE-FIX8 state (`1a82d63`) to the production server.
+2. Prove the intended commit/version is the one actually running.
+3. Runtime verification and any required live verification, separately authorized.
+4. Required live acceptance for this safety-critical fix.
 5. Architect / control-plane acceptance of that production evidence.
 6. MID-1 — the first product roadmap item, only after the gate above is GREEN.
 
-None of steps 2–6 is claimed as achieved today, and step 1 has not started.
+None of steps 1–6 is claimed as achieved today: the next action is deployment, and DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED all remain NO / NOT PROVEN. There is no direct LIVE-FIX8-E → MID-1 and no direct repository-complete → MID-1 transition.
 
 ## Canonical product roadmap
 
@@ -109,13 +112,17 @@ For LIVE-FIX8-D the states DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED must not
 
 ### Next remediation unit
 
-**LIVE-FIX8-E** — STATUS: NOT STARTED / NEXT REMEDIATION UNIT.
+**None — LIVE-FIX8-E was the final remediation unit and is now repository-complete.**
 
-Roadmap-level purpose only: the integration / regression / final remediation acceptance checkpoint. Its exact implementation contract is issued separately by the architect, and detailed E implementation requirements are deliberately not invented here. Its scope must not be expanded from [NICE TO HAVE](#nice-to-have) items. In particular, the NICE-TO-HAVE milestone-based trailing concept (item C) is **not** the contract of LIVE-FIX8-E: a LIVE-FIX8 unit may consume already frozen sticky milestones for this specific safety remediation, while productized trailing profiles remain future scope until separately architected.
+**LIVE-FIX8-E** — STATUS: ACCEPTED / COMMITTED / PUSHED at `1a82d63`.
+
+Roadmap-level purpose: the integration / regression / final remediation acceptance checkpoint. Its exact implementation contract was issued separately by the architect, and detailed E implementation requirements are deliberately not restated here. Its scope was not expanded from [NICE TO HAVE](#nice-to-have) items; in particular, the NICE-TO-HAVE milestone-based trailing concept (item C) was **not** the contract of LIVE-FIX8-E: a LIVE-FIX8 unit may consume already frozen sticky milestones for this specific safety remediation, while productized trailing profiles remain future scope until separately architected.
+
+With LIVE-FIX8-E accepted, committed and pushed, the LIVE-FIX8 remediation (units A–E) is REPOSITORY-COMPLETE and there is no further remediation unit. The next operational step is the [mandatory post-fix release gate](#mandatory-post-fix-release-gate) — deploy → runtime verification → required live acceptance — not another remediation unit. Repository-complete is not deployed: DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED remain NO / NOT PROVEN.
 
 ## Mandatory post-fix release gate
 
-LIVE-FIX8-D is already accepted, committed and pushed at `7dfef42`. After LIVE-FIX8-E is accepted and the completed remediation repository state is committed and pushed, the project does **not** go directly to MID. The next operational phase is:
+The complete LIVE-FIX8 remediation (units A–E) is now accepted, committed and pushed at `1a82d63` — REPOSITORY-COMPLETE. Even so, the project does **not** go directly to MID: repository-complete is not deployed. The next operational phase is:
 
 1. Deploy the accepted LIVE-FIX8 repository state to the production server.
 2. Prove the intended commit/version is the one actually running.
@@ -125,9 +132,9 @@ LIVE-FIX8-D is already accepted, committed and pushed at `7dfef42`. After LIVE-F
 
 Only when this gate is GREEN may the project move to MID-1. Compact form:
 
-**LIVE-FIX8-D (repository-complete) → LIVE-FIX8-E → COMMIT/PUSH → DEPLOY → RUNTIME VERIFIED → REQUIRED LIVE ACCEPTANCE → GREEN → MID-1**
+**LIVE-FIX8 A–E (repository-complete, COMMITTED / PUSHED @ `1a82d63`) → DEPLOY (next) → RUNTIME VERIFIED → REQUIRED LIVE ACCEPTANCE → GREEN → MID-1**
 
-There is no direct LIVE-FIX8-E → MID-1 transition: deployment and server verification are a mandatory gate between the completed fix and MID. None of these future release states is claimed now — today the accepted state remains DEPLOYED: NO / NOT PROVEN, RUNTIME VERIFIED: NO / NOT PROVEN, LIVE ACCEPTED: NO / NOT PROVEN.
+There is no direct LIVE-FIX8-E → MID-1 transition and no direct repository-complete → MID-1 transition: deployment and server verification are a mandatory gate between the completed fix and MID. None of these future release states is claimed now — today the accepted state remains DEPLOYED: NO / NOT PROVEN, RUNTIME VERIFIED: NO / NOT PROVEN, LIVE ACCEPTED: NO / NOT PROVEN.
 
 ## HIGH
 
