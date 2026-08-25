@@ -5,7 +5,7 @@ This roadmap prioritizes future work; it is not authorization to combine items i
 This document carries two independent layers that must never be conflated:
 
 - the **canonical product roadmap**: HIGH → MID → LOW → NICE TO HAVE;
-- the **current safety remediation track**: LIVE-FIX8, a bounded temporary track that must be completed, deployed and verified before the project returns to MID.
+- the **LIVE-FIX8 safety remediation track**: a bounded temporary track that had to be completed, deployed and verified before the project returned to MID. It is now **CLOSED** — see the [authoritative current state](#authoritative-current-state).
 
 LIVE-FIX8 is not a replacement product roadmap. It never renumbers, replaces or absorbs MID, LOW or NICE TO HAVE.
 
@@ -16,19 +16,18 @@ This block is the authoritative current planning state. It outranks every histor
 **WHERE WE WERE**
 
 - Product roadmap HIGH-1 … HIGH-11: DONE.
-- Safety remediation LIVE-FIX8-A, LIVE-FIX8-B, LIVE-FIX8-C1, LIVE-FIX8-C2, LIVE-FIX8-D: ACCEPTED / COMMITTED / PUSHED, with LIVE-FIX8-D at `7dfef42`.
-- LIVE-FIX8-E — the integration / regression / final remediation acceptance checkpoint — was the last remaining remediation unit and had not started.
+- The whole LIVE-FIX8 safety remediation — units A, B, C1, C2 (at `9f71b57`), D (at `7dfef42`) and E (at `1a82d63`) — was ACCEPTED / COMMITTED / PUSHED and REPOSITORY-COMPLETE.
+- That repository-complete state was **not** yet deployed, runtime verified or live accepted; the remaining step was the [mandatory post-fix release gate](#mandatory-post-fix-release-gate) — deploy → runtime verification → required live acceptance.
 
 **WHERE WE ARE**
 
-- Canonical repository checkpoint: `main` and `origin/main` @ `1a82d63` ("test: add LIVE-FIX8 integration acceptance proof").
-- Active operational focus: the [LIVE-FIX8 safety remediation](#current-live-fix8-safety-remediation-track) production [release gate](#mandatory-post-fix-release-gate) — not product MID work.
-- LIVE-FIX8-E is repository-complete: CODE READY, QA GREEN, ACCEPTED, COMMITTED and PUSHED at `1a82d63`. Repository-complete is not deployed.
-- With LIVE-FIX8-E accepted, the whole LIVE-FIX8 remediation — units A, B, C1, C2, D and E — is now REPOSITORY-COMPLETE: every unit is ACCEPTED / COMMITTED / PUSHED.
-- The current fix state, LIVE-FIX8-E included, is **not** deployed, **not** runtime verified and **not** live accepted.
-- MID has not started, and no MID item may be opened while the [release gate](#mandatory-post-fix-release-gate) is incomplete.
+- Canonical production / repository release: `main` and `origin/main` @ `0d1adb0`, deployed to the production server. LIVE-FIX8-E keeps its own repository commit identity `1a82d63`; the deployed release `0d1adb0` carries the whole accepted remediation.
+- The whole LIVE-FIX8 remediation — units A, B, C1, C2, D and E — is REPOSITORY-COMPLETE, DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED. **LIVE-FIX8 is CLOSED.**
+- LIVE Risk Cut acceptance is **GREEN, proven on real Bybit**. The observed production chain was: confirmed BTC entry → owned TP1 fill → durable 1R milestone → Risk Cut (-0.3R) → authoritative write verification → a real exchange-side stop at the requested level.
+- Auto-BE: offline / integration proof is GREEN; a live 2R → Auto-BE event has **not yet been observed**. The Auto-BE live observation is DEFERRED and **non-blocking**, and Auto-BE is **not** claimed as observed live. See the [deferred Auto-BE live observation](#deferred-auto-be-live-observation).
+- MID has not started; MID-1 is the next unit.
 
-Status chain of the accepted, repository-complete LIVE-FIX8 remediation (units A–E) at `1a82d63`:
+Status chain of the LIVE-FIX8 remediation (units A–E), deployed and live accepted at `0d1adb0`:
 
 | Status | Value |
 | --- | --- |
@@ -37,24 +36,19 @@ Status chain of the accepted, repository-complete LIVE-FIX8 remediation (units A
 | ACCEPTED | YES |
 | COMMITTED | YES |
 | PUSHED | YES |
-| DEPLOYED | NO / NOT PROVEN |
-| RUNTIME VERIFIED | NO / NOT PROVEN |
-| LIVE ACCEPTED | NO / NOT PROVEN |
+| DEPLOYED | YES |
+| RUNTIME VERIFIED | YES |
+| LIVE ACCEPTED | YES |
 
-Each status is defined normatively in [WORKFLOW.md](WORKFLOW.md#status-semantics); no status implies the next one.
+Each status is defined normatively in [WORKFLOW.md](WORKFLOW.md#status-semantics), and each was proven by its own evidence rather than inferred from the previous one. This whole-remediation acceptance does not retroactively assert that Auto-BE was observed live: the LIVE ACCEPTED state rests on the LIVE Risk Cut proof and sufficient combined repository / integration / production evidence, with the Auto-BE live observation deferred as non-blocking.
 
 **WHERE WE GO NEXT**
 
-The next action is no longer an implementation unit: LIVE-FIX8-E is accepted, committed and pushed at `1a82d63`, and the earlier "implement E, then commit and push" steps are complete. The next operational phase is the [mandatory post-fix release gate](#mandatory-post-fix-release-gate):
+LIVE-FIX8 is CLOSED and the [mandatory post-fix release gate](#mandatory-post-fix-release-gate) is GREEN, so the next action is the first product roadmap item:
 
-1. Deploy the accepted, repository-complete LIVE-FIX8 state (`1a82d63`) to the production server.
-2. Prove the intended commit/version is the one actually running.
-3. Runtime verification and any required live verification, separately authorized.
-4. Required live acceptance for this safety-critical fix.
-5. Architect / control-plane acceptance of that production evidence.
-6. MID-1 — the first product roadmap item, only after the gate above is GREEN.
+- **[MID-1](#mid) — Planned vs actual risk — NEXT / NOT STARTED.** It is not opened by this closeout and must be taken as its own [unit of work](../../AGENTS.md#unit-of-work).
 
-None of steps 1–6 is claimed as achieved today: the next action is deployment, and DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED all remain NO / NOT PROVEN. There is no direct LIVE-FIX8-E → MID-1 and no direct repository-complete → MID-1 transition.
+Compact sequence: **LIVE-FIX8 CLOSED → MID-1 (NEXT / NOT STARTED)**. The only remaining LIVE-FIX8 item is the deferred, non-blocking [Auto-BE live observation](#deferred-auto-be-live-observation); it is an operational observation, neither a remediation unit nor a blocker for MID-1.
 
 ## Canonical product roadmap
 
@@ -63,15 +57,15 @@ Architect-authoritative order of the product blocks; it does not change:
 **[HIGH](#high) → [MID](#mid) → [LOW](#low) → [NICE TO HAVE](#nice-to-have)**
 
 - [HIGH](#high) — safety-critical core. HIGH-1 … HIGH-11 are DONE.
-- [MID](#mid) — operator usability / observability / protection. NOT STARTED; the next product block **after** the whole LIVE-FIX8 remediation is deployed and successfully verified.
+- [MID](#mid) — operator usability / observability / protection. NOT STARTED. With the whole LIVE-FIX8 remediation now deployed and successfully verified (CLOSED), MID is the current product block and MID-1 is the next unit.
 - [LOW](#low) — analytics / later development. NOT STARTED.
 - [NICE TO HAVE](#nice-to-have) — future concepts only, never current implementation scope.
 
-The [LIVE-FIX8 track](#current-live-fix8-safety-remediation-track) is a temporary safety remediation track that runs *before* the return to MID. It is not a product block and does not substitute for MID, LOW or NICE TO HAVE.
+The [LIVE-FIX8 track](#current-live-fix8-safety-remediation-track) is a temporary safety remediation track that ran *before* the return to MID and is now CLOSED. It is not a product block and does not substitute for MID, LOW or NICE TO HAVE.
 
 ## Current LIVE-FIX8 safety remediation track
 
-The current operational focus. This track is temporary, bounded and safety-critical: it exists to finish the sticky-R protection remediation, not to extend the product. It must be completed, deployed and verified before MID-1 — see [the release gate](#mandatory-post-fix-release-gate).
+This track was the safety remediation focus that preceded the return to MID. It is temporary, bounded and safety-critical: it existed to finish the sticky-R protection remediation, not to extend the product. It is now **CLOSED** — repository-complete, deployed at `0d1adb0`, runtime verified and live accepted; the [release gate](#mandatory-post-fix-release-gate) is GREEN and MID-1 is the next unit.
 
 ### Accepted and frozen units
 
@@ -97,7 +91,7 @@ C2 additionally freezes:
 - `2R_PROVEN` != `AUTO_BE_VERIFIED`;
 - the first overlapping partial minute may legitimately remain `NOT_PROVEN`.
 
-For LIVE-FIX8-C2 the states DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED must not be claimed; see the [status chain](#authoritative-current-state).
+LIVE-FIX8-C2 has no separate per-unit deployment: DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED are recorded for the whole LIVE-FIX8 remediation — now GREEN and CLOSED — in the [authoritative current state](#authoritative-current-state), not claimed unit by unit.
 
 **LIVE-FIX8-D** — STATUS: ACCEPTED / COMMITTED / PUSHED at `7dfef42`.
 Invariant: the right to an automatic protection action comes only from the durable sticky milestone of the confirmed lifecycle (1R → Risk Cut, 2R → Auto-BE) and never from the transient current R; the action is proven performed only by an authoritative readback of the actual protection level on the same position, never by an accepted write response.
@@ -108,7 +102,7 @@ D additionally freezes:
 - `1R_PROVEN` / `2R_PROVEN` (price-level evidence) != protection-action state;
 - no new exchange write kind: no order placement, cancellation, close or leverage change.
 
-For LIVE-FIX8-D the states DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED must not be claimed; see the [status chain](#authoritative-current-state).
+LIVE-FIX8-D has no separate per-unit deployment: DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED are recorded for the whole LIVE-FIX8 remediation — now GREEN and CLOSED — in the [authoritative current state](#authoritative-current-state), not claimed unit by unit.
 
 ### Next remediation unit
 
@@ -118,23 +112,35 @@ For LIVE-FIX8-D the states DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED must not
 
 Roadmap-level purpose: the integration / regression / final remediation acceptance checkpoint. Its exact implementation contract was issued separately by the architect, and detailed E implementation requirements are deliberately not restated here. Its scope was not expanded from [NICE TO HAVE](#nice-to-have) items; in particular, the NICE-TO-HAVE milestone-based trailing concept (item C) was **not** the contract of LIVE-FIX8-E: a LIVE-FIX8 unit may consume already frozen sticky milestones for this specific safety remediation, while productized trailing profiles remain future scope until separately architected.
 
-With LIVE-FIX8-E accepted, committed and pushed, the LIVE-FIX8 remediation (units A–E) is REPOSITORY-COMPLETE and there is no further remediation unit. The next operational step is the [mandatory post-fix release gate](#mandatory-post-fix-release-gate) — deploy → runtime verification → required live acceptance — not another remediation unit. Repository-complete is not deployed: DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED remain NO / NOT PROVEN.
+With LIVE-FIX8-E accepted, committed and pushed, the LIVE-FIX8 remediation (units A–E) reached REPOSITORY-COMPLETE and there is no further remediation unit. It has since been deployed at `0d1adb0`, runtime verified and live accepted: the [mandatory post-fix release gate](#mandatory-post-fix-release-gate) is GREEN and **LIVE-FIX8 is CLOSED**. The next unit is the first product roadmap item, [MID-1](#mid) (NOT STARTED) — not another remediation unit.
+
+### Deferred Auto-BE live observation
+
+This is a non-blocking operational observation, **not** a roadmap stage and **not** a remediation unit. [LIVE-FIX8-D](#accepted-and-frozen-units) froze the Auto-BE protection action (2R → Auto-BE), and its offline / integration proof is GREEN. Its live behaviour has **not yet been observed on a real 2R → Auto-BE event**, so Auto-BE is **not** claimed as observed live. Forced short-stop live testing to manufacture such an event was explicitly waived after sufficient combined repository, integration and production evidence — including the LIVE Risk Cut proven GREEN on real Bybit.
+
+This deferred observation is explicitly non-blocking:
+
+- it does **not** reopen LIVE-FIX8, which is CLOSED;
+- it does **not** block MID-1 or any product work;
+- no special-money or forced test trade is required.
+
+If a future natural qualifying trade reaches a factual 2R and Auto-BE fires, capture the Telegram / journal evidence at that time. Any future actual Auto-BE defect would be handled on its own evidence as a separate [unit of work](../../AGENTS.md#unit-of-work). Until then this remains an observation only, and it creates no new roadmap stage.
 
 ## Mandatory post-fix release gate
 
-The complete LIVE-FIX8 remediation (units A–E) is now accepted, committed and pushed at `1a82d63` — REPOSITORY-COMPLETE. Even so, the project does **not** go directly to MID: repository-complete is not deployed. The next operational phase is:
+The complete LIVE-FIX8 remediation (units A–E) reached REPOSITORY-COMPLETE (COMMITTED / PUSHED, with E at `1a82d63`). Because repository-complete is not deployed, the project did **not** go directly to MID; it first had to pass this mandatory release gate, and every step is now DONE:
 
-1. Deploy the accepted LIVE-FIX8 repository state to the production server.
-2. Prove the intended commit/version is the one actually running.
-3. Perform the separately authorized runtime verification / smoke checks.
-4. Perform the required live acceptance for this safety-critical fix.
-5. Obtain architect / control-plane acceptance of that production evidence.
+1. Deploy the accepted LIVE-FIX8 repository state to the production server. — DONE at `0d1adb0`.
+2. Prove the intended commit/version is the one actually running. — DONE.
+3. Perform the separately authorized runtime verification / smoke checks. — DONE (RUNTIME VERIFIED).
+4. Perform the required live acceptance for this safety-critical fix. — DONE (LIVE ACCEPTED; LIVE Risk Cut proven GREEN on real Bybit).
+5. Obtain architect / control-plane acceptance of that production evidence. — DONE (production accepted).
 
-Only when this gate is GREEN may the project move to MID-1. Compact form:
+This gate is now **GREEN**, so the project may move to MID-1. Compact form:
 
-**LIVE-FIX8 A–E (repository-complete, COMMITTED / PUSHED @ `1a82d63`) → DEPLOY (next) → RUNTIME VERIFIED → REQUIRED LIVE ACCEPTANCE → GREEN → MID-1**
+**LIVE-FIX8 A–E (repository-complete, COMMITTED / PUSHED, E @ `1a82d63`) → DEPLOYED @ `0d1adb0` → RUNTIME VERIFIED → REQUIRED LIVE ACCEPTANCE → GREEN → MID-1 (NEXT / NOT STARTED)**
 
-There is no direct LIVE-FIX8-E → MID-1 transition and no direct repository-complete → MID-1 transition: deployment and server verification are a mandatory gate between the completed fix and MID. None of these future release states is claimed now — today the accepted state remains DEPLOYED: NO / NOT PROVEN, RUNTIME VERIFIED: NO / NOT PROVEN, LIVE ACCEPTED: NO / NOT PROVEN.
+There was no direct LIVE-FIX8-E → MID-1 transition and no direct repository-complete → MID-1 transition: deployment and server verification were a mandatory gate between the completed fix and MID, and that gate has been satisfied. The one still-open item is the deferred, non-blocking [Auto-BE live observation](#deferred-auto-be-live-observation); it does not reopen this gate and does not block MID-1.
 
 ## HIGH
 
@@ -1099,17 +1105,18 @@ this subsection.
 
 - The production server is not updated after every HIGH commit. Merging is not deploying.
 - Commit, merge, release review, deployment, and runtime verification require explicit authorization; review evidence does not authorize any of them.
-- The current release sequence for the active safety remediation is the [mandatory post-fix release gate](#mandatory-post-fix-release-gate). It outranks the historical batching pointer below.
+- The release sequence for the LIVE-FIX8 safety remediation was the [mandatory post-fix release gate](#mandatory-post-fix-release-gate), now GREEN and satisfied. It outranks the historical batching pointer below.
 - Historical batching context, superseded as current planning context: HIGH-4 through HIGH-11 were batched into one production release to be reviewed together before deployment, with the joint release review of the whole batch named as the next step while HIGH-11 was still awaiting independent review. HIGH-11 is now DONE, so that pointer is no longer the current next step and does not compete with the gate above.
 - After a release review passes, an authorized operator performs one deployment, then a runtime smoke check, then a period of observation.
 
 ## MID
 
-Operator usability / observability / protection. **NOT STARTED.** MID is the next
-product roadmap block after the entire [LIVE-FIX8 remediation](#current-live-fix8-safety-remediation-track)
-has been deployed and successfully verified through the [release gate](#mandatory-post-fix-release-gate).
-No MID item may be started or marked as current implementation while that gate is
-incomplete.
+Operator usability / observability / protection. **NOT STARTED.** With the entire
+[LIVE-FIX8 remediation](#current-live-fix8-safety-remediation-track) deployed and
+successfully verified through the [release gate](#mandatory-post-fix-release-gate)
+(now GREEN, LIVE-FIX8 CLOSED), MID is the current product roadmap block and
+**MID-1 is the next unit — NOT STARTED**. Each MID item remains its own
+[unit of work](../../AGENTS.md#unit-of-work); MID-1 is not opened by this closeout.
 
 **MID-1 — Planned vs actual risk.** Show after execution: planned entry, actual
 entry, planned risk, actual risk, and the difference; also notional, required
