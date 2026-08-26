@@ -12,7 +12,7 @@ from telegram import error as tg_error
 from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID, REQUIRE_MARKET_CONFIRM, MARKET_PREVIEW_TTL_SEC
-from core.database import update_risk_for_symbol, log_source, pop_market_pending, _MARKET_PENDING
+from core.database import update_risk_for_symbol, log_source, pop_market_pending, _MARKET_PENDING, is_trading_enabled
 from core.journal import append_event, extract_order_ids, ENTRY_PLACED
 from core.sl_percent import (
     SL_PERCENT, SignalSLError, compute_percent_sl, decimal_from_price,
@@ -500,6 +500,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("buy_market|"):
             _, sym, side, sl, qty_str, lev_str = data.split("|")
             lev = int(float(lev_str))
+
+            # S0-R1 fail-closed: /stop (trading_enabled=False) обязан заблокировать
+            # исполнение УЖЕ созданного market-подтверждения ДО любого сайд-эффекта
+            # входа — до мутирующего preflight (set_leverage_safe), до
+            # place_market_with_retry, до записи market_pending на диск и до
+            # ENTRY_PLACED. Гейт signal_parser этот путь не покрывает: callback
+            # переживает разбор сигнала, а оба направления (LONG/SHORT) исполняются
+            # именно здесь. Гейт независим от TTL превью и защиту уже открытых
+            # позиций (Risk Cut / Auto-BE) не трогает.
+            if not is_trading_enabled():
+                logging.info(
+                    "buy_market %s blocked: trading disabled (/stop) — вход не исполнен",
+                    sym,
+                )
+                await query.edit_message_text(
+                    format_warning_message(
+                        [
+                            "Торговля на паузе (/stop).",
+                            "Вход НЕ исполнен: ордер на биржу не отправлен.",
+                        ],
+                        context=f"{sym} · {side} · Market",
+                        action="возобновите торговлю через /start и отправьте сигнал заново",
+                        blocked=True,
+                    ),
+                    parse_mode='HTML',
+                )
+                return
 
             # TTL-защита: активна только в режиме preview-confirm.
             if REQUIRE_MARKET_CONFIRM and not _preview_is_fresh(sym, MARKET_PREVIEW_TTL_SEC):

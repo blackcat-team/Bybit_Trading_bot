@@ -378,12 +378,16 @@ def _tp_ladder_order(*, symbol=SYMBOL, exit_id=TP1_ID, idx=0, side="Sell"):
 
 async def _run(monkeypatch, tmp_path, *, positions, events=None, orders=None,
                readback=None, tick="0.01", write_result=None,
-               write_exc=None, instruments_exc=None):
+               write_exc=None, instruments_exc=None, trading_enabled=True):
     """Один прогон auto_breakeven_job против детерминированных снимков.
 
     *positions* — снимок цикла (общий ``get_positions``). *readback* — список
     снимков, которые отдаёт per-symbol readback по порядку; последний
     повторяется. ``None`` означает «readback видит тот же снимок цикла».
+
+    *trading_enabled* монтирует ``jobs.is_trading_enabled``: защита уже открытых
+    позиций обязана работать одинаково при включённой и выключенной торговле,
+    поэтому флаг сделан параметром прогона (pre-MID safety S0).
     """
     if events is not None:
         _write_events(monkeypatch, tmp_path, *events)
@@ -438,7 +442,7 @@ async def _run(monkeypatch, tmp_path, *, positions, events=None, orders=None,
     async def api_call(fn, **kwargs):
         return await fn(**kwargs)
 
-    monkeypatch.setattr(jobs, "is_trading_enabled", lambda: True)
+    monkeypatch.setattr(jobs, "is_trading_enabled", lambda: trading_enabled)
     monkeypatch.setattr(jobs, "session", fake_session)
     monkeypatch.setattr(jobs, "bybit_call", api_call)
     monkeypatch.setattr(jobs, "send_alert", AsyncMock())
@@ -1797,3 +1801,137 @@ async def test_r2_supersedes_risk_cut_after_not_applied_resolution(
     assert _verified_events()[-1]["action_kind"] == journal.PROTECTION_SOURCE_AUTO_BE
     assert _plan() is not None
     assert _plan()["milestones"] == {"r1_proven": True, "r2_proven": True}
+
+
+# =========================================================================
+# L. /stop НЕ отключает защиту уже открытых позиций (pre-MID safety S0)
+# =========================================================================
+#
+# /stop = trading_enabled=False приостанавливает ТОЛЬКО приём новых сигналов и
+# исполнение новых входов; эти гейты живут в путях входа (parse_and_trade и
+# рыночный callback), а не в этом job. Защита УЖЕ открытых bot-managed позиций
+# (durable 1R → Risk Cut, durable 2R → Auto-BE) обязана продолжаться и при
+# выключенной торговле. Снятие прежнего гейта job'а новых прав на действие не
+# даёт: право по-прежнему только от durable-милестоуна подтверждённого
+# lifecycle, а входных ордеров job не размещает — это доказывает общий assert
+# ``calls["forbidden"] == []`` в :func:`_run` (place_order и др. запрещены).
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trading_enabled", [True, False],
+                         ids=["trading_on", "trading_off"])
+@pytest.mark.parametrize("events, level, action, milestone", [
+    (_R1_LONG, RISK_CUT_LONG, journal.PROTECTION_SOURCE_RISK_CUT,
+     journal.MILESTONE_1R),
+    (_R2_LONG, AUTO_BE_LONG, journal.PROTECTION_SOURCE_AUTO_BE,
+     journal.MILESTONE_2R),
+], ids=["durable_1r_risk_cut", "durable_2r_auto_be"])
+async def test_open_position_protection_runs_regardless_of_trading_flag(
+    monkeypatch, tmp_path, trading_enabled, events, level, action, milestone
+):
+    """L1 (A/B/E/H). Право на защиту от trading_enabled не зависит.
+
+    С выключенной торговлей eligible durable 1R по-прежнему исполняет Risk Cut,
+    а eligible durable 2R — Auto-BE; при включённой торговле поведение то же
+    (E). Ни одного входного ордера job при этом не создаёт (H).
+    """
+    calls = await _run(
+        monkeypatch, tmp_path,
+        positions=[_position(mark="100.1")], events=events,
+        readback=[[_position(mark="100.1", stop=level)]],
+        trading_enabled=trading_enabled,
+    )
+
+    assert _levels(calls) == [level]
+    assert _pending_events()[0]["action_kind"] == action
+    assert _pending_events()[0]["action_milestone"] == milestone
+    state = _action_state()
+    assert state["pending"] is None
+    assert state["verified"]["verified_stop_loss"] == Decimal(level)
+    assert state["verified"]["action_kind"] == action
+    # H: защитный job входных ордеров не размещает и не изменяет.
+    assert calls["forbidden"] == []
+
+
+@pytest.mark.asyncio
+async def test_disabled_trading_without_milestone_makes_zero_mutation(
+    monkeypatch, tmp_path
+):
+    """L2 (C). Торговля выключена + нет милестоуна → ноль записей и ноль чтений инструмента."""
+    calls = await _run(
+        monkeypatch, tmp_path,
+        positions=[_position(qty="10", mark="103")],
+        events=(_entry(), _confirmed(), _sl_binding()),
+        trading_enabled=False,
+    )
+
+    assert calls["writes"] == []
+    assert _pending_events() == []
+    # Милестоуна нет — инструмент ради действия не читают: биржа не мутируется.
+    assert calls["instruments"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("positions, events, orders, reason", [
+    ([_position(qty="5", mark="100.2"), _position(qty="5", mark="100.2")],
+     _R1_LONG, None, "ambiguous_identity"),
+    ([_position(entry="101", mark="100.2")], _R1_LONG, None, "wrong_avg_entry"),
+    ([_position(qty="10", mark="103")], (), None, "manual_unowned"),
+    ([_position(qty="10", mark="100.2")],
+     (*_R1_LONG,
+      {"event": journal.RECONCILED, "symbol": SYMBOL, "order_id": ENTRY_ID}),
+     None, "stale_reconciled"),
+    ([_position(mark="100.2")], _R1_LONG, [_sl_order(exit_id="foreign-sl")],
+     "unbound_child"),
+], ids=lambda value: value if isinstance(value, str) else "")
+async def test_disabled_trading_preserves_failclosed_behavior(
+    monkeypatch, tmp_path, positions, events, orders, reason
+):
+    """L3 (D). Выключенная торговля fail-closed по неоднозначной/чужой/устаревшей позиции не ослабляет."""
+    calls = await _run(
+        monkeypatch, tmp_path,
+        positions=positions, events=events, orders=orders,
+        trading_enabled=False,
+    )
+
+    assert calls["writes"] == [], reason
+    assert _pending_events() == [], reason
+    assert calls["forbidden"] == [], reason
+
+
+@pytest.mark.asyncio
+async def test_disabled_trading_keeps_auto_be_precedence_over_risk_cut(
+    monkeypatch, tmp_path
+):
+    """L4 (F). При выключенной торговле доказанный 2R по-прежнему приоритетнее 1R."""
+    calls = await _run(
+        monkeypatch, tmp_path,
+        positions=[_position(mark="100.1")], events=_R2_LONG,
+        readback=[[_position(mark="100.1", stop=AUTO_BE_LONG)]],
+        trading_enabled=False,
+    )
+
+    assert _levels(calls) == [AUTO_BE_LONG]
+    assert RISK_CUT_LONG not in _levels(calls)
+
+
+@pytest.mark.asyncio
+async def test_disabled_trading_keeps_authoritative_readback_and_one_write(
+    monkeypatch, tmp_path
+):
+    """L5 (G). Выключенная торговля authoritative-исход и one-write не ослабляет.
+
+    Принятый ответ + MISMATCH readback завершением не становится, запись ровно
+    одна, а незавершённое намерение остаётся для readback-first в след. цикле.
+    """
+    calls = await _run(
+        monkeypatch, tmp_path,
+        positions=[_position(mark="100.2")], events=_R1_LONG,
+        readback=[[_position(mark="100.2", stop="99")]],
+        trading_enabled=False,
+    )
+
+    assert len(calls["writes"]) == 1
+    assert _verified_events() == []
+    assert _action_state()["pending"]["requested_stop_loss"] == Decimal(RISK_CUT_LONG)
+    assert calls["forbidden"] == []

@@ -855,6 +855,12 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Автоматическое действие защиты по durable sticky-милестоунам (LIVE-FIX8-D).
 
+    Этот job защищает УЖЕ открытые bot-managed позиции и намеренно НЕ смотрит на
+    trading_enabled. /stop приостанавливает только приём новых сигналов и новых
+    входов (гейты живут в путях входа, напр. parse_and_trade), тогда как
+    управление риском живой позиции — durable 1R → Risk Cut, durable 2R →
+    Auto-BE — обязано продолжаться и при выключенной торговле.
+
     Право на действие даёт ТОЛЬКО durable милестоун подтверждённого lifecycle:
 
     1. доказан 2R                 → Auto-BE (вход + 0.05R, динамический offset);
@@ -875,7 +881,12 @@ async def auto_breakeven_job(context: ContextTypes.DEFAULT_TYPE):
         → РОВНО ОДНА попытка set_trading_stop
         → authoritative readback решает VERIFIED / MISMATCH / UNVERIFIED / REJECTED
     """
-    if not is_trading_enabled(): return
+    # Гейта по trading_enabled здесь нет намеренно (см. docstring): пауза приёма
+    # сигналов не отменяет защиту уже открытой позиции. Снятие прежнего гейта
+    # новых прав на действие НЕ даёт — право по-прежнему исходит только из
+    # durable-милестоуна подтверждённого lifecycle, а сам job входных ордеров не
+    # размещает: единственная возможная запись это set_trading_stop по уже
+    # владеемой позиции.
 
     try:
         _pos_resp = await bybit_call(session.get_positions, category="linear", settleCoin="USDT")
