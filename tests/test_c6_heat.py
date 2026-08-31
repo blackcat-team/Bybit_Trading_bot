@@ -270,3 +270,355 @@ class TestHeatQueueDatabase:
     def test_remove_nonexistent_returns_false(self, tmp_path):
         db = self._fresh_db(tmp_path)
         assert db.remove_from_heat_queue("UNKNOWNUSDT") is False
+
+
+# ── Tests: compute_current_heat source tagging (S1) ──────────────────────────
+
+class TestComputeCurrentHeatSource:
+    """compute_current_heat помечает недоступность источником api_error, не live."""
+
+    @pytest.mark.asyncio
+    async def test_api_exception_yields_api_error_source(self):
+        """Сбой авторитетного чтения позиций → source='api_error' (НЕ 'live').
+
+        Числовое значение при этом — лишь заполнитель; ключевой факт в том, что
+        источник НЕ 'live', и слой применения обязан трактовать его fail-closed.
+        """
+        fake_tc = MagicMock()
+        fake_tc.session = MagicMock()
+        with patch("core.heat.MAX_TOTAL_HEAT_USDT", 500.0), \
+             patch.dict(sys.modules, {"core.trading_core": fake_tc}), \
+             patch("core.bybit_call.bybit_call",
+                   new=AsyncMock(side_effect=RuntimeError("API down"))):
+            from core.heat import compute_current_heat
+            _heat_value, source = await compute_current_heat()
+        assert source == "api_error"
+        assert source != "live"
+
+    @pytest.mark.asyncio
+    async def test_disabled_yields_disabled_source(self):
+        """MAX<=0 → source='disabled' (быстрый выход, без чтения биржи)."""
+        with patch("core.heat.MAX_TOTAL_HEAT_USDT", 0):
+            from core.heat import compute_current_heat
+            _heat_value, source = await compute_current_heat()
+        assert source == "disabled"
+
+
+# ── Tests: enforce_heat fail-closed on unknown heat (S1) ─────────────────────
+
+class TestEnforceHeatUnknownFailsClosed:
+    """Неизвестный/непроверенный текущий heat → fail-closed для нового входа."""
+
+    @pytest.mark.asyncio
+    async def test_api_error_blocks_without_limit_arithmetic(self):
+        """D: MAX>0 + api_error → (False,'unavailable:...'), НЕ 'ok'/'rejected'/'queued'.
+
+        До S1 enforce_heat трактовал заполнитель 0.0 как current heat: при
+        new_risk<=limit возвращалось (True,'ok') и вход разрешался. Теперь блок,
+        и reason отличается от обычного превышения лимита.
+        """
+        with patch("core.heat.MAX_TOTAL_HEAT_USDT", 500.0), \
+             patch("core.heat.HEAT_ACTION", "reject"), \
+             patch("core.heat.compute_current_heat",
+                   new=AsyncMock(return_value=(0.0, "api_error"))), \
+             patch("core.notifier.send_alert", new=AsyncMock(return_value=True)):
+            from core.heat import enforce_heat
+            allowed, reason = await enforce_heat(
+                50.0, {"sym": "BTCUSDT"}, MagicMock(), "0"
+            )
+        assert allowed is False
+        assert reason.startswith("unavailable")
+        assert not reason.startswith("rejected")
+        assert not reason.startswith("queued")
+        assert reason != "ok"
+
+    @pytest.mark.asyncio
+    async def test_api_error_alert_truthful_no_fabricated_values(self):
+        """F: алерт правдив (heat не удалось проверить) и без вымышленных current/after."""
+        sent = []
+
+        async def _capture(bot, owner, level, cls, msg, dedup_key, **kw):
+            sent.append((msg, dedup_key))
+            return True
+
+        with patch("core.heat.MAX_TOTAL_HEAT_USDT", 500.0), \
+             patch("core.heat.HEAT_ACTION", "reject"), \
+             patch("core.heat.compute_current_heat",
+                   new=AsyncMock(return_value=(0.0, "api_error"))), \
+             patch("core.notifier.send_alert", new=_capture):
+            from core.heat import enforce_heat
+            await enforce_heat(50.0, {"sym": "ETHUSDT"}, MagicMock(), "0")
+
+        assert len(sent) == 1
+        alert_msg, dedup_key = sent[0]
+        assert "не удалось проверить" in alert_msg
+        assert "не разрешён" in alert_msg
+        # Никакого ложного расчёта превышения лимита и никаких чисел current/after.
+        assert "Лимит heat" not in alert_msg
+        assert "=" not in alert_msg
+        assert dedup_key == "heat_unavailable_ETHUSDT"
+
+    @pytest.mark.asyncio
+    async def test_api_error_with_queue_action_blocks_and_does_not_queue(self):
+        """E: api_error + HEAT_ACTION='queue' → всё равно blocked, в очередь НЕ ставится."""
+        added = []
+        with patch("core.heat.MAX_TOTAL_HEAT_USDT", 500.0), \
+             patch("core.heat.HEAT_ACTION", "queue"), \
+             patch("core.heat.HEAT_QUEUE_TTL_MIN", 30), \
+             patch("core.heat.add_to_heat_queue", new=lambda item: added.append(item)), \
+             patch("core.heat.compute_current_heat",
+                   new=AsyncMock(return_value=(0.0, "api_error"))), \
+             patch("core.notifier.send_alert", new=AsyncMock(return_value=True)):
+            from core.heat import enforce_heat
+            allowed, reason = await enforce_heat(
+                50.0,
+                {"sym": "SOLUSDT", "side": "LONG", "risk_usd": 50.0},
+                MagicMock(), "0",
+            )
+        assert allowed is False
+        assert reason.startswith("unavailable")
+        assert added == [], "Неизвестный heat не ставится в очередь"
+
+    @pytest.mark.asyncio
+    async def test_non_live_source_also_fails_closed(self):
+        """Любой не-live источник (не только api_error) трактуется как heat неизвестен."""
+        with patch("core.heat.MAX_TOTAL_HEAT_USDT", 500.0), \
+             patch("core.heat.HEAT_ACTION", "reject"), \
+             patch("core.heat.compute_current_heat",
+                   new=AsyncMock(return_value=(0.0, "disabled"))), \
+             patch("core.notifier.send_alert", new=AsyncMock(return_value=True)):
+            from core.heat import enforce_heat
+            allowed, reason = await enforce_heat(
+                50.0, {"sym": "BTCUSDT"}, MagicMock(), "0"
+            )
+        assert allowed is False
+        assert reason.startswith("unavailable")
+
+
+# ── Tests: _validated_active_positions (S1-R2 Blocker #2, fail-closed) ────────
+
+class TestValidatedActivePositions:
+    """source="live" допускается ТОЛЬКО для доказанно успешного и структурно
+    валидного снимка позиций. Любой недоказанный снимок → None (fail-closed):
+    неизвестное не выдаётся за нулевой риск."""
+
+    @pytest.mark.parametrize("resp", [
+        None,                                   # ответ не словарь
+        ["not", "a", "dict"],                   # ответ не словарь
+        # неуспешный конверт (retCode != 0): result.list относится к ошибке
+        {"retCode": 10001, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "0.1", "avgPrice": "40000", "stopLoss": ""}]}},
+        # retCode отсутствует вовсе → конверт не подтверждён
+        {"result": {"list": []}},
+        # retCode = "0" строкой (не int) → не подтверждён
+        {"retCode": "0", "result": {"list": []}},
+        # result не словарь
+        {"retCode": 0, "result": [1, 2, 3]},
+        # result.list не список
+        {"retCode": 0, "result": {"list": "nope"}},
+        # строка позиции не словарь
+        {"retCode": 0, "result": {"list": ["notadict"]}},
+        # size = Infinity (malformed)
+        {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "Infinity", "avgPrice": "40000", "stopLoss": ""}]}},
+        # size = NaN (malformed)
+        {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "NaN", "avgPrice": "40000", "stopLoss": ""}]}},
+        # size отсутствует (MISSING)
+        {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "avgPrice": "40000", "stopLoss": ""}]}},
+        # активная позиция без непустого symbol
+        {"retCode": 0, "result": {"list": [
+            {"symbol": "", "size": "0.1", "avgPrice": "40000", "stopLoss": ""}]}},
+        # SL задан, но avgPrice не разбирается (malformed)
+        {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "0.1", "avgPrice": "abc", "stopLoss": "39000"}]}},
+        # SL задан, но avgPrice = 0 (не положительный) → цена входа не доказана
+        {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "0.1", "avgPrice": "0", "stopLoss": "39000"}]}},
+        # stopLoss malformed
+        {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "0.1", "avgPrice": "40000", "stopLoss": "abc"}]}},
+    ])
+    def test_untrusted_snapshot_returns_none(self, resp):
+        from core.heat import _validated_active_positions
+        assert _validated_active_positions(resp) is None
+
+    def test_empty_list_is_trusted_empty(self):
+        """Доказанно пустой снимок доверен: пустой список, не None."""
+        from core.heat import _validated_active_positions
+        assert _validated_active_positions({"retCode": 0, "result": {"list": []}}) == []
+
+    def test_zero_size_row_skipped_but_trusted(self):
+        """Строка size=0 — закрытый слот: пропущена, снимок остаётся доверенным."""
+        from core.heat import _validated_active_positions
+        resp = {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "0", "avgPrice": "", "stopLoss": ""}]}}
+        assert _validated_active_positions(resp) == []
+
+    def test_valid_sl_row_accepted(self):
+        from core.heat import _validated_active_positions
+        resp = {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "0.1", "avgPrice": "40000", "stopLoss": "39000"}]}}
+        active = _validated_active_positions(resp)
+        assert isinstance(active, list) and len(active) == 1
+
+    def test_no_sl_row_accepted(self):
+        """Пустой SL допустим: вклад позиции считается по risk_mapping."""
+        from core.heat import _validated_active_positions
+        resp = {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "0.1", "avgPrice": "40000", "stopLoss": ""}]}}
+        active = _validated_active_positions(resp)
+        assert isinstance(active, list) and len(active) == 1
+
+
+# ── Tests: compute_current_heat validated source (S1-R2 Blocker #2) ──────────
+
+def _run_heat(coro):
+    import asyncio
+    return asyncio.run(coro)
+
+
+def _run_heat_call(target_name, *args, max_heat, snapshot, pending=None,
+                   risk_map=None, **kwargs):
+    """Выполняет async-функцию из core.heat под контролируемым состоянием.
+
+    Вместо мутации разделяемого core.database в sys.modules внедряется
+    самодостаточный фейковый модуль core.database с РЕАЛЬНЫМИ dict
+    ``_MARKET_PENDING``/``RISK_MAPPING``: heat читает их через ленивый
+    ``from core.database import``. Это устойчиво к тому, что соседние тест-файлы
+    подменяют core.database заглушкой MagicMock через ``sys.modules.setdefault``
+    (тогда мутация dict была бы no-op на mock-атрибуте, а ``.items()`` mock-а
+    итерируется как пустой). ``snapshot`` — ответ get_positions (dict) либо
+    исключение (side_effect).
+    """
+    import types
+    fake_db = types.ModuleType("core.database")
+    fake_db._MARKET_PENDING = dict(pending or {})
+    fake_db.RISK_MAPPING = dict(risk_map or {})
+    fake_db.add_to_heat_queue = lambda item: None
+    if isinstance(snapshot, BaseException):
+        heat_call = AsyncMock(side_effect=snapshot)
+    else:
+        heat_call = AsyncMock(return_value=snapshot)
+    import core.heat as heat_mod  # кэшируем реальный core.heat до подмены core.database
+    with patch("core.heat.MAX_TOTAL_HEAT_USDT", max_heat), \
+         patch.dict(sys.modules, {"core.database": fake_db}), \
+         patch("core.bybit_call.bybit_call", new=heat_call):
+        target = getattr(heat_mod, target_name)
+        return _run_heat(target(*args, **kwargs))
+
+
+class TestComputeCurrentHeatValidatedSource:
+    """compute_current_heat помечает live ТОЛЬКО для доказанного снимка;
+    неуспешный конверт или битые поля → api_error (fail-closed)."""
+
+    def _run(self, resp, *, max_heat=500.0, pending=None, risk_map=None):
+        return _run_heat_call(
+            "compute_current_heat", max_heat=max_heat, snapshot=resp,
+            pending=pending, risk_map=risk_map,
+        )
+
+    def test_valid_sl_snapshot_is_live_with_correct_heat(self):
+        resp = {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "0.1", "avgPrice": "40000", "stopLoss": "39000"}]}}
+        heat, source = self._run(resp)
+        assert source == "live"
+        assert abs(heat - 100.0) < 1e-6
+
+    def test_empty_snapshot_is_live_zero(self):
+        resp = {"retCode": 0, "result": {"list": []}}
+        heat, source = self._run(resp)
+        assert source == "live"
+        assert heat == 0.0
+
+    def test_nonsuccess_envelope_is_api_error(self):
+        """retCode != 0 при валидной по форме list → НЕ live (fail-closed)."""
+        resp = {"retCode": 10001, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "0.1", "avgPrice": "40000", "stopLoss": "39000"}]}}
+        heat, source = self._run(resp)
+        assert source == "api_error"
+        assert source != "live"
+
+    def test_malformed_field_snapshot_is_api_error(self):
+        """Успешный конверт, но битый size → НЕ live (fail-closed)."""
+        resp = {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "NaN", "avgPrice": "40000", "stopLoss": ""}]}}
+        heat, source = self._run(resp)
+        assert source == "api_error"
+
+
+# ── Tests: evaluate_confirmation_heat / exclude-once (S1-R2 Blocker #1) ───────
+
+class TestConfirmationHeatEvaluator:
+    """Свежий confirmation-гейт: fail-closed по недоступности/риску и учёт
+    намеренного риска РОВНО ОДИН РАЗ через exclude_sym."""
+
+    def _authoritative(self, resp, *, max_heat, pending, exclude_sym=None):
+        return _run_heat_call(
+            "_authoritative_heat", max_heat=max_heat, snapshot=resp,
+            pending=pending, exclude_sym=exclude_sym,
+        )
+
+    def _evaluate(self, resp, *, max_heat, pending, sym, intended):
+        return _run_heat_call(
+            "evaluate_confirmation_heat", sym, intended,
+            max_heat=max_heat, snapshot=resp, pending=pending,
+        )
+
+    def test_exclude_sym_removes_only_that_pending(self):
+        """PROOF exclude-once: exclude_sym убирает pending только своего символа."""
+        resp = {"retCode": 0, "result": {"list": []}}  # открытых позиций нет
+        pending = {"BTCUSDT": (50.0, "#t"), "ETHUSDT": (10.0, "#t")}
+        heat_all, src_all = self._authoritative(resp, max_heat=500.0, pending=pending)
+        assert src_all == "live"
+        assert abs(heat_all - 60.0) < 1e-6           # 50 + 10
+        heat_excl, src_excl = self._authoritative(
+            resp, max_heat=500.0, pending=pending, exclude_sym="BTCUSDT")
+        assert src_excl == "live"
+        assert abs(heat_excl - 10.0) < 1e-6          # только ETH pending
+
+    def test_counts_intended_exactly_once(self):
+        """PROOF (RED против двойного счёта): один раз 50 ≤ 75 → OK; два раза 100 > 75."""
+        from core.heat import CONFIRM_HEAT_OK
+        resp = {"retCode": 0, "result": {"list": []}}
+        pending = {"BTCUSDT": (50.0, "#t")}
+        assert self._evaluate(resp, max_heat=75.0, pending=pending,
+                              sym="BTCUSDT", intended=50.0) == CONFIRM_HEAT_OK
+
+    def test_over_limit_when_other_positions_push_past(self):
+        from core.heat import CONFIRM_HEAT_OVER_LIMIT
+        resp = {"retCode": 0, "result": {"list": [
+            {"symbol": "ETHUSDT", "size": "1", "avgPrice": "3000", "stopLoss": "2900"}]}}
+        pending = {"BTCUSDT": (50.0, "#t")}      # ETH heat=100 + intended 50 = 150 > 120
+        assert self._evaluate(resp, max_heat=120.0, pending=pending,
+                              sym="BTCUSDT", intended=50.0) == CONFIRM_HEAT_OVER_LIMIT
+
+    def test_unavailable_snapshot_is_unavailable(self):
+        from core.heat import CONFIRM_HEAT_UNAVAILABLE
+        resp = {"retCode": 0, "result": {"list": [
+            {"symbol": "BTCUSDT", "size": "NaN", "avgPrice": "40000", "stopLoss": ""}]}}
+        pending = {"BTCUSDT": (50.0, "#t")}
+        assert self._evaluate(resp, max_heat=500.0, pending=pending,
+                              sym="BTCUSDT", intended=50.0) == CONFIRM_HEAT_UNAVAILABLE
+
+    def test_disabled_returns_disabled_without_read(self):
+        """MAX<=0 → DISABLED без чтения биржи (heat-чтение не выполняется)."""
+        from core.heat import CONFIRM_HEAT_DISABLED
+        with patch("core.heat.MAX_TOTAL_HEAT_USDT", 0), \
+             patch("core.bybit_call.bybit_call",
+                   new=AsyncMock(side_effect=AssertionError("нет чтения при disabled"))):
+            from core.heat import evaluate_confirmation_heat
+            assert _run_heat(evaluate_confirmation_heat("BTCUSDT", 50.0)) == CONFIRM_HEAT_DISABLED
+
+    def test_unproven_intended_is_pending_unknown_before_any_read(self):
+        """Недоказанный намеренный риск → PENDING_UNKNOWN ДО чтения биржи."""
+        from core.heat import CONFIRM_HEAT_PENDING_UNKNOWN
+        with patch("core.heat.MAX_TOTAL_HEAT_USDT", 500.0), \
+             patch("core.bybit_call.bybit_call",
+                   new=AsyncMock(side_effect=AssertionError("нет чтения до проверки риска"))):
+            from core.heat import evaluate_confirmation_heat
+            for bad in (None, float("nan"), float("inf"), -5.0, "abc", True):
+                assert _run_heat(
+                    evaluate_confirmation_heat("BTCUSDT", bad)
+                ) == CONFIRM_HEAT_PENDING_UNKNOWN

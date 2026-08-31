@@ -44,6 +44,19 @@ from handlers.ui import format_market_preview as _PRODUCTION_FORMAT_MARKET_PREVI
 
 _UID = "123"
 
+
+@pytest.fixture(autouse=True)
+def _s1r2_heat_gate_disabled():
+    """S1-R2: buy_market проходит через свежий heat-гейт перед первой мутацией.
+
+    core.config здесь замокан/частичен, из-за чего core.heat.MAX_TOTAL_HEAT_USDT
+    может быть MagicMock, и сравнение ``MAX <= 0`` в гейте падало бы TypeError.
+    Фиксируем валидное числовое 0 (heat отключён): гейт становится no-op, а
+    поведение market-пути совпадает с pre-R2.
+    """
+    with patch("core.heat.MAX_TOTAL_HEAT_USDT", 0):
+        yield
+
 # Часовой для "записи в sys.modules не существовало": None здесь не годится,
 # потому что None — легальное значение записи sys.modules.
 _ABSENT = object()

@@ -154,6 +154,18 @@ def _truncate(text: str, n: int = 400) -> str:
     return text[:n] + "…"
 
 
+def _live_heat_value(heat_value, heat_source):
+    """Числовой current heat только для авторитетного live-источника.
+
+    Возвращает *heat_value*, если ``heat_source == "live"`` (heat доказан живым
+    чтением Bybit), иначе None. Любой не-live источник (``"api_error"``,
+    недоступность, malformed) считается «heat неизвестен»: заполнитель 0.0 из
+    :func:`core.heat.compute_current_heat` никогда не показывается как фактический
+    ноль — /status выводит N/A. Неизвестный heat не равен нулю.
+    """
+    return heat_value if heat_source == "live" else None
+
+
 def _build_status_msg(
     *,
     trading_on: bool,
@@ -304,7 +316,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if MAX_TOTAL_HEAT_USDT > 0:
         try:
             from core.heat import compute_current_heat
-            heat_usd, _ = await compute_current_heat()
+            heat_value, heat_source = await compute_current_heat()
+            # Только доказанный live-heat показывается числом. api_error / любой
+            # не-live источник → None → /status выведет N/A, а не ложный 0.0.
+            heat_usd = _live_heat_value(heat_value, heat_source)
         except Exception:
             pass
 

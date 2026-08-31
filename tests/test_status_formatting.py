@@ -262,3 +262,58 @@ class TestBuildStatusMsg:
             quarantined=[], alert_ts=None, alert_msg="",
         )
         assert isinstance(msg, str)
+
+
+# ── _live_heat_value + truthful /status heat (S1) ────────────────────────────
+
+class TestLiveHeatValue:
+    """_live_heat_value: числовой heat только для авторитетного live-источника."""
+
+    def test_live_source_returns_numeric(self):
+        from handlers.commands import _live_heat_value
+        assert _live_heat_value(30.5, "live") == 30.5
+
+    def test_api_error_source_returns_none(self):
+        # Заполнитель 0.0 из compute_current_heat НЕ выдаётся за факт.
+        from handlers.commands import _live_heat_value
+        assert _live_heat_value(0.0, "api_error") is None
+
+    def test_non_live_source_returns_none(self):
+        from handlers.commands import _live_heat_value
+        assert _live_heat_value(0.0, "disabled") is None
+        assert _live_heat_value(123.0, "whatever") is None
+
+
+class TestStatusHeatTruthful:
+    """Итоговый /status: api_error heat → N/A, а не ложный 0.0."""
+
+    _DEFAULTS = dict(
+        trading_on=True, daily_pnl=0.0, current_risk=50.0,
+        heat_usd=None, max_heat=0.0, pos_count=0, entry_orders=0,
+        mkt_pending=0, sources_seen=0, quarantined=[],
+        alert_ts=None, alert_level="", alert_class="", alert_msg="",
+    )
+
+    def _make(self, **kw) -> str:
+        return _build_status_msg(**{**self._DEFAULTS, **kw})
+
+    def test_api_error_heat_renders_na_not_zero(self):
+        """RED против pre-S1: источник api_error → None → N/A, не '0.0 / 100.0'."""
+        from handlers.commands import _live_heat_value
+        heat_usd = _live_heat_value(0.0, "api_error")
+        msg = self._make(heat_usd=heat_usd, max_heat=100.0)
+        assert "N/A" in msg
+        assert "0.0 / 100.0" not in msg
+
+    def test_live_heat_renders_numeric(self):
+        """Доказанный live-heat остаётся числом (регресс не сломан)."""
+        from handlers.commands import _live_heat_value
+        heat_usd = _live_heat_value(30.5, "live")
+        msg = self._make(heat_usd=heat_usd, max_heat=200.0)
+        assert "30.5 / 200.0" in msg
+
+    def test_disabled_presentation_preserved(self):
+        """max_heat<=0 → 'отключён' вне зависимости от источника."""
+        from handlers.commands import _live_heat_value
+        msg = self._make(heat_usd=_live_heat_value(0.0, "disabled"), max_heat=0.0)
+        assert "отключён" in msg

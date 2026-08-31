@@ -433,19 +433,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logging.warning("mkt_preview %s: indicative SL unavailable: %s", sym, calc_err)
                     sl_preview = None
 
-            # Рассчитываем прогнозируемый heat (мягкий fallback)
-            heat_after = 0.0
+            # Прогнозируемый heat для превью (информативно, не гейт входа).
+            # S1-R1: только доказанный live-источник даёт число. При api_error /
+            # любом не-live источнике или исключении heat_after остаётся None →
+            # превью показывает N/A, без арифметики на заполнителе 0.0 и без
+            # выдуманного heat_after. Превью не является вторым гейтом исполнения.
+            heat_after = None
             max_heat = 0.0
             try:
                 from core.config import MAX_TOTAL_HEAT_USDT
                 from core.heat import compute_current_heat
                 max_heat = MAX_TOTAL_HEAT_USDT
                 if max_heat > 0:
-                    cur_heat, _ = await compute_current_heat()
-                    pending = _MARKET_PENDING.get(sym)
-                    risk_for_heat = pending[0] if pending else 0.0
-                    heat_after = cur_heat + risk_for_heat
+                    cur_heat, heat_source = await compute_current_heat()
+                    if heat_source == "live":
+                        pending = _MARKET_PENDING.get(sym)
+                        risk_for_heat = pending[0] if pending else 0.0
+                        heat_after = cur_heat + risk_for_heat
+                    # не-live источник → heat_after остаётся None → N/A
             except Exception:
+                # heat_after остаётся None → N/A (при включённом heat)
                 pass
 
             # Читаем риск + источник из pending-хранилища
@@ -775,6 +782,59 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode='HTML',
                 )
                 return
+
+            # S1-R2 fail-closed: свежий авторитетный heat-гейт ПЕРЕД первой
+            # мутацией биржи (set_leverage). Между превью и подтверждением
+            # портфельный heat мог измениться, поэтому гейт signal_parser здесь
+            # уже устарел. Риск ЭТОЙ сделки учитывается ровно один раз: текущий
+            # heat берётся без ожидающего входа символа, а его риск добавляется
+            # отдельно (см. core.heat.evaluate_confirmation_heat). Блокировка не
+            # мутирует pending и ничего не ставит в очередь — ордер не уходит.
+            from core.heat import (
+                CONFIRM_HEAT_OVER_LIMIT, CONFIRM_HEAT_PENDING_UNKNOWN,
+                CONFIRM_HEAT_UNAVAILABLE, evaluate_confirmation_heat,
+            )
+            pending_for_heat = _MARKET_PENDING.get(sym)
+            intended_risk_for_heat = pending_for_heat[0] if pending_for_heat else None
+            heat_decision = await evaluate_confirmation_heat(sym, intended_risk_for_heat)
+            if heat_decision == CONFIRM_HEAT_OVER_LIMIT:
+                logging.warning(
+                    "buy_market %s blocked: лимит совокупного риска (heat) будет "
+                    "превышён — ордер не отправлен", sym,
+                )
+                await query.edit_message_text(
+                    format_warning_message(
+                        [
+                            "Лимит совокупного риска (heat) будет превышён.",
+                            "Вход НЕ исполнен: ордер на биржу не отправлен.",
+                        ],
+                        context=f"{sym} · {side} · Market",
+                        action="уменьшите риск или дождитесь закрытия других позиций",
+                        blocked=True,
+                    ),
+                    parse_mode='HTML',
+                )
+                return
+            if heat_decision in (CONFIRM_HEAT_UNAVAILABLE, CONFIRM_HEAT_PENDING_UNKNOWN):
+                logging.warning(
+                    "buy_market %s blocked: авторитетный портфельный heat не "
+                    "подтверждён (%s) — ордер не отправлен (fail-closed)",
+                    sym, heat_decision,
+                )
+                await query.edit_message_text(
+                    format_warning_message(
+                        [
+                            "Портфельный heat не подтверждён.",
+                            "Вход НЕ исполнен: ордер на биржу не отправлен.",
+                        ],
+                        context=f"{sym} · {side} · Market",
+                        action="повторите позже, когда состояние позиций подтвердится",
+                        blocked=True,
+                    ),
+                    parse_mode='HTML',
+                )
+                return
+            # CONFIRM_HEAT_OK / CONFIRM_HEAT_DISABLED — проверка пройдена, продолжаем.
 
             # Все fail-closed проверки пройдены (свежая цена, SL, риск, объём) —
             # только теперь единственный live write плеча (§3). set_leverage_safe

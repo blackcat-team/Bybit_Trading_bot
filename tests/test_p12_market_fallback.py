@@ -48,6 +48,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _s1r2_heat_gate_disabled():
+    """S1-R2: buy_market проходит через свежий heat-гейт перед первой мутацией.
+
+    Эти тесты мокируют core.config, из-за чего core.heat.MAX_TOTAL_HEAT_USDT —
+    MagicMock, и сравнение ``MAX <= 0`` в гейте падало бы TypeError. Фиксируем
+    валидное числовое 0 (heat отключён): гейт становится no-op, а поведение
+    market-пути совпадает с pre-R2.
+    """
+    with patch("core.heat.MAX_TOTAL_HEAT_USDT", 0):
+        yield
+
+
 # ── Test fixtures / helpers ───────────────────────────────────────────────────
 
 def _make_query(cb_data: str, user_id: str = _UID):

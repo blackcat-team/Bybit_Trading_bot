@@ -69,6 +69,39 @@ def _market_callback(sym: str, side: str, stop_val, qty, lev,
             f"buy_market|{sym}|{side}|{stop_val}|{qty}|{lev}")
 
 
+def _heat_block_message(heat_reason: str, sym: str, side: str) -> str:
+    """Правдивое сообщение оператору о блокировке нового входа по heat.
+
+    Чистая функция (без I/O). Различает два принципиально разных случая блока,
+    опираясь на reason из :func:`core.heat.enforce_heat`:
+
+    * ``"unavailable:..."`` — авторитетный текущий heat НЕ подтверждён (ошибка
+      API / malformed). Обычный расчёт «current + new > limit» не проводился,
+      поэтому оператору НЕЛЬЗЯ показывать «превышен лимит Heat»: это выдало бы
+      неизвестный heat за доказанное превышение. Сообщаем честно — heat не
+      удалось проверить, вход не разрешён, ордер на биржу не отправлялся.
+    * прочее (``"rejected:..."`` / ``"queued:..."``) — доказанное превышение
+      лимита; прежняя формулировка reject/queue сохраняется без изменений.
+    """
+    if heat_reason.startswith("unavailable"):
+        return format_warning_message(
+            [
+                "Текущий портфельный heat не удалось проверить.",
+                "Новый вход не разрешён: ордер на биржу не отправлен.",
+            ],
+            context=f"{sym} · {side}",
+            action="повторите отправку сигнала после восстановления данных heat",
+            blocked=True,
+        )
+    action_word = "В очереди" if heat_reason.startswith("queued") else "Отклонено"
+    return format_warning_message(
+        [f"{action_word}: превышен лимит Heat."],
+        context=f"{sym} · {side}",
+        action="дождитесь снижения Heat или проверьте лимит риска",
+        blocked=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Чистый парсинг
 # ---------------------------------------------------------------------------
@@ -544,6 +577,28 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pos_usd = current_risk / (diff_pct / 100)
 
+        # ── Heat enforcement (fail-closed) ДО первой биржевой мутации входа ──
+        # S1-R1: гейт heat обязан отработать РАНЬШЕ set_leverage_safe
+        # (session.set_leverage — live-мутация). Неизвестный/непроверенный или
+        # превышающий лимит heat блокирует новый вход до любой записи на биржу
+        # и до какой-либо persistence входа. Всё, что нужно гейту (current_risk,
+        # sym, side, entry/stop, источник), вычислено выше из локальных данных;
+        # при MAX_TOTAL_HEAT_USDT<=0 enforce_heat сразу отдаёт heat_disabled и
+        # не выполняет ни одного heat-запроса.
+        heat_allowed, heat_reason = await enforce_heat(
+            new_risk_usd=current_risk,
+            trade_info={
+                "sym": sym, "side": side,
+                "entry_val": entry_price, "stop_val": stop_val,
+                "risk_usd": current_risk, "source_tag": source_tag,
+            },
+            bot=context.bot,
+            owner_id=ALLOWED_ID,
+        )
+        if not heat_allowed:
+            await msg_obj.reply_html(_heat_block_message(heat_reason, sym, side))
+            return
+
         # Плечо
         effective_lev = await bybit_call(set_leverage_safe, sym, lev)
 
@@ -605,29 +660,6 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     action="повторите отправку сигнала позже",
                 ),
                 parse_mode='HTML',
-            )
-            return
-
-        # ── Heat enforcement (disabled when MAX_TOTAL_HEAT_USDT=0) ──────────
-        heat_allowed, heat_reason = await enforce_heat(
-            new_risk_usd=current_risk,
-            trade_info={
-                "sym": sym, "side": side,
-                "entry_val": entry_price, "stop_val": stop_val,
-                "risk_usd": current_risk, "source_tag": source_tag,
-            },
-            bot=context.bot,
-            owner_id=ALLOWED_ID,
-        )
-        if not heat_allowed:
-            action_word = "В очереди" if heat_reason.startswith("queued") else "Отклонено"
-            await msg_obj.reply_html(
-                format_warning_message(
-                    [f"{action_word}: превышен лимит Heat."],
-                    context=f"{sym} · {side}",
-                    action="дождитесь снижения Heat или проверьте лимит риска",
-                    blocked=True,
-                )
             )
             return
 

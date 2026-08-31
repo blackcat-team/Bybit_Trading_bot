@@ -352,10 +352,17 @@ def format_market_preview(
         if entry_value is not None:
             risk_rows.append(("До SL", f"{_sl_pct(entry_value, stop_value):.2f}%"))
     risk_rows.append(("Риск", _fmt_usdt(risk_usd)))
-    risk_rows.append((
-        "Heat",
-        f"{heat_after:.1f} / {max_heat:.1f} USDT" if max_heat > 0 else "отключён",
-    ))
+    # S1-R1: heat_after=None означает «текущий heat не подтверждён» (не-live
+    # источник / ошибка чтения). При включённом лимите это N/A, а не 0.0 —
+    # заполнитель никогда не выдаётся за фактический heat. max_heat<=0 → отключён.
+    if max_heat > 0:
+        heat_text = (
+            f"{heat_after:.1f} / {max_heat:.1f} USDT"
+            if heat_after is not None else "N/A"
+        )
+    else:
+        heat_text = "отключён"
+    risk_rows.append(("Heat", heat_text))
     risk = format_value_block(risk_rows)
     ttl = (
         f"⏳ Подтверждение действительно {h(ttl_sec)} сек."

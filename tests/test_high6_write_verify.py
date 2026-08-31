@@ -32,6 +32,19 @@ import pytest
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+@pytest.fixture(autouse=True)
+def _s1r2_heat_gate_disabled():
+    """S1-R2: buy_market проходит через свежий heat-гейт перед первой мутацией.
+
+    Изоляция модуля даёт core.heat.MAX_TOTAL_HEAT_USDT как MagicMock (core.config
+    замокан), из-за чего сравнение ``MAX <= 0`` в гейте падало бы TypeError.
+    Фиксируем валидное числовое 0 (heat отключён): гейт становится no-op, а
+    market-readback поведение совпадает с pre-R2.
+    """
+    with patch("core.heat.MAX_TOTAL_HEAT_USDT", 0):
+        yield
+
 _HEAVY_MODULES = (
     "telegram", "telegram.ext", "telegram.request", "telegram.error",
     "pybit", "pybit.unified_trading",
