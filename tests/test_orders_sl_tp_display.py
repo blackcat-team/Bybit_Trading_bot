@@ -84,6 +84,21 @@ _UNKNOWN_CONDITIONAL = {
 _SHORT_POSITION = [{"symbol": "CFXUSDT", "side": "Sell", "size": "1111"}]
 
 
+def _entry_row(order_id="sl-1", symbol="CFXUSDT"):
+    """Список из одного обычного лимитного входа, проходящего HIGH-7 classify.
+
+    Все protective discriminator fields присутствуют и доказаны как «признака
+    нет»: только такой ордер S2 допускает к preview одиночной отмены.
+    """
+    return [{
+        "symbol": symbol, "side": "Buy", "orderType": "Limit",
+        "price": "0.04100", "qty": "500", "reduceOnly": False,
+        "closeOnTrigger": False, "orderStatus": "New", "stopOrderType": "",
+        "orderFilter": "Order", "createType": "CreateByUser",
+        "positionIdx": 0, "orderId": order_id,
+    }]
+
+
 # ── 1. Conditional Market Stop Loss ──────────────────────────────────────────
 
 class TestConditionalStopLoss:
@@ -416,15 +431,35 @@ def _run(coro):
         asyncio.set_event_loop(previous)
 
 
-def _run_cancel(cb_data: str):
-    """Прогоняет button_handler и возвращает записанные kwargs cancel_order."""
-    import handlers.buttons as buttons
+def _run_cancel(cb_data: str, orders=None):
+    """Прогоняет button_handler по индивидуальному cancel-callback (S2-контракт).
 
-    recorded = {}
+    После S2 первое нажатие ❌ НИКОГДА не отменяет ордер напрямую: оно ведёт в
+    безопасный preview. Хелпер фиксирует все обращения к ``session.cancel_order``
+    (их должно быть 0), вызовы прямого обновления вида (их тоже 0 на первом
+    клике) и созданный preview-snapshot одиночной отмены.
+    """
+    import handlers.buttons as buttons
+    import handlers.cancel_orders as co
+
+    if orders is None:
+        orders = _entry_row()
+
+    recorded = {"cancel_calls": []}
 
     async def fake_bybit_call(fn, *args, **kwargs):
-        recorded["kwargs"] = kwargs
-        return {"retCode": 0}
+        sess = co.session
+        if fn is sess.get_open_orders:
+            return {"retCode": 0, "result": {"category": "linear", "list": orders}}
+        if fn is sess.cancel_order:
+            recorded["cancel_calls"].append(kwargs)
+            return {"retCode": 0, "result": {"orderId": kwargs.get("orderId")}}
+        raise AssertionError(f"Unexpected bybit_call to {fn}")
+
+    async def fake_to_thread(fn, *a, **k):
+        return fn(*a, **k)
+
+    co._PENDING_CANCEL_ONE.clear()
 
     query = MagicMock()
     query.from_user.id = "123"
@@ -435,41 +470,70 @@ def _run_cancel(cb_data: str):
     update.callback_query = query
 
     with patch.object(buttons, "ALLOWED_ID", "123"), \
+         patch.object(co, "ALLOWED_ID", "123"), \
          patch.object(buttons, "bybit_call", side_effect=fake_bybit_call), \
+         patch.object(co, "bybit_call", side_effect=fake_bybit_call), \
+         patch.object(co, "get_bot_entry_identities", lambda: {}), \
+         patch.object(co.asyncio, "to_thread", fake_to_thread), \
+         patch.object(co.asyncio, "sleep", new=AsyncMock()), \
          patch.object(buttons, "view_orders", new=AsyncMock()) as v_list, \
          patch.object(buttons, "view_symbol_orders", new=AsyncMock()) as v_sym:
         _run(buttons.button_handler(update, MagicMock()))
         recorded["view_list_called"] = v_list.called
         recorded["view_sym_called"] = v_sym.called
+
+    snaps = list(co._PENDING_CANCEL_ONE.values())
+    recorded["snapshot"] = snaps[0] if snaps else None
     return recorded
 
 
 class TestCancelCallbackCompat:
+    """S2: индивидуальная кнопка ведёт в безопасный preview, не в прямую отмену.
+
+    Раньше эти тесты фиксировали подтверждённый дефект — прямой
+    ``session.cancel_order`` по первому клику. Теперь они доказывают, что первый
+    клик zero-write, а символ/orderId/режим корректно разобраны и прокинуты в
+    preview-snapshot для обоих форматов callback (compact ``co`` и legacy
+    ``cancel_o``).
+    """
+
     def test_compact_sym_mode(self):
         r = _run_cancel("co|CFXUSDT|sl-1|s")
-        assert r["kwargs"]["symbol"] == "CFXUSDT"
-        assert r["kwargs"]["orderId"] == "sl-1"
-        assert r["kwargs"]["category"] == "linear"
-        assert r["view_sym_called"] is True
+        assert r["cancel_calls"] == [], "первый клик не отменяет напрямую"
+        assert r["view_sym_called"] is False
+        assert r["snapshot"]["pair"] == ("CFXUSDT", "sl-1")
+        assert r["snapshot"]["mode"] == "sym"
 
     def test_compact_list_mode(self):
         r = _run_cancel("co|CFXUSDT|sl-1|l")
-        assert r["kwargs"]["orderId"] == "sl-1"
-        assert r["view_list_called"] is True
+        assert r["cancel_calls"] == []
+        assert r["view_list_called"] is False
+        assert r["snapshot"]["pair"] == ("CFXUSDT", "sl-1")
+        assert r["snapshot"]["mode"] == "list"
 
     def test_legacy_sym_mode_still_accepted(self):
         r = _run_cancel("cancel_o|CFXUSDT|sl-1|sym")
-        assert r["kwargs"]["symbol"] == "CFXUSDT"
-        assert r["kwargs"]["orderId"] == "sl-1"
-        assert r["view_sym_called"] is True
+        assert r["cancel_calls"] == []
+        assert r["snapshot"]["pair"] == ("CFXUSDT", "sl-1")
+        assert r["snapshot"]["mode"] == "sym"
 
     def test_legacy_list_mode_still_accepted(self):
         r = _run_cancel("cancel_o|CFXUSDT|sl-1|list")
-        assert r["kwargs"]["orderId"] == "sl-1"
-        assert r["view_list_called"] is True
+        assert r["cancel_calls"] == []
+        assert r["snapshot"]["pair"] == ("CFXUSDT", "sl-1")
+        assert r["snapshot"]["mode"] == "list"
 
     def test_order_id_never_truncated(self):
         oid = "1a2b3c4d-5e6f-7890-abcd-ef1234567890"
-        r = _run_cancel(f"co|1000PEPEUSDT|{oid}|s")
-        assert r["kwargs"]["orderId"] == oid
-        assert r["kwargs"]["symbol"] == "1000PEPEUSDT"
+        r = _run_cancel(
+            f"co|1000PEPEUSDT|{oid}|s",
+            orders=_entry_row(order_id=oid, symbol="1000PEPEUSDT"),
+        )
+        assert r["cancel_calls"] == []
+        assert r["snapshot"]["pair"] == ("1000PEPEUSDT", oid)
+
+    def test_protective_row_first_click_is_zero_write(self):
+        """Защитная строка (SL) по первому клику не отменяется и не даёт токен."""
+        r = _run_cancel("co|CFXUSDT|sl-1|s", orders=[dict(_SL_ORDER)])
+        assert r["cancel_calls"] == []
+        assert r["snapshot"] is None

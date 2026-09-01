@@ -1399,3 +1399,794 @@ def _protection_result_text(status) -> str:
     if status == PROTECTION_CRITICAL_MISMATCH:
         return "ИСЧЕЗЛА — критическая проверка"
     return "не проверялась"
+
+
+# ---------------------------------------------------------------------------
+# S2 — Безопасная отмена ОДНОГО выбранного ордера
+# ---------------------------------------------------------------------------
+#
+# Индивидуальная кнопка ❌ больше НИКОГДА не отменяет ордер напрямую. Она
+# переиспользует весь контракт HIGH-7 для ровно одной выбранной пары
+# (symbol, orderId):
+#
+#     ❌ → authoritative-чтение → точная идентификация → HIGH-7 классификация →
+#     preview → явное подтверждение → свежее authoritative-перечтение →
+#     повторная классификация → максимум ОДИН точный cancel_order →
+#     authoritative-исход → bounded readback защиты → правдивый результат →
+#     возврат в исходное представление ордеров.
+#
+# Классификатор (classify_cancellable), разбор исхода (classify_cancel_response),
+# снимок/сверка защиты (read_protection_snapshot / compare_protection) и durable-
+# аудит (append_event + ORDER_CANCEL_BATCH) НЕ дублируются: одиночный поток
+# вызывает те же функции. Единственное bounded-расширение схемы аудита —
+# поле ``operation == "cancel_single_entry"``, обратносовместимое с пакетным
+# ``cancel_limit_entries``.
+
+# Ожидающие подтверждения снимки одиночной отмены: token → snapshot. Отдельное
+# от _PENDING_CANCEL хранилище: пакетный и одиночный потоки не должны расходовать
+# токены друг друга, а их схемы снимков различаются. Разделение гарантирует, что
+# пакетная отмена (HIGH-7) остаётся нетронутой.
+_PENDING_CANCEL_ONE: dict = {}
+
+# Идентификатор операции в durable-журнале: отличает одиночную отмену от
+# пакетной, оставаясь тем же событием ORDER_CANCEL_BATCH с той же схемой.
+OP_SINGLE_ENTRY = "cancel_single_entry"
+
+# Режимы возврата в исходное представление ордеров.
+VIEW_LIST = "list"
+VIEW_SYM = "sym"
+
+
+def _single_nav_button(mode, symbol):
+    """Кнопка возврата в то представление ордеров, откуда пришёл callback.
+
+    Навигация выполняется существующими callback'ами (``refresh_orders`` —
+    общий список, ``show_orders|SYM`` — карточка символа) и ПОСЛЕ показанного
+    исхода: она не подменяет знание о результате отмены, а лишь позволяет
+    оператору вернуться к обновлённому списку уже после результата.
+    """
+    if mode == VIEW_SYM and symbol:
+        return InlineKeyboardButton(
+            f"🔙 Ордера {symbol}", callback_data=f"show_orders|{symbol}"
+        )
+    return InlineKeyboardButton("🔄 К ордерам", callback_data="refresh_orders")
+
+
+def _prune_stale_single():
+    """Удаляет одиночные preview-снимки с истекшим TTL (защита от утечки памяти)."""
+    cutoff = time.time() - PREVIEW_TTL_SEC
+    stale = [
+        t for t, s in _PENDING_CANCEL_ONE.items()
+        if s.get("timestamp", 0) < cutoff
+    ]
+    for t in stale:
+        _PENDING_CANCEL_ONE.pop(t, None)
+
+
+# Сентинел неоднозначности: точная пара (symbol, orderId) встретилась в
+# авторитетном ответе биржи более одного раза.
+_PAIR_AMBIGUOUS = object()
+
+# Причина fail-closed одиночного потока: дубликат точной пары (диагностический
+# лог, не payload биржи).
+REASON_DUPLICATE_PAIR = "duplicate_exact_pair_ambiguous"
+
+# Исход израсходованного подтверждения, когда дубликат точной пары обнаружен уже
+# при повторном чтении. Отдельная строка outcome/reason в durable-событии;
+# схема ORDER_CANCEL_BATCH при этом не меняется.
+_OUTCOME_AMBIGUOUS_AFTER_RECHECK = "skipped_ambiguous_after_recheck"
+
+
+def _find_unique_pair(orders, symbol, order_id):
+    """Находит открытый ордер по ТОЧНОЙ паре ``(symbol, orderId)``, fail-closed.
+
+    Единый общий хелпер одиночного потока (preview и confirm), чтобы обе стороны
+    искали строку одинаково и не расходились по семантике. Возвращает ровно
+    один из трёх исходов:
+
+    * ``None`` — 0 совпадений: строки нет (stale / исполнена / отменена);
+    * :data:`_PAIR_AMBIGUOUS` — 2+ совпадений: неоднозначность, fail-closed;
+    * саму строку — ровно 1 совпадение (дальше — прежний контракт HIGH-7
+      :func:`classify_cancellable` без изменений).
+
+    Дубликат точной пары авторитетным доказательством не является: одна строка
+    может выглядеть обычным входом, другая — быть защитной, malformed или
+    противоречивой, и порядок строк в ответе ничего не доказывает. Поэтому
+    выбор first / last / «безопаснее выглядящей» строки запрещён — ЛЮБЫЕ 2+
+    совпадения означают ambiguous, даже когда строки выглядят одинаково.
+    Строки не сливаются и по одной паре не классифицируются до доказанной
+    уникальности: сначала уникальность, только потом классификация.
+    """
+    matches = [
+        o for o in orders
+        if isinstance(o, dict)
+        and _read_text(o, "symbol") == symbol
+        and _read_text(o, "orderId") == order_id
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        return _PAIR_AMBIGUOUS
+    return matches[0]
+
+
+async def preview_cancel_one(update, context, symbol, order_id, mode):
+    """Preview безопасной отмены ОДНОГО выбранного ордера (S2).
+
+    Первое нажатие ❌ не выполняет ни одной записи на биржу. Оно authoritative-
+    читает открытые ордера, находит точную пару ``(symbol, orderId)`` и
+    классифицирует её строгим контрактом HIGH-7. Callback-символ и orderId —
+    лишь запрошенная идентичность, а не доказательство, что текущая строка биржи
+    безопасна. Если ордер защитный, изменившийся, отсутствующий или
+    неоднозначный — правдивый отказ без единой отмены. Если доказанно обычный
+    лимитный вход — preview с явным Confirm / Cancel.
+    """
+    query = update.callback_query
+    user_id = str(query.from_user.id)
+    if user_id != ALLOWED_ID:
+        return
+
+    req_symbol = symbol.strip() if isinstance(symbol, str) else ""
+    req_order_id = order_id.strip() if isinstance(order_id, str) else ""
+    return_mode = VIEW_SYM if mode == VIEW_SYM else VIEW_LIST
+    nav = InlineKeyboardMarkup([[_single_nav_button(return_mode, req_symbol)]])
+
+    if not req_symbol or not req_order_id:
+        # Malformed callback: точной пары нет, биржа про ордер ничего не
+        # утверждала — fail closed, ни одной записи.
+        await query.edit_message_text(
+            "\n\n".join([
+                format_header("ℹ️", "ОТМЕНА НЕВОЗМОЖНА"),
+                "Ордер не идентифицирован: запрос не содержит точной пары "
+                "символ + orderId.",
+                format_action("обновите список ордеров и повторите"),
+            ]),
+            parse_mode="HTML",
+            reply_markup=nav,
+        )
+        return
+
+    try:
+        orders_resp = await bybit_call(
+            session.get_open_orders, category=CATEGORY, settleCoin="USDT"
+        )
+        orders = read_open_orders(orders_resp)
+        if orders is None:
+            await query.edit_message_text(
+                format_error_message(
+                    "Не удалось получить список открытых ордеров.",
+                    action="проверьте ордера вручную на Bybit",
+                ),
+                parse_mode="HTML",
+                reply_markup=nav,
+            )
+            return
+
+        # Точная пара (symbol, orderId): сопоставление только по orderId
+        # позволило бы отменить чужую строку с тем же идентификатором на другом
+        # символе (см. §1, §G). Пара обязана быть УНИКАЛЬНОЙ: дубликат точной
+        # пары не доказывает, какая строка авторитетна (§2, тест E).
+        owned_entries = await read_bot_owned_entries()
+        match = _find_unique_pair(orders, req_symbol, req_order_id)
+
+        if match is None:
+            await query.edit_message_text(
+                "\n\n".join([
+                    format_header("ℹ️", "ОРДЕР НЕ НАЙДЕН"),
+                    "Выбранный ордер отсутствует среди открытых: он мог быть "
+                    "исполнен, отменён или изменён.",
+                    "Ничего не отменялось.",
+                    format_action("обновите список ордеров"),
+                ]),
+                parse_mode="HTML",
+                reply_markup=nav,
+            )
+            return
+
+        if match is _PAIR_AMBIGUOUS:
+            # Дубликат точной пары: какая строка авторитетна — не доказано.
+            # Fail-closed до создания токена: ни preview, ни единой записи.
+            logging.warning(
+                "preview_cancel_one: неоднозначная точная пара — "
+                "fail-closed, токен не создаётся"
+            )
+            log_classification("preview_one", 2, {}, {REASON_DUPLICATE_PAIR: 1})
+            await query.edit_message_text(
+                "\n\n".join([
+                    format_header("🛡", "ОТМЕНА НЕВОЗМОЖНА — НЕОДНОЗНАЧНО"),
+                    "Точная пара символ + orderId встречается среди открытых "
+                    "ордеров более одного раза. Какая строка авторитетна — не "
+                    "доказано, поэтому отмена запрещена. Ничего не отменялось.",
+                    format_action("проверьте ордера вручную на Bybit"),
+                ]),
+                parse_mode="HTML",
+                reply_markup=nav,
+            )
+            return
+
+        target = match
+        ok, reason = classify_cancellable(target, owned_entries)
+        if not ok:
+            # Защитный / conditional / reduce-only / malformed / неоднозначный —
+            # отмена запрещена, preview не выдаётся, токен не создаётся.
+            log_classification("preview_one", 1, {}, {reason: 1})
+            await query.edit_message_text(
+                "\n\n".join([
+                    format_header("🛡", "ОТМЕНА ЗАПРЕЩЕНА"),
+                    format_warning_list([
+                        "Выбранный ордер не является обычным лимитным входом.",
+                        "TP, SL, conditional, trailing, reduce-only и "
+                        "неоднозначные ордера этим действием не отменяются.",
+                    ]),
+                    format_action("проверьте ордер вручную на Bybit"),
+                ]),
+                parse_mode="HTML",
+                reply_markup=nav,
+            )
+            return
+
+        log_classification("preview_one", 1, {reason: 1}, {})
+
+        # Доказанный обычный вход — строим preview-снимок точной пары.
+        pair = (req_symbol, req_order_id)
+        token = secrets.token_urlsafe(16)
+        _prune_stale_single()
+        _PENDING_CANCEL_ONE[token] = {
+            "user_id": user_id,
+            "pair": pair,
+            "symbol": req_symbol,
+            "order_id": req_order_id,
+            "mode": return_mode,
+            "timestamp": time.time(),
+        }
+
+        preview_text = "\n".join([
+            format_header("⚠️", "ОТМЕНА ОРДЕРА — ПОДТВЕРЖДЕНИЕ"),
+            "",
+            "<b>Будет отменён один ордер:</b>",
+            format_value_block([
+                ("Инструмент", req_symbol),
+                ("Сторона", _read_text(target, "side") or "—"),
+                ("Тип", "Limit"),
+                ("Цена", target.get("price", "—")),
+                ("Объём", target.get("qty", "—")),
+                ("orderId", short_order_id(req_order_id)),
+            ]),
+            "",
+            format_warning_list([
+                "Отменяется только этот обычный лимитный вход по точному orderId.",
+                "TP, SL, conditional, trailing и reduce-only ордера не "
+                "затрагиваются.",
+                "После отмены проверяется сохранность SL/TP открытых позиций.",
+            ]),
+            "",
+            format_action("подтвердите отмену или отмените операцию"),
+        ])
+        kb = [[
+            InlineKeyboardButton(
+                "✅ ПОДТВЕРДИТЬ ОТМЕНУ",
+                callback_data=f"confirm_cancel_one|{token}",
+            ),
+            InlineKeyboardButton(
+                "❌ ОТМЕНИТЬ",
+                callback_data=f"cancel_cancel_one|{token}",
+            ),
+        ]]
+        await query.edit_message_text(
+            preview_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+
+    except Exception as exc:
+        logging.error("preview_cancel_one: ошибка при создании preview: %s", exc)
+        await query.edit_message_text(
+            format_error_message(
+                "Не удалось создать preview отмены ордера.",
+                action="проверьте ордера и позиции вручную на Bybit",
+            ),
+            parse_mode="HTML",
+            reply_markup=nav,
+        )
+
+
+async def confirm_cancel_one(update, context, token):
+    """Подтверждает и выполняет отмену ОДНОГО ордера (S2).
+
+    Проверяет одноразовый token (владелец, TTL), выполняет НОВОЕ authoritative-
+    чтение открытых ордеров и отменяет ордер только если точная пара из preview
+    по-прежнему присутствует и повторно доказана обычным лимитным входом. Стейл-
+    preview никогда не авторизует изменившуюся или защитную строку. Снимает
+    защиту позиции до и после, пишет ровно одно durable-событие
+    ORDER_CANCEL_BATCH (``operation=cancel_single_entry``) и показывает правдивый
+    исход; возврат в исходное представление — после результата.
+    """
+    query = update.callback_query
+    user_id = str(query.from_user.id)
+    if user_id != ALLOWED_ID:
+        return
+
+    # Снимок читается, но расходуется только когда операция действительно
+    # начинается: чужой или просроченный callback не гасит годное подтверждение.
+    snapshot = _PENDING_CANCEL_ONE.get(token)
+    if snapshot is None:
+        await query.edit_message_text(
+            format_error_message(
+                "Превью устарело или уже использовано.",
+                action="обновите список ордеров и повторите",
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    if snapshot["user_id"] != user_id:
+        await query.edit_message_text(
+            format_error_message(
+                "Превью принадлежит другому пользователю.",
+                action="создайте своё превью",
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    return_mode = snapshot.get("mode", VIEW_LIST)
+    preview_symbol = snapshot["symbol"]
+    nav = InlineKeyboardMarkup([[_single_nav_button(return_mode, preview_symbol)]])
+
+    if time.time() - snapshot["timestamp"] > PREVIEW_TTL_SEC:
+        _PENDING_CANCEL_ONE.pop(token, None)
+        await query.edit_message_text(
+            "\n\n".join([
+                format_header("⏳", "ПРЕВЬЮ УСТАРЕЛО"),
+                format_warning_list([
+                    "Срок подтверждения preview истёк.",
+                    "Ордер мог измениться.",
+                ]),
+                format_action("обновите список ордеров и повторите"),
+            ]),
+            parse_mode="HTML",
+            reply_markup=nav,
+        )
+        return
+
+    # Одноразовость: с этого момента операция считается НАЧАТОЙ. Токен
+    # израсходован; любой дальнейший выход обязан оставить ровно одно durable-
+    # событие ORDER_CANCEL_BATCH — включая ошибку чтения и исключение.
+    _PENDING_CANCEL_ONE.pop(token, None)
+
+    preview_pair = snapshot["pair"]
+
+    audit = {
+        "results": {kind: [] for kind in RESULT_KINDS},
+        "confirmed": [preview_pair],
+        "attempted": [],
+        "skipped_changed": [],
+        "skipped_protected": [],
+        "symbols": [preview_symbol],
+        "protection_before": None,
+        "protection_after": None,
+        "protection_status": PROTECTION_UNVERIFIED,
+        "protection_lost": [],
+        "outcome": "started",
+    }
+    audit_written = False
+    audit_durable = False
+
+    async def _finish_audit() -> bool:
+        """Пишет ровно одно ORDER_CANCEL_BATCH. Возвращает durable-успех.
+
+        Повторный вызов записи не выполняет и возвращает ранее доказанный исход:
+        недоказанная запись не должна на втором вызове превратиться в успех и
+        замаскировать потерю durable-следа.
+        """
+        nonlocal audit_written, audit_durable
+        if audit_written:
+            return audit_durable
+        audit_written = True
+        results = audit["results"]
+        event = {
+            "event": ORDER_CANCEL_BATCH,
+            "actor": user_id,
+            "callback_id": short_order_id(token),
+            "operation": OP_SINGLE_ENTRY,
+            "outcome": audit["outcome"],
+            "previewed_ids": [pair_label(preview_pair)],
+            "previewed_count": 1,
+            "confirmed_ids": sorted(pair_label(p) for p in audit["confirmed"]),
+            "confirmed_count": len(audit["confirmed"]),
+            "attempted_ids": sorted(pair_label(p) for p in audit["attempted"]),
+            "attempted_count": len(audit["attempted"]),
+            "cancelled_ids": sorted(pair_label(p) for p in results[CANCELLED]),
+            "cancelled_count": len(results[CANCELLED]),
+            "rejected_ids": sorted(pair_label(p) for p in results[REJECTED]),
+            "rejected_count": len(results[REJECTED]),
+            "unverified_ids": sorted(pair_label(p) for p in results[UNVERIFIED]),
+            "unverified_count": len(results[UNVERIFIED]),
+            "skipped_changed_ids": sorted(
+                pair_label(p) for p in audit["skipped_changed"]
+            ),
+            "skipped_changed_count": len(audit["skipped_changed"]),
+            "skipped_protected_ids": sorted(
+                pair_label(p) for p in audit["skipped_protected"]
+            ),
+            "skipped_protected_count": len(audit["skipped_protected"]),
+            "symbols": audit["symbols"],
+            "protection_before": snapshot_for_journal(audit["protection_before"]),
+            "protection_after": snapshot_for_journal(audit["protection_after"]),
+            "protection_status": audit["protection_status"],
+            "protection_lost": audit["protection_lost"],
+            "readback_attempts": READBACK_ATTEMPTS,
+            "source": f"{SOURCE_OPEN_ORDER}+{SOURCE_POSITION}",
+            "reason": (
+                f"outcome={audit['outcome']} operation={OP_SINGLE_ENTRY} "
+                f"confirmed={len(audit['confirmed'])} "
+                f"attempted={len(audit['attempted'])} "
+                f"cancelled={len(results[CANCELLED])} "
+                f"rejected={len(results[REJECTED])} "
+                f"unverified={len(results[UNVERIFIED])} "
+                f"skipped_changed={len(audit['skipped_changed'])} "
+                f"skipped_protected={len(audit['skipped_protected'])} "
+                f"prot={audit['protection_status']}"
+            ),
+        }
+        try:
+            written = await asyncio.to_thread(append_event, event)
+        except Exception as journal_exc:
+            logging.error(
+                "journal ORDER_CANCEL_BATCH (single): запись не удалась: %s",
+                journal_exc,
+            )
+            audit_durable = False
+            return False
+        if not written:
+            logging.error(
+                "journal ORDER_CANCEL_BATCH (single): durable-запись не подтверждена"
+            )
+            audit_durable = False
+            return False
+        audit_durable = True
+        return True
+
+    try:
+        # --- Свежее authoritative-перечтение ---
+        orders_resp = await bybit_call(
+            session.get_open_orders, category=CATEGORY, settleCoin="USDT"
+        )
+        current_orders = read_open_orders(orders_resp)
+        if current_orders is None:
+            audit["outcome"] = "orders_read_unproven"
+            journal_ok = await _finish_audit()
+            if not journal_ok:
+                await query.edit_message_text(
+                    _journal_failure_text(audit), parse_mode="HTML"
+                )
+                return
+            await query.edit_message_text(
+                format_error_message(
+                    "Не удалось прочитать текущие открытые ордера. "
+                    "Ордер не отменён.",
+                    action="проверьте ордера вручную на Bybit",
+                ),
+                parse_mode="HTML",
+                reply_markup=nav,
+            )
+            return
+
+        # Повторная fail-closed классификация строго по точной паре, которая
+        # обязана быть УНИКАЛЬНОЙ. Дубликат точной пары, обнаруженный уже после
+        # израсходованного токена, — no-write ambiguous исход с durable-следом
+        # (§2, аудит, тест F): классифицировать одну из строк нельзя.
+        owned_entries = await read_bot_owned_entries()
+        match = _find_unique_pair(current_orders, preview_pair[0], preview_pair[1])
+        target = None
+        became_protected = False
+        became_ambiguous = False
+        if match is _PAIR_AMBIGUOUS:
+            became_ambiguous = True
+            logging.warning(
+                "confirm_cancel_one: неоднозначная точная пара при повторном "
+                "чтении — fail-closed, cancel_order не вызывается"
+            )
+            log_classification("confirm_one", 2, {}, {REASON_DUPLICATE_PAIR: 1})
+        elif match is not None:
+            ok, reason = classify_cancellable(match, owned_entries)
+            if ok:
+                target = match
+            else:
+                became_protected = True
+                log_classification("confirm_one", 1, {}, {reason: 1})
+
+        if target is None:
+            # Пара неоднозначна, исчезла (заполнена/отменена/изменилась) либо
+            # стала защитной. Токен уже израсходован — каждая ветка обязана
+            # оставить ровно одно durable-событие и не выполнить ни одной записи.
+            if became_ambiguous:
+                audit["outcome"] = _OUTCOME_AMBIGUOUS_AFTER_RECHECK
+                audit["skipped_protected"] = [preview_pair]
+            elif became_protected:
+                audit["outcome"] = "skipped_protected_after_recheck"
+                audit["skipped_protected"] = [preview_pair]
+            else:
+                audit["outcome"] = "skipped_changed_after_recheck"
+                audit["skipped_changed"] = [preview_pair]
+
+            # Снимок защиты сохраняем даже когда отменять нечего.
+            audit["protection_before"] = await read_protection_snapshot(
+                [preview_symbol], attempts=1
+            )
+            audit["protection_after"] = await read_protection_snapshot(
+                [preview_symbol], attempts=READBACK_ATTEMPTS
+            )
+            status, lost = compare_protection(
+                audit["protection_before"], audit["protection_after"]
+            )
+            audit["protection_status"] = status
+            audit["protection_lost"] = lost
+
+            journal_ok = await _finish_audit()
+            if not journal_ok:
+                await query.edit_message_text(
+                    _journal_failure_text(audit), parse_mode="HTML"
+                )
+                return
+            await _send_single_result(query, audit, return_mode)
+            return
+
+        # Пара по-прежнему доказанный обычный вход — точная отмена.
+        sym, oid = preview_pair
+        audit["attempted"] = [preview_pair]
+
+        # --- Снимок защиты ДО отмены ---
+        audit["protection_before"] = await read_protection_snapshot(
+            [sym], attempts=1
+        )
+
+        # --- Ровно ОДНА cancel_order по точным symbol + orderId ---
+        try:
+            resp = await bybit_call(
+                session.cancel_order, category=CATEGORY, symbol=sym, orderId=oid
+            )
+            outcome = classify_cancel_response(resp, exc=None)
+        except Exception as exc:
+            outcome = classify_cancel_response(None, exc=exc)
+            if outcome == UNVERIFIED:
+                logging.warning(
+                    "cancel_one: %s/%s — исход не доказан: %s", sym, oid, exc
+                )
+        audit["results"][outcome].append(preview_pair)
+
+        # --- Снимок защиты ПОСЛЕ отмены (bounded readback) ---
+        audit["protection_after"] = await read_protection_snapshot(
+            [sym], attempts=READBACK_ATTEMPTS
+        )
+        status, lost = compare_protection(
+            audit["protection_before"], audit["protection_after"]
+        )
+        audit["protection_status"] = status
+        audit["protection_lost"] = lost
+        audit["outcome"] = "completed"
+
+        journal_ok = await _finish_audit()
+        if not journal_ok:
+            await query.edit_message_text(
+                _journal_failure_text(audit), parse_mode="HTML"
+            )
+            return
+
+        await _send_single_result(query, audit, return_mode)
+
+    except Exception as exc:
+        logging.error("confirm_cancel_one: критическая ошибка: %s", exc)
+        # Токен израсходован: исключение не освобождает от durable-следа.
+        audit["outcome"] = "exception"
+        try:
+            journal_ok = await _finish_audit()
+        except Exception as audit_exc:
+            logging.error(
+                "journal ORDER_CANCEL_BATCH (single): аварийная запись не удалась: %s",
+                audit_exc,
+            )
+            journal_ok = False
+        if not journal_ok:
+            await query.edit_message_text(
+                _journal_failure_text(audit), parse_mode="HTML"
+            )
+            return
+        await query.edit_message_text(
+            format_error_message(
+                "Не удалось выполнить отмену ордера.",
+                action="проверьте ордера и позиции вручную на Bybit",
+            ),
+            parse_mode="HTML",
+            reply_markup=nav,
+        )
+
+
+async def cancel_cancel_one(update, context, token):
+    """Оператор отказался от отмены ордера: явный отзыв ТОЧНОГО токена (§1).
+
+    Отказ привязан к тому же single-cancel токену, что и preview
+    (``cancel_cancel_one|<token>``). Он consume/удаляет ровно этот токен из
+    :data:`_PENDING_CANCEL_ONE`, поэтому ``confirm_cancel_one|<этот_же_token>``
+    после отказа больше не способен достичь ни одной записи на биржу: снимок
+    исчезает и повторное подтверждение отклоняется как устаревшее. Отзывается
+    строго один токен — независимые preview других ордеров остаются в силе
+    (никакого broad per-user purge). Ни на одной ветке отказ не выполняет и не
+    провоцирует запись на биржу.
+
+    Привязка к владельцу как в :func:`confirm_cancel_one`: чужой Telegram-id не
+    проходит гейт ALLOWED_ID, а снимок, принадлежащий другому пользователю, не
+    отзывается и не получает исполнения — foreign-токен не превращается в
+    торговую запись и не расширяется. Неизвестный, malformed или уже
+    израсходованный токен просто ничего не отзывает и не трогает чужие токены.
+    """
+    query = update.callback_query
+    user_id = str(query.from_user.id)
+    if user_id != ALLOWED_ID:
+        return
+
+    snapshot = _PENDING_CANCEL_ONE.get(token)
+    if snapshot is not None and snapshot.get("user_id") != user_id:
+        # Чужой снимок: owner binding сохраняется, токен не трогаем, записи нет.
+        await query.edit_message_text(
+            format_error_message(
+                "Превью принадлежит другому пользователю.",
+                action="создайте своё превью",
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    # Точечный отзыв ровно этого токена (no-op для неизвестного/чужого/уже
+    # израсходованного). Другие single-cancel preview не затрагиваются.
+    _PENDING_CANCEL_ONE.pop(token, None)
+
+    await query.edit_message_text(
+        "\n\n".join([
+            format_header("ℹ️", "ОПЕРАЦИЯ ОТМЕНЕНА"),
+            "Отмена ордера не выполнялась. Ордер не изменён.",
+            format_action("обновите список ордеров через /orders"),
+        ]),
+        parse_mode="HTML",
+    )
+
+
+async def _send_single_result(query, audit, return_mode):
+    """Формирует правдивый результат отмены одного ордера + кнопку возврата.
+
+    Никогда не выдаёт UNVERIFIED за CANCELLED или REJECTED и не заявляет
+    сохранность SL/TP, если снимок после недоступен. Критическая пропажа защиты
+    приоритетнее исхода отмены. Кнопка возврата ведёт в исходное представление
+    ПОСЛЕ показанного результата, а не вместо него.
+    """
+    results = audit["results"]
+    symbols = audit["symbols"]
+    symbol = symbols[0] if symbols else ""
+    nav = InlineKeyboardMarkup([[_single_nav_button(return_mode, symbol)]])
+
+    protection_status = audit["protection_status"]
+    protection_lost = audit["protection_lost"]
+    protection_before = audit["protection_before"]
+    protection_after = audit["protection_after"]
+
+    cancelled = len(results[CANCELLED])
+    rejected = len(results[REJECTED])
+    unverified = len(results[UNVERIFIED])
+    skipped_changed = len(audit["skipped_changed"])
+    skipped_protected = len(audit["skipped_protected"])
+    # Дубликат точной пары ведётся в skipped_protected (fail-closed), но исход
+    # правдиво называется неоднозначностью, а не защитным ордером (§2, тест F).
+    ambiguous = audit.get("outcome") == _OUTCOME_AMBIGUOUS_AFTER_RECHECK
+
+    # --- Критическая пропажа защиты ---
+    if protection_status == PROTECTION_CRITICAL_MISMATCH:
+        await query.edit_message_text(
+            "\n\n".join([
+                format_header("🚨", "КРИТИЧЕСКОЕ НЕСООТВЕТСТВИЕ — ЗАЩИТА ИСЧЕЗЛА"),
+                format_warning_list(
+                    ["После отмены ордера доказанно исчезли защитные уровни:"]
+                    + protection_lost
+                    + [
+                        "НЕМЕДЛЕННО проверьте позицию и SL/TP вручную на Bybit.",
+                        "НЕ повторяйте отмену без проверки.",
+                    ]
+                ),
+                "",
+                format_value_block([
+                    ("Отменено", cancelled),
+                    ("Отклонено Bybit", rejected),
+                    ("Исход неизвестен", unverified),
+                ]),
+                format_action(
+                    "НЕМЕДЛЕННО проверьте SL/TP позиции вручную на Bybit"
+                ),
+            ]),
+            parse_mode="HTML",
+            reply_markup=nav,
+        )
+        return
+
+    # --- Заголовок по доказанному исходу ---
+    if cancelled:
+        header = format_header("✅", "ОРДЕР ОТМЕНЁН")
+    elif rejected:
+        header = format_header("❌", "ОТМЕНА ОТКЛОНЕНА BYBIT")
+    elif unverified:
+        header = format_header("⚠️", "ИСХОД ОТМЕНЫ НЕ ПОДТВЕРЖДЁН")
+    elif skipped_protected:
+        if ambiguous:
+            header = format_header("🛡", "ОТМЕНА ПРОПУЩЕНА — НЕОДНОЗНАЧНО")
+        else:
+            header = format_header("🛡", "ОТМЕНА ПРОПУЩЕНА — ЗАЩИТНЫЙ ОРДЕР")
+    elif skipped_changed:
+        header = format_header("ℹ️", "ОРДЕР ИЗМЕНИЛСЯ — НЕ ОТМЕНЁН")
+    else:
+        header = format_header("ℹ️", "ОРДЕР НЕ ОТМЕНЁН")
+
+    rows = [("Отменено", cancelled)]
+    if rejected:
+        rows.append(("Отклонено Bybit", rejected))
+    if unverified:
+        rows.append(("Исход не подтверждён", unverified))
+    if skipped_changed:
+        rows.append(("Пропущено (изменён)", skipped_changed))
+    if skipped_protected:
+        rows.append((
+            "Пропущено (неоднозначно)" if ambiguous else "Пропущено (защитный)",
+            skipped_protected,
+        ))
+    rows.append(("Сохранность SL/TP", _protection_result_text(protection_status)))
+
+    warnings = []
+    if unverified:
+        warnings.append(
+            "Исход отмены не подтверждён (таймаут или неоднозначный ответ). "
+            "Состояние ордера могло измениться — проверьте вручную на Bybit."
+        )
+    if rejected:
+        warnings.append("Bybit отклонил отмену: ордер остаётся активным.")
+    if skipped_changed:
+        warnings.append(
+            "Ордер изменился или исчез после preview — отмена не отправлялась."
+        )
+    if skipped_protected:
+        if ambiguous:
+            warnings.append(
+                "Точная пара (символ + orderId) встретилась в ответе биржи "
+                "более одного раза — отмена не отправлялась (fail-closed)."
+            )
+        else:
+            warnings.append(
+                "После повторной проверки ордер стал защитным или неоднозначным — "
+                "отмена не отправлялась."
+            )
+    if protection_before is None:
+        warnings.append(
+            "Снимок защиты ДО отмены недоступен — сохранность SL/TP не доказана."
+        )
+    elif protection_after is None:
+        warnings.append(
+            f"Снимок защиты ПОСЛЕ отмены недоступен после {READBACK_ATTEMPTS} "
+            "попыток — сохранность SL/TP не доказана. Проверьте SL/TP позиции "
+            "вручную."
+        )
+    elif protection_status == PROTECTION_UNVERIFIED:
+        warnings.append(
+            "Проверка сохранности SL/TP неоднозначна. Проверьте SL/TP позиции "
+            "вручную."
+        )
+
+    sections = [header, "", format_value_block(rows)]
+    if warnings:
+        sections.append(format_warning_list(warnings))
+        sections.append(
+            format_action("проверьте ордера и позиции вручную на Bybit")
+        )
+    else:
+        sections.append(format_action("вернитесь к списку ордеров"))
+
+    await query.edit_message_text(
+        "\n\n".join(s for s in sections if s),
+        parse_mode="HTML",
+        reply_markup=nav,
+    )

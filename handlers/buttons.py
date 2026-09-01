@@ -54,6 +54,9 @@ from handlers.cancel_orders import (
     preview_cancel_orders,
     confirm_cancel_orders,
     cancel_cancel_batch,
+    preview_cancel_one,
+    confirm_cancel_one,
+    cancel_cancel_one,
 )
 
 
@@ -346,22 +349,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await check_positions(update, context)
 
         elif data.startswith("cancel_o|") or data.startswith("co|"):
-            # Принимаются оба формата: компактный "co|sym|oid|l" и устаревший
+            # S2: индивидуальная ❌ НИКОГДА не отменяет напрямую. Принимаются оба
+            # формата: компактный "co|sym|oid|s" и устаревший
             # "cancel_o|sym|oid|list" — уже отправленные кнопки должны работать.
+            # Первое нажатие ведёт только в безопасный preview (ноль записей).
             parts = data.split("|")
-            sym, oid = parts[1], parts[2]
+            sym = parts[1] if len(parts) > 1 else ""
+            oid = parts[2] if len(parts) > 2 else ""
             raw_mode = parts[3] if len(parts) > 3 else "list"
             mode = "sym" if raw_mode in ("sym", "s") else "list"
+            await preview_cancel_one(update, context, sym, oid, mode)
 
-            try:
-                await bybit_call(session.cancel_order, category="linear", symbol=sym, orderId=oid)
-            except Exception as e:
-                logging.debug(f"cancel_order {sym}/{oid}: {e}")  # likely already cancelled
+        elif data.startswith("confirm_cancel_one|"):
+            await confirm_cancel_one(update, context, data.split("|", 1)[1])
 
-            if mode == "sym":
-                await view_symbol_orders(update, context, sym)
-            else:
-                await view_orders(update, context)
+        elif data.startswith("cancel_cancel_one|"):
+            # S2 §1: отказ несёт точный токен и отзывает ровно его — тот же
+            # confirm_cancel_one|<token> после отказа записи не достигает.
+            await cancel_cancel_one(update, context, data.split("|", 1)[1])
 
         elif data in ("cancel_limit_entries", "cancel_all_orders"):
             # HIGH-7: глобальный cancel_all_orders удалён. Оба callback ведут в

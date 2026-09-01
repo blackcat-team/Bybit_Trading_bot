@@ -2019,3 +2019,843 @@ class TestStrictOwnershipInCancelFlow:
             "orderId": _LIVE_ORDER_ID,
         }]
         assert events[0]["cancelled_ids"] == [f"ETHUSDT:{_LIVE_ORDER_ID}"]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# S2 — Безопасная отмена ОДНОГО выбранного ордера (PRE-MID SAFETY GATE)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Индивидуальная кнопка ❌ переиспользует весь контракт HIGH-7 для ровно одной
+# точной пары (symbol, orderId). Тесты драйвят реальные co.preview_cancel_one /
+# co.confirm_cancel_one / co.cancel_cancel_one; классификатор, разбор исхода,
+# снимок защиты и durable-аудит не дублируются в assertions. Пакетный контракт
+# HIGH-7 выше остаётся зелёным (§M — регрессия пакета).
+
+
+def _last_markup(update):
+    """reply_markup последнего edit_message_text (или None)."""
+    call = update.callback_query.edit_message_text.await_args
+    return call.kwargs.get("reply_markup") if call else None
+
+
+def _button_callbacks():
+    """callback_data всех InlineKeyboardButton, построенных за текущий поток.
+
+    В изолированном загрузчике telegram замокирован, поэтому кнопки — MagicMock,
+    и их callback_data читается из записанных вызовов, а не из объекта разметки.
+    _run_single_flow сбрасывает счётчик в начале каждого потока.
+    """
+    out = []
+    for call in co.InlineKeyboardButton.call_args_list:
+        cb = call.kwargs.get("callback_data")
+        if cb is not None:
+            out.append(cb)
+    return out
+
+
+async def _run_single_flow(fake, monkeypatch, *, symbol="BTCUSDT", order_id="e-1",
+                           mode="list", journal_sink=None, user_id=_UID,
+                           confirm_user_id=None, owned=None, journal_file=None,
+                           auto_confirm=True):
+    """preview_cancel_one → (опционально) confirm_cancel_one.
+
+    Возвращает (token, preview_upd, confirm_upd). confirm_upd=None, если preview
+    не создал токен (небезопасная строка) или auto_confirm=False.
+    """
+    co._PENDING_CANCEL_ONE.clear()
+    co.InlineKeyboardButton.reset_mock()
+    monkeypatch.setattr(co, "bybit_call", fake)
+    monkeypatch.setattr(co.asyncio, "sleep", AsyncMock())
+    if journal_file is not None:
+        monkeypatch.setattr(journal_mod, "JOURNAL_FILE", journal_file)
+        monkeypatch.setattr(co, "get_bot_entry_identities",
+                            journal_mod.get_bot_entry_identities)
+    else:
+        monkeypatch.setattr(co, "get_bot_entry_identities",
+                            lambda: dict(owned or {}))
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(co.asyncio, "to_thread", fake_to_thread)
+
+    if journal_sink is not None:
+        monkeypatch.setattr(co, "append_event", journal_sink)
+
+    preview_upd = _make_update(user_id)
+    await co.preview_cancel_one(preview_upd, MagicMock(), symbol, order_id, mode)
+
+    tokens = list(co._PENDING_CANCEL_ONE)
+    if not tokens or not auto_confirm:
+        return (tokens[0] if tokens else None), preview_upd, None
+
+    confirm_upd = _make_update(confirm_user_id or user_id)
+    await co.confirm_cancel_one(confirm_upd, MagicMock(), tokens[0])
+    return tokens[0], preview_upd, confirm_upd
+
+
+class TestS2PreviewIsZeroWrite:
+    """§A, §3: первый ❌ не выполняет ни одной записи и требует подтверждения."""
+
+    @pytest.mark.asyncio
+    async def test_first_click_makes_zero_cancel_and_requires_confirm(self, monkeypatch):
+        """§A, §D: preview показан, cancel_order == 0, есть Confirm-токен."""
+        fake = _Bybit([_orders(_entry("e-1", symbol="BTCUSDT"))])
+        token, preview_upd, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, auto_confirm=False
+        )
+        assert fake.cancel_calls == [], "preview обязан быть zero-write"
+        assert confirm_upd is None
+        assert token is not None
+        text = _last_edit(preview_upd)
+        assert "ПОДТВЕРЖДЕНИЕ" in text.upper()
+        assert "BTCUSDT" in text
+        assert f"confirm_cancel_one|{token}" in _button_callbacks()
+
+    @pytest.mark.asyncio
+    async def test_preview_shows_operator_context(self, monkeypatch):
+        """§3: preview показывает символ, сторону, тип, цену, qty и хвост orderId."""
+        fake = _Bybit([_orders(
+            _entry("abcdef123456", symbol="BTCUSDT", side="Buy", price="95", qty="1")
+        )])
+        _, preview_upd, _ = await _run_single_flow(
+            fake, monkeypatch, order_id="abcdef123456", auto_confirm=False
+        )
+        text = _last_edit(preview_upd)
+        assert "Buy" in text
+        assert "Limit" in text
+        assert "95" in text
+        # Полный orderId не выводится, только безопасный хвост.
+        assert "abcdef123456" not in text
+        assert "123456" in text
+
+
+class TestS2ProtectiveRowNeverCancelled:
+    """§B: защитная / conditional строка не авторизует отмену."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("over", [
+        {"reduceOnly": True},
+        {"closeOnTrigger": True},
+        {"triggerPrice": "100"},
+        {"stopOrderType": "StopLoss"},
+        {"stopOrderType": "TakeProfit"},
+        {"stopOrderType": "TrailingStop"},
+        {"orderFilter": "StopOrder"},
+        {"createType": "CreateByClosing"},
+        {"orderStatus": "Untriggered"},
+    ])
+    async def test_protective_row_blocks_cancel(self, monkeypatch, over):
+        """§B: SL/TP/conditional/reduce-only → preview запрещает, cancel == 0."""
+        fake = _Bybit([_orders(_entry("e-1", symbol="BTCUSDT", **over))])
+        token, preview_upd, confirm_upd = await _run_single_flow(fake, monkeypatch)
+        assert fake.cancel_calls == []
+        assert token is None, "защитная строка не создаёт токен подтверждения"
+        assert confirm_upd is None
+        assert "ЗАПРЕЩЕНА" in _last_edit(preview_upd).upper()
+
+
+class TestS2MalformedFailClosed:
+    """§C: отсутствующие/malformed дискриминаторы и битый callback fail-closed."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("over", [
+        {"_drop": ("stopOrderType",)},
+        {"_drop": ("orderFilter",)},
+        {"_drop": ("createType",)},
+        {"orderStatus": None},
+        {"stopOrderType": 7},
+        {"orderType": "Market"},
+        {"orderType": ""},
+    ])
+    async def test_missing_or_malformed_discriminator_blocks(self, monkeypatch, over):
+        """§C: missing/malformed safety-поле → отмена запрещена, cancel == 0."""
+        fake = _Bybit([_orders(_entry("e-1", symbol="BTCUSDT", **over))])
+        token, preview_upd, _ = await _run_single_flow(fake, monkeypatch)
+        assert fake.cancel_calls == []
+        assert token is None
+        assert "ЗАПРЕЩЕНА" in _last_edit(preview_upd).upper()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("symbol,order_id", [
+        ("", "e-1"),
+        ("BTCUSDT", ""),
+        ("   ", "e-1"),
+    ])
+    async def test_malformed_callback_identity_blocks(self, monkeypatch, symbol, order_id):
+        """§1, §C: callback без точной пары → fail-closed, чтения ордеров нет."""
+        fake = _Bybit([_orders(_entry("e-1", symbol="BTCUSDT"))])
+        token, preview_upd, _ = await _run_single_flow(
+            fake, monkeypatch, symbol=symbol, order_id=order_id
+        )
+        assert fake.cancel_calls == []
+        assert token is None
+        assert "НЕВОЗМОЖНА" in _last_edit(preview_upd).upper()
+
+
+class TestS2FreshRevalidation:
+    """§E, §F, §G: свежее перечтение защищает от stale-preview и чужих строк."""
+
+    @pytest.mark.asyncio
+    async def test_row_became_protective_before_confirm(self, monkeypatch):
+        """§E: preview безопасен, но перед confirm строка стала reduce-only → skip."""
+        fake = _Bybit(
+            [
+                _orders(_entry("e-1", symbol="BTCUSDT")),
+                _orders(_entry("e-1", symbol="BTCUSDT", reduceOnly=True)),
+            ],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        events = []
+        _, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert fake.cancel_calls == [], "изменившаяся строка не отменяется"
+        ev = events[0]
+        assert ev["cancelled_count"] == 0
+        assert ev["skipped_protected_ids"] == ["BTCUSDT:e-1"]
+        assert ev["outcome"] == "skipped_protected_after_recheck"
+        assert "ОРДЕР ОТМЕНЁН" not in _last_edit(confirm_upd)
+
+    @pytest.mark.asyncio
+    async def test_row_disappeared_before_confirm(self, monkeypatch):
+        """§E: строка исчезла (заполнена/отменена) → truthful skip, cancel == 0."""
+        fake = _Bybit(
+            [
+                _orders(_entry("e-1", symbol="BTCUSDT")),
+                _orders(),
+            ],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        events = []
+        _, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert fake.cancel_calls == []
+        ev = events[0]
+        assert ev["cancelled_count"] == 0
+        assert ev["skipped_changed_ids"] == ["BTCUSDT:e-1"]
+        assert ev["outcome"] == "skipped_changed_after_recheck"
+
+    @pytest.mark.asyncio
+    async def test_new_order_after_preview_never_eligible(self, monkeypatch):
+        """§F: другой ордер, появившийся после preview, не становится целью."""
+        # Preview e-1 исчез, confirm видит только e-2 (новый).
+        fake = _Bybit(
+            [
+                _orders(_entry("e-1", symbol="BTCUSDT")),
+                _orders(_entry("e-2", symbol="BTCUSDT")),
+            ],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        await _run_single_flow(fake, monkeypatch)
+        cancelled = [c["orderId"] for c in fake.cancel_calls]
+        assert cancelled == [], "только исходная точная пара может рассматриваться"
+
+    @pytest.mark.asyncio
+    async def test_same_order_id_other_symbol_not_cancelled(self, monkeypatch):
+        """§G: тот же orderId на другом символе не отменяется (точная пара)."""
+        # Preview BTCUSDT:e-1, confirm видит ETHUSDT:e-1 (тот же oid, другой символ).
+        fake = _Bybit(
+            [
+                _orders(_entry("e-1", symbol="BTCUSDT")),
+                _orders(_entry("e-1", symbol="ETHUSDT")),
+            ],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        events = []
+        await _run_single_flow(
+            fake, monkeypatch, symbol="BTCUSDT", order_id="e-1",
+            journal_sink=lambda ev: events.append(ev) or True,
+        )
+        assert fake.cancel_calls == [], "чужой символ с тем же orderId неприкосновенен"
+        assert events[0]["cancelled_count"] == 0
+        assert events[0]["skipped_changed_ids"] == ["BTCUSDT:e-1"]
+
+    @pytest.mark.asyncio
+    async def test_preview_other_symbol_same_id_not_found(self, monkeypatch):
+        """§G: на preview callback BTCUSDT:e-1, а есть только ETHUSDT:e-1 → не найден."""
+        fake = _Bybit([_orders(_entry("e-1", symbol="ETHUSDT"))])
+        token, preview_upd, _ = await _run_single_flow(
+            fake, monkeypatch, symbol="BTCUSDT", order_id="e-1"
+        )
+        assert fake.cancel_calls == []
+        assert token is None
+        assert "НЕ НАЙДЕН" in _last_edit(preview_upd).upper()
+
+
+class TestS2SingleWriteAndOutcome:
+    """§6, §7, §H, §I, §J: ровно одна запись и строгий разбор исхода."""
+
+    @pytest.mark.asyncio
+    async def test_success_is_single_exact_cancel(self, monkeypatch):
+        """§H: retCode int 0 → CANCELLED и ровно одна точная cancel_order."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT", sl="90", tp="130"))],
+            cancel_responses={"e-1": {"retCode": 0, "result": {"orderId": "e-1"}}},
+        )
+        events = []
+        _, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert fake.cancel_calls == [
+            {"category": "linear", "symbol": "BTCUSDT", "orderId": "e-1"}
+        ]
+        ev = events[0]
+        assert ev["cancelled_count"] == 1
+        assert ev["rejected_count"] == 0
+        assert ev["unverified_count"] == 0
+        assert ev["attempted_count"] == 1
+        assert ev["cancelled_ids"] == ["BTCUSDT:e-1"]
+        assert "ОТМЕНЁН" in _last_edit(confirm_upd).upper()
+
+    @pytest.mark.asyncio
+    async def test_business_rejection_is_rejected_no_retry(self, monkeypatch):
+        """§I: доказанный business-код → REJECTED, ровно одна попытка, без retry."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT"))],
+            cancel_errors={"e-1": _Reject(110007)},
+        )
+        events = []
+        _, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert len(fake.cancel_calls) == 1
+        ev = events[0]
+        assert ev["rejected_count"] == 1
+        assert ev["cancelled_count"] == 0
+        assert "ОТКЛОН" in _last_edit(confirm_upd).upper()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("exc", [
+        RuntimeError("ReadTimeout"),
+        ConnectionError("connection reset"),
+    ])
+    async def test_transport_failure_is_unverified_no_retry(self, monkeypatch, exc):
+        """§J: таймаут/обрыв → UNVERIFIED, одна попытка, без ложного успеха."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT"))],
+            cancel_errors={"e-1": exc},
+        )
+        events = []
+        _, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert len(fake.cancel_calls) == 1, "повторная отмена при неоднозначности запрещена"
+        ev = events[0]
+        assert ev["unverified_count"] == 1
+        assert ev["cancelled_count"] == 0
+        text = _last_edit(confirm_upd)
+        assert "НЕ ПОДТВЕРЖДЁН" in text.upper()
+        assert "ОРДЕР ОТМЕНЁН" not in text
+        # Ложная формулировка «уже отменён» из старого пути исчезла.
+        assert "уже отмен" not in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_malformed_ack_is_unverified(self, monkeypatch):
+        """§7: ответ без retCode отменой не считается ни в журнале, ни в Telegram."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT"))],
+            cancel_responses={"e-1": {"result": {"orderId": "e-1"}}},
+        )
+        events = []
+        _, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        ev = events[0]
+        assert ev["cancelled_count"] == 0
+        assert ev["unverified_count"] == 1
+        assert "ОРДЕР ОТМЕНЁН" not in _last_edit(confirm_upd)
+
+
+class TestS2TokenSafety:
+    """§4, §K: токен user-bound, short-TTL, одноразовый, точная пара."""
+
+    async def _preview_only(self, fake, monkeypatch):
+        co._PENDING_CANCEL_ONE.clear()
+        monkeypatch.setattr(co, "bybit_call", fake)
+        monkeypatch.setattr(co.asyncio, "sleep", AsyncMock())
+        monkeypatch.setattr(co, "get_bot_entry_identities", lambda: {})
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+        monkeypatch.setattr(co.asyncio, "to_thread", fake_to_thread)
+
+        preview_upd = _make_update(_UID)
+        await co.preview_cancel_one(preview_upd, MagicMock(), "BTCUSDT", "e-1", "list")
+        return next(iter(co._PENDING_CANCEL_ONE))
+
+    @pytest.mark.asyncio
+    async def test_wrong_user_cannot_confirm(self, monkeypatch):
+        """§K: чужой Telegram-аккаунт и чужой владелец снимка не отменяют ничего."""
+        fake = _Bybit([_orders(_entry("e-1", symbol="BTCUSDT"))])
+        token = await self._preview_only(fake, monkeypatch)
+
+        # Барьер 1: чужой Telegram id не проходит ALLOWED_ID, снимок не гасится.
+        foreign = _make_update("999")
+        await co.confirm_cancel_one(foreign, MagicMock(), token)
+        assert fake.cancel_calls == []
+        assert token in co._PENDING_CANCEL_ONE
+
+        # Барьер 2: снимок принадлежит другому пользователю.
+        co._PENDING_CANCEL_ONE[token]["user_id"] = "777"
+        owner = _make_update(_UID)
+        await co.confirm_cancel_one(owner, MagicMock(), token)
+        assert fake.cancel_calls == []
+        assert "другому пользователю" in _last_edit(owner).lower()
+
+    @pytest.mark.asyncio
+    async def test_expired_token_cannot_confirm(self, monkeypatch):
+        """§4, §K: просроченный (TTL) токен отмену не выполняет."""
+        fake = _Bybit([_orders(_entry("e-1", symbol="BTCUSDT"))])
+        token = await self._preview_only(fake, monkeypatch)
+        co._PENDING_CANCEL_ONE[token]["timestamp"] -= (co.PREVIEW_TTL_SEC + 10)
+        upd = _make_update(_UID)
+        await co.confirm_cancel_one(upd, MagicMock(), token)
+        assert fake.cancel_calls == []
+        assert "УСТАРЕЛО" in _last_edit(upd).upper()
+        assert token not in co._PENDING_CANCEL_ONE
+
+    @pytest.mark.asyncio
+    async def test_reused_token_is_one_shot(self, monkeypatch):
+        """§K: одноразовый токен — повторный confirm ничего не отменяет второй раз."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        monkeypatch.setattr(co, "append_event", lambda ev: True)
+        token = await self._preview_only(fake, monkeypatch)
+        first = _make_update(_UID)
+        await co.confirm_cancel_one(first, MagicMock(), token)
+        assert len(fake.cancel_calls) == 1
+        # Повторный confirm с тем же токеном.
+        second = _make_update(_UID)
+        await co.confirm_cancel_one(second, MagicMock(), token)
+        assert len(fake.cancel_calls) == 1, "повторный токен не повторяет отмену"
+        text = _last_edit(second).lower()
+        assert "устарело" in text or "использовано" in text
+
+    @pytest.mark.asyncio
+    async def test_malformed_unknown_token_rejected(self, monkeypatch):
+        """§K: неизвестный (malformed) токен отмену не выполняет."""
+        fake = _Bybit([_orders(_entry("e-1", symbol="BTCUSDT"))])
+        monkeypatch.setattr(co, "bybit_call", fake)
+        monkeypatch.setattr(co.asyncio, "sleep", AsyncMock())
+        co._PENDING_CANCEL_ONE.clear()
+        upd = _make_update(_UID)
+        await co.confirm_cancel_one(upd, MagicMock(), "not-a-real-token")
+        assert fake.cancel_calls == []
+        text = _last_edit(upd).lower()
+        assert "устарело" in text or "использовано" in text
+
+
+class TestS2ProtectionReadback:
+    """§8, §L: снимок защиты до и после, VERIFIED / UNVERIFIED / CRITICAL."""
+
+    @pytest.mark.asyncio
+    async def test_unchanged_protection_verified(self, monkeypatch):
+        """§L: неизменные SL/TP → VERIFIED."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [
+                _positions(_pos(symbol="BTCUSDT", side="Buy", sl="90", tp="130")),
+                _positions(_pos(symbol="BTCUSDT", side="Buy", sl="90", tp="130")),
+            ],
+        )
+        events = []
+        await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert events[0]["protection_status"] == co.PROTECTION_VERIFIED
+
+    @pytest.mark.asyncio
+    async def test_unavailable_readback_unverified(self, monkeypatch):
+        """§L: недоступный post-readback → UNVERIFIED + предупреждение."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [
+                _positions(_pos(symbol="BTCUSDT", side="Buy", sl="90", tp="130")),
+                RuntimeError("positions unavailable"),
+            ],
+        )
+        events = []
+        _, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert events[0]["protection_status"] == co.PROTECTION_UNVERIFIED
+        assert "вручную" in _last_edit(confirm_upd).lower()
+
+    @pytest.mark.asyncio
+    async def test_proven_protection_loss_is_critical(self, monkeypatch):
+        """§L: доказанная пропажа SL той же позиции → CRITICAL_MISMATCH + алерт."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [
+                _positions(_pos(symbol="BTCUSDT", side="Buy", size="1", sl="90", tp="130")),
+                _positions(_pos(symbol="BTCUSDT", side="Buy", size="1", sl="", tp="130")),
+            ],
+        )
+        events = []
+        _, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert events[0]["protection_status"] == co.PROTECTION_CRITICAL_MISMATCH
+        text = _last_edit(confirm_upd)
+        assert "КРИТИЧ" in text.upper()
+        assert any("SL" in item for item in events[0]["protection_lost"])
+
+
+class TestS2DurableAudit:
+    """§9: одиночная отмена переиспользует ORDER_CANCEL_BATCH, оставаясь truthful."""
+
+    @pytest.mark.asyncio
+    async def test_single_cancel_writes_backward_compatible_event(self, monkeypatch):
+        """§9: событие — ORDER_CANCEL_BATCH с operation=cancel_single_entry."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        events = []
+        await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert len(events) == 1
+        ev = events[0]
+        assert ev["event"] == journal_mod.ORDER_CANCEL_BATCH
+        assert ev["operation"] == co.OP_SINGLE_ENTRY
+        assert ev["previewed_count"] == 1
+        assert ev["confirmed_count"] == 1
+        assert journal_mod.ORDER_CANCEL_BATCH not in journal_mod.TERMINAL_EVENTS
+
+    @pytest.mark.asyncio
+    async def test_orders_read_unproven_still_writes_event(self, monkeypatch):
+        """§9: недоказанное перечтение → след есть, cancel == 0, правдивая ошибка."""
+        fake = _Bybit([
+            _orders(_entry("e-1", symbol="BTCUSDT")),
+            _orders(_entry("e-1", symbol="BTCUSDT"), ret_code=10001),
+        ])
+        events = []
+        _, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert fake.cancel_calls == []
+        assert len(events) == 1
+        assert events[0]["outcome"] == "orders_read_unproven"
+        assert "не отменён" in _last_edit(confirm_upd).lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sink", ["false", "raise"])
+    async def test_failed_journal_write_degrades_to_critical(self, monkeypatch, sink):
+        """§9: append_event=False/исключение → нет ложного успеха, ручная проверка."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        calls = []
+
+        def journal(event):
+            calls.append(event)
+            if sink == "raise":
+                raise OSError("disk full")
+            return False
+
+        _, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=journal
+        )
+        assert len(calls) == 1, "автоматический повтор записи запрещён"
+        text = _last_edit(confirm_upd)
+        assert "ЖУРНАЛ НЕ ЗАПИСАН" in text.upper()
+        assert "ОРДЕР ОТМЕНЁН" not in text
+        assert "вручную" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_exception_after_write_does_not_duplicate_event(self, monkeypatch):
+        """§9: одно подтверждение → максимум одна попытка записи журнала."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        events = []
+
+        async def boom(query, audit, return_mode):
+            raise RuntimeError("render failed")
+
+        monkeypatch.setattr(co, "_send_single_result", boom)
+        _, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert len(events) == 1, "второе событие исказило бы аудит"
+        assert "вручную" in _last_edit(confirm_upd).lower()
+
+
+class TestS2NavigationViewMode:
+    """§10, §N: возврат в исходное представление ПОСЛЕ результата."""
+
+    @pytest.mark.asyncio
+    async def test_list_mode_returns_to_global_list(self, monkeypatch):
+        """§N: одиночная отмена из общего списка ведёт назад в общий список."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        monkeypatch.setattr(co, "append_event", lambda ev: True)
+        await _run_single_flow(fake, monkeypatch, mode="list")
+        assert "refresh_orders" in _button_callbacks()
+        assert "show_orders|BTCUSDT" not in _button_callbacks()
+
+    @pytest.mark.asyncio
+    async def test_sym_mode_returns_to_symbol_view(self, monkeypatch):
+        """§N: одиночная отмена из карточки символа ведёт назад в карточку символа."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        monkeypatch.setattr(co, "append_event", lambda ev: True)
+        await _run_single_flow(fake, monkeypatch, mode="sym")
+        assert "show_orders|BTCUSDT" in _button_callbacks()
+
+
+class TestS2BatchSurfaceUntouched:
+    """§M: пакетный поток HIGH-7 не задет — раздельные хранилища токенов."""
+
+    def test_single_and_batch_pending_stores_are_separate(self):
+        assert co._PENDING_CANCEL is not co._PENDING_CANCEL_ONE
+
+    @pytest.mark.asyncio
+    async def test_batch_flow_still_works_alongside_single(self, monkeypatch):
+        """§M: пакетная отмена по-прежнему проходит preview → confirm → cancel."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"), _entry("e-2", symbol="ETHUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT"), _pos(symbol="ETHUSDT"))],
+        )
+        await _run_flow(fake, monkeypatch)
+        cancelled = sorted(c["orderId"] for c in fake.cancel_calls)
+        assert cancelled == ["e-1", "e-2"]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# S2-R1 — Ремедиация QA-B BLOCKER 1: явный отказ отзывает точный токен
+# ════════════════════════════════════════════════════════════════════════════
+
+
+async def _preview_only_token(fake, monkeypatch, *, symbol="BTCUSDT",
+                              order_id="e-1", mode="list", user_id=_UID,
+                              clear=True):
+    """Создаёт один preview одиночной отмены и возвращает его токен.
+
+    В отличие от :func:`_run_single_flow` не подтверждает и (при ``clear=False``)
+    не очищает хранилище — нужно для независимых сосуществующих токенов (§B).
+    Ставит те же offline-моки, что и остальной S2-поток.
+    """
+    if clear:
+        co._PENDING_CANCEL_ONE.clear()
+    monkeypatch.setattr(co, "bybit_call", fake)
+    monkeypatch.setattr(co.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(co, "get_bot_entry_identities", lambda: {})
+    monkeypatch.setattr(co, "append_event", lambda ev: True)
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(co.asyncio, "to_thread", fake_to_thread)
+
+    before = set(co._PENDING_CANCEL_ONE)
+    await co.preview_cancel_one(_make_update(user_id), MagicMock(),
+                                symbol, order_id, mode)
+    created = set(co._PENDING_CANCEL_ONE) - before
+    assert len(created) == 1, "preview обязан создать ровно один токен"
+    return created.pop()
+
+
+class TestS2AbortRevokesExactToken:
+    """§A–D: отказ привязан к точному токену и отзывает ровно его."""
+
+    @pytest.mark.asyncio
+    async def test_abort_revokes_exact_token(self, monkeypatch):
+        """§A: preview → отказ по ТОМУ ЖЕ токену → confirm тем же токеном не пишет."""
+        fake = _Bybit(
+            [_orders(_entry("e-1", symbol="BTCUSDT"))],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        token, _, _ = await _run_single_flow(fake, monkeypatch, auto_confirm=False)
+        assert token is not None
+        assert token in co._PENDING_CANCEL_ONE
+
+        abort_upd = _make_update(_UID)
+        await co.cancel_cancel_one(abort_upd, MagicMock(), token)
+        assert token not in co._PENDING_CANCEL_ONE, "отказ обязан отозвать ТОТ ЖЕ токен"
+        abort_text = _last_edit(abort_upd)
+        assert "ОТМЕНЕНА" in abort_text.upper()
+        assert "не выполнялась" in abort_text.lower()
+
+        # Подтверждение исходным токеном после отказа записи не достигает.
+        confirm_upd = _make_update(_UID)
+        await co.confirm_cancel_one(confirm_upd, MagicMock(), token)
+        assert fake.cancel_calls == [], "после отказа confirm|token не пишет на биржу"
+        text = _last_edit(confirm_upd).lower()
+        assert "устарело" in text or "использовано" in text
+
+    @pytest.mark.asyncio
+    async def test_abort_is_token_scoped(self, monkeypatch):
+        """§B: два независимых preview; отказ A не трогает B, B остаётся исполнимым."""
+        fake = _Bybit(
+            [_orders(
+                _entry("e-1", symbol="BTCUSDT"),
+                _entry("e-2", symbol="ETHUSDT"),
+            )],
+            [_positions(_pos(symbol="BTCUSDT"), _pos(symbol="ETHUSDT"))],
+        )
+        token_a = await _preview_only_token(
+            fake, monkeypatch, symbol="BTCUSDT", order_id="e-1", clear=True
+        )
+        token_b = await _preview_only_token(
+            fake, monkeypatch, symbol="ETHUSDT", order_id="e-2", clear=False
+        )
+        assert token_a != token_b
+        assert len(co._PENDING_CANCEL_ONE) == 2
+
+        # Отказ строго по токену A (никакого broad per-user purge).
+        await co.cancel_cancel_one(_make_update(_UID), MagicMock(), token_a)
+        assert token_a not in co._PENDING_CANCEL_ONE
+        assert token_b in co._PENDING_CANCEL_ONE, "B остаётся независимо валидным"
+
+        # A исполнить нельзя.
+        await co.confirm_cancel_one(_make_update(_UID), MagicMock(), token_a)
+        assert fake.cancel_calls == [], "отозванный токен A на биржу не пишет"
+
+        # B по-прежнему исполняется — ровно одна точная отмена e-2.
+        await co.confirm_cancel_one(_make_update(_UID), MagicMock(), token_b)
+        assert fake.cancel_calls == [
+            {"category": "linear", "symbol": "ETHUSDT", "orderId": "e-2"}
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_token", ["not-a-real-token", ""])
+    async def test_malformed_unknown_abort_token_is_safe(self, monkeypatch, bad_token):
+        """§C: неизвестный/пустой токен — без записи, без краша, чужой токен цел."""
+        fake = _Bybit([_orders(_entry("e-1", symbol="BTCUSDT"))])
+        token = await _preview_only_token(fake, monkeypatch)
+
+        abort_upd = _make_update(_UID)
+        await co.cancel_cancel_one(abort_upd, MagicMock(), bad_token)
+        assert fake.cancel_calls == []
+        assert token in co._PENDING_CANCEL_ONE, "неизвестный отказ не трогает валидный токен"
+        assert len(co._PENDING_CANCEL_ONE) == 1
+        assert "ОТМЕНЕНА" in _last_edit(abort_upd).upper()
+
+    @pytest.mark.asyncio
+    async def test_wrong_user_abort_cannot_execute_or_broaden(self, monkeypatch):
+        """§D: чужой отказ не отзывает, не исполняет и не расширяет токен."""
+        fake = _Bybit([_orders(_entry("e-1", symbol="BTCUSDT"))])
+        token = await _preview_only_token(fake, monkeypatch)
+
+        # Барьер 1: чужой Telegram-id не проходит гейт ALLOWED_ID.
+        await co.cancel_cancel_one(_make_update("999"), MagicMock(), token)
+        assert fake.cancel_calls == []
+        assert token in co._PENDING_CANCEL_ONE, "чужой id токен не отзывает"
+
+        # Барьер 2: снимок принадлежит другому пользователю — не отзывается.
+        co._PENDING_CANCEL_ONE[token]["user_id"] = "777"
+        owner = _make_update(_UID)
+        await co.cancel_cancel_one(owner, MagicMock(), token)
+        assert fake.cancel_calls == []
+        assert token in co._PENDING_CANCEL_ONE, "foreign-снимок не отзывается"
+        assert "другому пользователю" in _last_edit(owner).lower()
+
+        # Критично: чужое взаимодействие не превратило токен в исполнение.
+        confirm_upd = _make_update(_UID)
+        await co.confirm_cancel_one(confirm_upd, MagicMock(), token)
+        assert fake.cancel_calls == [], "foreign-токен не исполняется и после отказа"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# S2-R1 — Ремедиация QA-B BLOCKER 2: дубликат точной пары fail-closed
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _protective_dup(order_id="e-1", symbol="BTCUSDT"):
+    """Реальная защитная строка с той же точной парой: полный набор дискриминаторов."""
+    return _entry(
+        order_id, symbol=symbol, reduceOnly=True, closeOnTrigger=True,
+        triggerPrice="88000", stopOrderType="StopLoss",
+        orderFilter="StopOrder", createType="CreateByStopLoss",
+    )
+
+
+def _malformed_dup(order_id="e-1", symbol="BTCUSDT"):
+    """Malformed строка с той же точной парой: тип ордера не доказан."""
+    return _entry(order_id, symbol=symbol, orderStatus=None)
+
+
+class TestS2DuplicateExactPairPreview:
+    """§E: дубликат точной пары на preview — без токена, ноль записей."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rows", [
+        # safe + protective
+        (_entry("e-1", symbol="BTCUSDT"), _protective_dup()),
+        # обратный порядок строк — исход не зависит от порядка
+        (_protective_dup(), _entry("e-1", symbol="BTCUSDT")),
+        # safe + malformed (тип ордера не доказан)
+        (_entry("e-1", symbol="BTCUSDT"), _malformed_dup()),
+        # safe + safe: ЛЮБЫЕ 2+ одинаковой пары = неоднозначность
+        (_entry("e-1", symbol="BTCUSDT"), _entry("e-1", symbol="BTCUSDT")),
+    ])
+    async def test_duplicate_pair_preview_fails_closed(self, monkeypatch, rows):
+        """§E: 2 строки с одной точной парой → нет токена, ambiguous UX, cancel==0."""
+        fake = _Bybit([_orders(*rows)])
+        token, preview_upd, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, symbol="BTCUSDT", order_id="e-1"
+        )
+        assert fake.cancel_calls == [], "неоднозначная пара не пишет на биржу"
+        assert token is None, "дубликат точной пары не создаёт токен подтверждения"
+        assert confirm_upd is None
+        assert len(co._PENDING_CANCEL_ONE) == 0
+        assert "НЕОДНОЗНАЧНО" in _last_edit(preview_upd).upper()
+
+
+class TestS2DuplicateExactPairConfirm:
+    """§F: дубликат обнаружен после израсходованного токена — no-write + аудит."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dup_rows", [
+        # safe + protective дубликат
+        (_entry("e-1", symbol="BTCUSDT"), _protective_dup()),
+        # safe + safe дубликат — доказывает «ЛЮБЫЕ 2+ = неоднозначность»
+        (_entry("e-1", symbol="BTCUSDT"), _entry("e-1", symbol="BTCUSDT")),
+    ])
+    async def test_duplicate_pair_at_confirm_fails_closed_with_audit(
+        self, monkeypatch, dup_rows
+    ):
+        """§F: preview видит одну безопасную строку → токен; свежее перечтение —
+        дубликат точной пары. Токен израсходован, cancel==0, durable-аудит есть.
+        """
+        fake = _Bybit(
+            [
+                _orders(_entry("e-1", symbol="BTCUSDT")),  # preview: уникальная
+                _orders(*dup_rows),                        # confirm: дубликат
+            ],
+            [_positions(_pos(symbol="BTCUSDT"))],
+        )
+        events = []
+        token, _, confirm_upd = await _run_single_flow(
+            fake, monkeypatch, journal_sink=lambda ev: events.append(ev) or True
+        )
+        assert token is not None, "уникальный preview обязан создать токен"
+        assert token not in co._PENDING_CANCEL_ONE, "токен израсходован"
+        assert fake.cancel_calls == [], "неоднозначность на confirm не пишет на биржу"
+
+        assert len(events) == 1, "израсходованное подтверждение обязано оставить след"
+        ev = events[0]
+        assert ev["event"] == journal_mod.ORDER_CANCEL_BATCH
+        assert ev["operation"] == co.OP_SINGLE_ENTRY
+        assert ev["outcome"] == "skipped_ambiguous_after_recheck"
+        assert ev["cancelled_count"] == 0
+        assert ev["attempted_count"] == 0
+        assert ev["skipped_protected_ids"] == ["BTCUSDT:e-1"]
+
+        text = _last_edit(confirm_upd)
+        assert "НЕОДНОЗНАЧНО" in text.upper()
+        assert "ОРДЕР ОТМЕНЁН" not in text
