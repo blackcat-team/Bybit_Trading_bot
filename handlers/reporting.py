@@ -33,12 +33,14 @@ PnL, R, winrate и число сделок выглядят как правда,
 пагинации — ошибка отчёта, а не «данные закончились».
 """
 
-import csv
 import io
 import logging
+import math
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -51,7 +53,6 @@ from core.journal import (
     get_exit_order_risk_evidence,
     normalize_symbol,
 )
-from core.utils import safe_float
 from handlers.orders import bybit_call
 from handlers.ui import (
     format_action,
@@ -277,13 +278,173 @@ def _format_r(value: float) -> str:
     return f"{whole}.{frac}R" if frac else f"{whole}R"
 
 
+# ── Нативный XLSX месячного отчёта ───────────────────────────────────────────
+# S5 меняет ТОЛЬКО представление/экспорт месячного файла. Источник данных,
+# пагинация, границы месяца, порядок сделок, доказанный исторический R и расчёт
+# PnL/winrate не меняются — здесь лишь перевод уже посчитанных значений в
+# нативную книгу Excel.
+_SHEET_TITLE = "Сделки"
+_XLSX_HEADERS = (
+    "Дата", "Инструмент", "Side", "Entry", "Exit", "PnL USDT", "R", "Источник",
+)
+# Дата — настоящая datetime-ячейка Excel; формат меняет только отображение.
+_DATE_FORMAT = "DD.MM.YYYY HH:MM"
+# Цена сохраняет полную точность значения; отображение — динамические знаки.
+_PRICE_FORMAT = "0.########"
+# PnL остаётся числом; знак и цвет задаются форматом, значение не трогается.
+_PNL_FORMAT = "[Green]+0.00;[Red]-0.00;0.00"
+_R_FORMAT = "0.00"
+# Недоказанный риск в экспорте — операторское тире, а не UNKNOWN/0/0R.
+_R_UNKNOWN_DISPLAY = "—"
+_COLUMN_WIDTHS = {
+    "A": 19, "B": 15, "C": 11, "D": 15, "E": 15, "F": 14, "G": 11, "H": 20,
+}
+_HEADER_FONT = Font(bold=True)
+_HEADER_FILL = PatternFill(
+    start_color="FFD9E1F2", end_color="FFD9E1F2", fill_type="solid"
+)
+_HEADER_ALIGN = Alignment(horizontal="center", vertical="center")
+
+
+class _ReportExportError(Exception):
+    """Недостоверное значение экспорта: файл не формируется, а не подменяется."""
+
+
+def _finite_number(value, field: str) -> float:
+    """Строгая конвертация authoritative-значения отчёта в конечное число.
+
+    Малформед не превращается в ноль: пустая строка, мусор, ``bool``,
+    нефинитное (NaN/Inf) значение или неподдерживаемый тип поднимают
+    :class:`_ReportExportError`, и файл целиком не формируется. Фабриковать
+    число вместо правды запрещено — оператор должен уметь сортировать,
+    фильтровать и суммировать эти колонки без подмены значений.
+    """
+    if isinstance(value, bool):
+        raise _ReportExportError(f"{field}: булево значение не является числом")
+    if isinstance(value, (int, float)):
+        num = float(value)
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise _ReportExportError(f"{field}: пустое значение не является числом")
+        try:
+            num = float(stripped)
+        except (ValueError, TypeError):
+            raise _ReportExportError(
+                f"{field}: недостоверное число {value!r}"
+            ) from None
+    else:
+        raise _ReportExportError(
+            f"{field}: неподдерживаемый тип {type(value).__name__}"
+        )
+    if not math.isfinite(num):
+        raise _ReportExportError(f"{field}: нефинитное значение {value!r}")
+    return num
+
+
+def _display_source(source) -> str:
+    """Операторское отображение источника: снимает только ведущий тег ``#``.
+
+    Технический маркер ``#prodtest`` показывается как ``prodtest``. Встроенные
+    ``#`` внутри остального текста не трогаются, а сама персистентная запись
+    источника не меняется — это только отображаемое значение экспорта.
+    """
+    text = "" if source is None else str(source)
+    if text.startswith("#"):
+        text = text[1:]
+    return text
+
+
+def _write_text_cell(cell, text):
+    """Пишет литеральную строку, не давая ей стать формулой Excel.
+
+    Значение, начинающееся с ``=``, openpyxl иначе пометил бы как формулу.
+    Принудительный строковый тип держит внешний текст (``=1+1``, ``+``, ``-``,
+    ``@``) обычной строкой при открытии книги в Excel.
+    """
+    cell.value = "" if text is None else str(text)
+    cell.data_type = "s"
+    return cell
+
+
+def _build_report_workbook(rows: list) -> io.BytesIO:
+    """Строит месячный ``.xlsx`` в памяти и возвращает его как BytesIO.
+
+    Одна closed-PnL строка — одна строка листа; агрегации здесь нет. ``Дата`` —
+    настоящая datetime-ячейка, ``Entry``/``Exit``/``PnL USDT`` и доказанный R —
+    числовые ячейки, недоказанный R — тире. Строгая числовая конвертация
+    поднимает :class:`_ReportExportError` наружу как ошибку отчёта: частичный
+    или битый файл оператору не отправляется.
+    """
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = _SHEET_TITLE
+
+    worksheet.append(list(_XLSX_HEADERS))
+    for cell in worksheet[1]:
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.alignment = _HEADER_ALIGN
+
+    for record in rows:
+        idx = worksheet.max_row + 1
+
+        date_cell = worksheet.cell(row=idx, column=1, value=record["dt"])
+        date_cell.number_format = _DATE_FORMAT
+
+        _write_text_cell(worksheet.cell(row=idx, column=2), record["symbol"])
+        _write_text_cell(worksheet.cell(row=idx, column=3), record["side"])
+
+        entry_cell = worksheet.cell(
+            row=idx, column=4,
+            value=_finite_number(record["entry"], "avgEntryPrice"),
+        )
+        entry_cell.number_format = _PRICE_FORMAT
+
+        exit_cell = worksheet.cell(
+            row=idx, column=5,
+            value=_finite_number(record["exit"], "avgExitPrice"),
+        )
+        exit_cell.number_format = _PRICE_FORMAT
+
+        pnl_cell = worksheet.cell(
+            row=idx, column=6, value=_finite_number(record["pnl"], "closedPnl"),
+        )
+        pnl_cell.number_format = _PNL_FORMAT
+
+        if record["r"] is None:
+            _write_text_cell(
+                worksheet.cell(row=idx, column=7), _R_UNKNOWN_DISPLAY
+            )
+        else:
+            r_cell = worksheet.cell(
+                row=idx, column=7, value=_finite_number(record["r"], "R"),
+            )
+            r_cell.number_format = _R_FORMAT
+
+        _write_text_cell(
+            worksheet.cell(row=idx, column=8), _display_source(record["source"])
+        )
+
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = f"A1:H{worksheet.max_row}"
+    for column, width in _COLUMN_WIDTHS.items():
+        worksheet.column_dimensions[column].width = width
+
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
 async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Команда /report [мм.гггг] — отчёт о закрытых сделках за месяц.
 
     Без аргументов: показывает текстовый список последних 15 сделок.
-    С аргументом даты (например, /report 01.2026): отправляет CSV-файл с полной
-    выборкой. Данные получаются чанками по 7 дней для обхода лимитов API.
+    С аргументом даты (например, /report 01.2026): отправляет нативную книгу
+    Excel (.xlsx) с полной выборкой. Данные получаются чанками по 7 дней для
+    обхода лимитов API.
     """
     if str(update.effective_user.id) != ALLOWED_ID: return
 
@@ -346,7 +507,7 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_pnl = 0
         wins = 0
         losses = 0
-        csv_data = []
+        xlsx_rows = []
         report_lines = []
         # Доказанный риск конкретных входов бота. Читается один раз за отчёт;
         # запись в журнал не производится — backfill историческим риском запрещён.
@@ -364,9 +525,15 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         for t in all_trades:
             symbol = t['symbol']
-            pnl = safe_float(t.get('closedPnl'), field='closedPnl')
+            # Authoritative closedPnl проверяется СТРОГО из сырого значения биржи
+            # ДО любых производных (total_pnl, wins/losses, R и строка книги).
+            # safe_float здесь запрещён: он молча свёл бы missing/None/""/пробелы/
+            # мусор/[]/{}/False к 0.0, а True — к 1.0, сфабриковав нулевой PnL и
+            # фальшивый R (0 или 0.5). Битое authoritative-значение обязано
+            # провалить отчёт целиком (_ReportExportError → общий except), а не
+            # подмениться нулём. Легальный ноль (0/"0"/"0.00") остаётся числом.
+            pnl = _finite_number(t.get('closedPnl'), 'closedPnl')
             ts = int(t.get('updatedTime', 0))
-            full_date = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M:%S")
             short_date = datetime.fromtimestamp(ts / 1000).strftime("%d.%m")
 
             total_pnl += pnl
@@ -380,19 +547,28 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Риск этой сделки не доказан: R недоступен. Ни ноль, ни текущий
                 # глобальный риск подстановкой быть не могут.
                 r_text = UNKNOWN
-                csv_r = UNKNOWN
+                r_value = None
             else:
                 r_val = pnl / trade_risk
                 total_r += r_val
                 r_known += 1
                 r_text = _format_r(r_val)
-                csv_r = round(r_val, 2)
+                r_value = r_val
             src = get_source_at_time(symbol, ts)
 
-            csv_data.append({
-                "Date": full_date, "Symbol": symbol, "Side": t['side'],
-                "Entry": t['avgEntryPrice'], "Exit": t['avgExitPrice'],
-                "PnL": round(pnl, 2), "R": csv_r, "Source": src
+            # Одна closed-PnL строка = одна строка книги. Дата — настоящий
+            # datetime того же базиса, что и текст отчёта; Entry/Exit остаются
+            # сырыми значениями биржи и строго конвертируются только при сборке
+            # книги (путь файла), чтобы текстовый отчёт без аргумента не менялся.
+            xlsx_rows.append({
+                "dt": datetime.fromtimestamp(ts / 1000),
+                "symbol": symbol,
+                "side": t['side'],
+                "entry": t['avgEntryPrice'],
+                "exit": t['avgExitPrice'],
+                "pnl": pnl,
+                "r": r_value,
+                "source": src,
             })
 
             icon = "🟢" if pnl >= 0 else "🔴"
@@ -435,15 +611,13 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.delete()
 
         if context.args:
-            output = io.StringIO()
-            writer = csv.DictWriter(output,
-                                    fieldnames=["Date", "Symbol", "Side", "Entry", "Exit", "PnL", "R", "Source"])
-            writer.writeheader()
-            writer.writerows(csv_data)
-            output.seek(0)
+            # Нативная книга Excel строится в памяти. Ошибка строгой числовой
+            # конвертации поднимется наружу в общий except и станет ошибкой
+            # отчёта — битый/частичный файл оператору не уходит.
+            workbook = _build_report_workbook(xlsx_rows)
             await update.message.reply_document(
-                document=io.BytesIO(output.getvalue().encode('utf-8-sig')),
-                filename=f"Report_{month_name.replace(' ', '_')}.csv",
+                document=workbook,
+                filename=f"Report_{target_date.strftime('%m_%Y')}.xlsx",
                 caption=header,
                 parse_mode='HTML'
             )

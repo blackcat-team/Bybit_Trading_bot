@@ -8,7 +8,8 @@ LIVE-FIX2/LIVE-FIX4 — исторический R в /report считается
 3. Сделка без доказанного риска получает UNKNOWN, а не R по текущему риску.
 4. Агрегат R собирается только из доказанных сделок и правдиво сообщает охват.
 5. PnL, winrate и число сделок не зависят от доказанности риска.
-6. CSV использует ту же семантику: число либо UNKNOWN.
+6. XLSX-экспорт использует ту же семантику: доказанный R числом, недоказанный —
+   тире.
 7. Совпадение только по символу доказательством не является.
 8. Карта доказанного риска строится строго по паре (symbol, order_id).
 9. Риск, конечный для Decimal, но дающий inf/0.0 во float, доказательством не
@@ -39,6 +40,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import openpyxl
 
 # ── Mock heavy deps before any project import ────────────────────────────────
 for _mod in [
@@ -156,8 +159,8 @@ async def _run_report(trades, evidence, *, args=None, exit_evidence=None,
     В ``calls``, если он передан, складываются ``(fn, kwargs)`` каждого обращения
     к Bybit — так проверяется, что отчёт читает только closed-PnL.
 
-    Возвращает (text, csv_text): текст последнего сообщения и содержимое CSV
-    (пустая строка, если документ не отправлялся).
+    Возвращает (text, workbook): текст последнего сообщения и загруженную
+    openpyxl книгу месячного экспорта (``None``, если документ не отправлялся).
     """
     status_msg = MagicMock()
     status_msg.edit_text = AsyncMock()
@@ -198,15 +201,16 @@ async def _run_report(trades, evidence, *, args=None, exit_evidence=None,
     if update.message.reply_text.await_count > 1:
         text = update.message.reply_text.call_args_list[-1].args[0]
 
-    csv_text = ""
+    workbook = None
     if update.message.reply_document.await_count:
         kwargs = update.message.reply_document.call_args.kwargs
         document = kwargs["document"]
         assert isinstance(document, io.BytesIO)
-        csv_text = document.getvalue().decode("utf-8-sig")
+        document.seek(0)
+        workbook = openpyxl.load_workbook(document)
         text = kwargs["caption"]
 
-    return text, csv_text
+    return text, workbook
 
 
 # ── Доказанный риск сделки → правдивый R ────────────────────────────────────
@@ -336,14 +340,17 @@ class TestUnknownHistoricalR:
         assert "0.00R" not in text
 
     @pytest.mark.asyncio
-    async def test_csv_overflow_risk_is_unknown(self):
-        """CSV для overflow-риска содержит UNKNOWN в колонке R, а не 0."""
+    async def test_xlsx_overflow_risk_is_em_dash_not_zero(self):
+        """XLSX для overflow-риска: R — тире, а не 0; PnL сохранён числом."""
         evidence = get_entry_risk_evidence([_entry(order_id="OID-1", risk="1e9999")])
-        _, csv_text = await _run_report(
+        _, workbook = await _run_report(
             [_trade(pnl="-4.6", order_id="OID-1")], evidence, args=["02.2026"],
         )
-        row = next(line for line in csv_text.splitlines() if "BTCUSDT" in line)
-        assert f",-4.6,{UNKNOWN}," in row
+        ws = workbook.active
+        assert ws.cell(row=2, column=7).value == "—"       # R не доказан
+        assert ws.cell(row=2, column=7).value != UNKNOWN
+        assert ws.cell(row=2, column=6).value == -4.6       # PnL сохранён числом
+        assert ws.cell(row=2, column=6).data_type == "n"
 
 
 # ── Агрегаты: R по доказанным, PnL/winrate/счёт по всем ─────────────────────
@@ -379,14 +386,14 @@ class TestAggregates:
         assert "из 2 сделок" not in text
 
 
-# ── CSV: та же семантика ────────────────────────────────────────────────────
+# ── XLSX: та же семантика ────────────────────────────────────────────────────
 
-class TestCsvOutput:
+class TestXlsxOutput:
 
     @pytest.mark.asyncio
-    async def test_csv_mixes_proven_number_and_unknown(self):
-        """В CSV доказанный R — число, недоказанный — UNKNOWN, а не 0."""
-        _, csv_text = await _run_report(
+    async def test_xlsx_mixes_proven_number_and_em_dash(self):
+        """В XLSX доказанный R — число, недоказанный — тире, а не 0."""
+        _, workbook = await _run_report(
             [
                 _trade(symbol="BTCUSDT", pnl="-4.6", order_id="OID-1", ts=1770000000000),
                 _trade(symbol="GRVTUSDT", pnl="-31.6", order_id="OID-X", ts=1770000100000),
@@ -394,13 +401,18 @@ class TestCsvOutput:
             {("BTCUSDT", "OID-1"): 1.0},
             args=["02.2026"],
         )
-        rows = [line for line in csv_text.splitlines() if line.strip()]
-        assert rows[0].startswith("Date,Symbol,Side,Entry,Exit,PnL,R,Source")
-        grvt = next(line for line in rows if "GRVTUSDT" in line)
-        btc = next(line for line in rows if "BTCUSDT" in line)
-        assert f",{UNKNOWN}," in grvt
-        assert ",-31.6," in grvt                     # PnL сохранён
-        assert ",-4.6," in btc                       # R доказан числом
+        ws = workbook.active
+        assert [c.value for c in ws[1]] == [
+            "Дата", "Инструмент", "Side", "Entry", "Exit", "PnL USDT", "R", "Источник",
+        ]
+        rows = {ws.cell(row=r, column=2).value: r for r in range(2, ws.max_row + 1)}
+        grvt, btc = rows["GRVTUSDT"], rows["BTCUSDT"]
+        # GRVT: риск не доказан → тире, PnL сохранён числом.
+        assert ws.cell(row=grvt, column=7).value == "—"
+        assert ws.cell(row=grvt, column=6).value == -31.6
+        # BTC: риск доказан → R числом.
+        assert ws.cell(row=btc, column=7).value == -4.6
+        assert ws.cell(row=btc, column=7).data_type == "n"
 
 
 # ── Карта доказанного риска в журнале ───────────────────────────────────────
@@ -541,16 +553,18 @@ class TestExitBindingHistoricalR:
         assert "-0.25R" not in text
 
     @pytest.mark.asyncio
-    async def test_csv_uses_the_same_resolved_r(self):
-        """CSV использует тот же R, что и сообщение."""
-        _, csv_text = await _run_report(
+    async def test_xlsx_uses_the_same_resolved_r(self):
+        """XLSX использует тот же доказанный R, что и сообщение."""
+        _, workbook = await _run_report(
             [_trade(symbol="ETHUSDT", pnl="-3", order_id="CLOSE-TP-1")],
             {},
             exit_evidence=_ETH_EXIT_RISK,
             args=["02.2026"],
         )
-        row = next(line for line in csv_text.splitlines() if "ETHUSDT" in line)
-        assert ",-3.0,-1.0," in row
+        ws = workbook.active
+        assert ws.cell(row=2, column=6).value == -3.0    # PnL
+        assert ws.cell(row=2, column=7).value == -1.0    # R = -3 / 3
+        assert ws.cell(row=2, column=7).data_type == "n"
 
     @pytest.mark.asyncio
     async def test_partial_coverage_is_stated_truthfully(self):

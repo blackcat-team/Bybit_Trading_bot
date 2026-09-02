@@ -19,7 +19,7 @@ LIVE-FIX5 — пагинация закрытых сделок Bybit V5 в autho
 - /report при аномалии страницы не показывает частичные PnL/R/winrate/сделки, а
   недельная задача не отправляет частичный отчёт и не падает наружу;
 - многостраничный период считается по полному склеенному набору строк, и
-  Telegram с CSV используют один и тот же набор;
+  Telegram с XLSX используют один и тот же набор;
 - ни один путь отчёта не обращается к write-эндпоинтам биржи.
 
 Все зависимости Bybit/Telegram замокированы; сетевых вызовов нет.
@@ -31,6 +31,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import openpyxl
 
 # ── Mock heavy deps before any project import ────────────────────────────────
 for _mod in [
@@ -360,9 +362,9 @@ class TestPaginationFailsClosed:
 async def _run_report(*responses, args=None, tail=None):
     """Выполняет send_report на программируемых страницах closed-PnL.
 
-    Возвращает (text, csv_text, pages, status): текст последнего сообщения,
-    содержимое CSV (пустое, если документ не отправлялся), запросы к бирже и
-    mock статусного сообщения.
+    Возвращает (text, workbook, pages, status): текст последнего сообщения,
+    загруженную openpyxl книгу месячного экспорта (``None``, если документ не
+    отправлялся), запросы к бирже и mock статусного сообщения.
     """
     status_msg = MagicMock()
     status_msg.edit_text = AsyncMock()
@@ -392,15 +394,16 @@ async def _run_report(*responses, args=None, tail=None):
     if update.message.reply_text.await_count > 1:
         text = update.message.reply_text.call_args_list[-1].args[0]
 
-    csv_text = ""
+    workbook = None
     if update.message.reply_document.await_count:
         kwargs = update.message.reply_document.call_args.kwargs
         document = kwargs["document"]
         assert isinstance(document, io.BytesIO)
-        csv_text = document.getvalue().decode("utf-8-sig")
+        document.seek(0)
+        workbook = openpyxl.load_workbook(document)
         text = kwargs["caption"]
 
-    return text, csv_text, pages, status_msg
+    return text, workbook, pages, status_msg
 
 
 class TestReportUsesFullDataset:
@@ -427,19 +430,25 @@ class TestReportUsesFullDataset:
         assert UNKNOWN not in text
 
     @pytest.mark.asyncio
-    async def test_csv_and_telegram_share_the_same_full_dataset(self):
-        """CSV собирается по тому же полному набору строк, что и текст."""
-        text, csv_text, _, _ = await _run_report(
+    async def test_xlsx_and_telegram_share_the_same_full_dataset(self):
+        """XLSX собирается по тому же полному набору строк, что и текст."""
+        text, workbook, _, _ = await _run_report(
             _page([_row(order_id="P1", pnl="-4.6", ts=1770000000000)],
                   next_cursor="CURSOR-2"),
             _page([_row(order_id="P2", pnl="9.2", ts=1770000100000)]),
             args=["02.2026"],
             tail=_terminal_page(),
         )
-        rows = [line for line in csv_text.splitlines()[1:] if line.strip()]
-        assert len(rows) == 2
-        assert any(",-4.6,-4.6," in line for line in rows)
-        assert any(",9.2,4.6," in line for line in rows)
+        ws = workbook.active
+        data_rows = list(range(2, ws.max_row + 1))
+        assert len(data_rows) == 2
+        # PnL по обеим страницам и R по доказанному риску каждой сделки:
+        # -4.6/1 и 9.2/2. Занижённый отчёт дал бы одну строку.
+        pnl_to_r = {
+            ws.cell(row=r, column=6).value: ws.cell(row=r, column=7).value
+            for r in data_rows
+        }
+        assert pnl_to_r == {-4.6: -4.6, 9.2: 4.6}
         assert _summary_value(text, "Сделки") == "2"
 
     @pytest.mark.asyncio
@@ -451,13 +460,13 @@ class TestReportUsesFullDataset:
     ])
     async def test_second_page_anomaly_shows_error_not_partial_report(self, second):
         """Аномалия страницы даёт безопасную ошибку вместо частичной статистики."""
-        text, csv_text, pages, status = await _run_report(
+        text, workbook, pages, status = await _run_report(
             _page([_row(order_id="P1", pnl="-4.6")], next_cursor="CURSOR-2"),
             second,
         )
         assert len(pages.calls) == 2
         assert status.delete.await_count == 0
-        assert csv_text == ""
+        assert workbook is None
         error_text = status.edit_text.call_args_list[-1].args[0]
         assert "Не удалось сформировать отчёт" in error_text
         for partial in ("-4.60 USDT", "Winrate", "Сделки", "-4.6R"):
