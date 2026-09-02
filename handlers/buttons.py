@@ -31,7 +31,7 @@ from core.write_verify import (
     verify_position_protection, write_outcome_for,
 )
 from handlers.preflight import clip_qty, get_available_usd, floor_qty, validate_qty
-from handlers.orders import place_market_with_retry, close_position_market, bybit_call, set_leverage_safe
+from handlers.orders import place_market_with_retry, bybit_call, set_leverage_safe
 from handlers.views_orders import view_orders, view_symbol_orders
 from handlers.views_positions import check_positions
 from handlers.pos_protection import (
@@ -58,6 +58,13 @@ from handlers.cancel_orders import (
     preview_cancel_one,
     confirm_cancel_one,
     cancel_cancel_one,
+)
+from handlers.position_close import (
+    MODE_EMERGENCY,
+    MODE_NORMAL,
+    cancel_close_position,
+    confirm_close_position,
+    preview_close_position,
 )
 
 
@@ -1084,55 +1091,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
 
         elif data.startswith("close_confirm|"):
+            # S4: первый клик НИКОГДА не закрывает напрямую. Ведёт в безопасное
+            # authoritative-превью (ноль записей) с токенизированным
+            # подтверждением.
             _, sym = data.split("|")
-            kb = [[
-                InlineKeyboardButton("✅ Подтвердить закрытие", callback_data=f"close_mkt_confirm|{sym}"),
-                InlineKeyboardButton("↩ К ордерам", callback_data=f"show_orders|{sym}"),
-            ]]
-            await query.edit_message_text(
-                f"{format_header('⚠️', 'CONFIRM')}\n"
-                f"Position: {h(sym)} · Market\n\n"
-                f"{format_warning_list(['Вся позиция будет закрыта немедленно.'])}\n\n"
-                f"{format_action('подтвердите закрытие или вернитесь к ордерам')}",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup(kb),
-            )
+            await preview_close_position(update, context, sym, mode=MODE_NORMAL)
 
         elif data.startswith("close_mkt_confirm|"):
+            # S4: устаревший прямой-write callback БОЛЬШЕ не закрывает позицию.
+            # Уже отправленные старые кнопки ведут в свежее authoritative-превью
+            # (ноль записей) и требуют нового токенизированного подтверждения.
             _, sym = data.split("|")
-            try:
-                success, msg_text, _ = await bybit_call(close_position_market, sym)
-                if success:
-                    await query.answer(f"✅ {sym} закрыт!", show_alert=True)
-                    await query.edit_message_text(
-                        f"{format_header('✅', 'POSITION CLOSED')}\n"
-                        f"Position: {h(sym)}\n\n"
-                        f"Позиция закрыта по Market.",
-                        parse_mode='HTML',
-                    )
-                else:
-                    await query.answer(msg_text, show_alert=True)
-                    await check_positions(update, context)
-            except Exception as e:
-                await query.answer("❌ Не удалось закрыть позицию. Проверьте Bybit.", show_alert=True)
+            await preview_close_position(update, context, sym, mode=MODE_NORMAL)
 
         elif data.startswith("emergency_close|"):
+            # S4: аварийное закрытие тоже ведёт только в безопасное превью с
+            # усиленным предупреждением, но по-прежнему требует явного
+            # подтверждения. Прямой записи в этой ветке больше нет.
             _, sym = data.split("|")
-            try:
-                success, msg_text, _ = await bybit_call(close_position_market, sym)
-                if success:
-                    await query.answer(f"✅ {sym} закрыт аварийно!", show_alert=True)
-                    await query.edit_message_text(
-                        f"{format_header('✅', 'POSITION CLOSED')}\n"
-                        f"Position: {h(sym)}\n\n"
-                        f"Позиция закрыта аварийно по Market.",
-                        parse_mode='HTML',
-                    )
-                else:
-                    await query.answer(msg_text, show_alert=True)
-                    await check_positions(update, context)
-            except Exception as e:
-                await query.answer("❌ Не удалось закрыть позицию. Проверьте Bybit.", show_alert=True)
+            await preview_close_position(update, context, sym, mode=MODE_EMERGENCY)
+
+        elif data.startswith("close_exec|"):
+            # S4: единственный путь к записи закрытия — токен-связанное
+            # подтверждение (recheck → один reduceOnly Market → readback).
+            await confirm_close_position(update, context, data.split("|", 1)[1])
+
+        elif data.startswith("close_cancel|"):
+            # S4: отказ отзывает ровно этот токен закрытия; ноль записей.
+            await cancel_close_position(update, context, data.split("|", 1)[1])
 
     except Exception as e:
         logging.error("Button handler error: %s", e)
