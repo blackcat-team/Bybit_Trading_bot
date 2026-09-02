@@ -208,6 +208,34 @@ async def test_info_is_owner_only_and_touches_no_exchange(bot):
     assert not hasattr(bot.info, "bybit_call")
 
 
+def test_info_break_even_shortcuts_state_preview_and_buffer(bot):
+    """S3: /info правдиво описывает контракт быстрых кнопок «в БУ».
+
+    После S3 «SL в БУ» и «TP в БУ» не пишут на биржу с первого клика: сначала
+    превью, затем явное подтверждение. Справка больше не должна обещать перенос
+    уровня «без превью и подтверждения» и должна называть TP-буфер 0.1%.
+    """
+    text = bot.info.build_info_message(
+        require_market_confirm=1, preview_ttl_sec=300
+    )
+
+    # Прежнее обещание мгновенного переноса без подтверждения устарело.
+    assert "без превью и подтверждения" not in text
+
+    # Обе быстрые кнопки по-прежнему документированы.
+    assert "SL в БУ" in text
+    assert "TP в БУ" in text
+
+    # Контракт кнопок «в БУ»: превью и подтверждение именно для них.
+    be_text = text[text.index("SL в БУ"):]
+    assert "превью" in be_text
+    assert "подтвержд" in be_text.lower()
+
+    # TP-безубыток описывается буфером 0.1%, без обещания компенсации комиссии.
+    assert "0.1%" in be_text
+    assert "буфер" in be_text.lower()
+
+
 # ── 2. /price: нормализация ввода ─────────────────────────────────────────────
 
 @pytest.mark.parametrize("raw,expected", [

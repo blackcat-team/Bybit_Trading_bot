@@ -35,8 +35,9 @@ from handlers.orders import place_market_with_retry, close_position_market, bybi
 from handlers.views_orders import view_orders, view_symbol_orders
 from handlers.views_positions import check_positions
 from handlers.pos_protection import (
-    CANCEL_INPUT_CALLBACK, cancel_protection, cancel_protection_input,
-    confirm_protection, start_protection_edit,
+    CANCEL_INPUT_CALLBACK, PRESET_SL_BE, PRESET_TP_BE, cancel_protection,
+    cancel_protection_input, confirm_protection, start_protection_edit,
+    start_protection_preset,
 )
 from handlers.ui import (
     format_action,
@@ -271,75 +272,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await cancel_protection_input(update, context)
 
         elif data.startswith("to_be|"):
+            # S3: «🛡 SL в БУ» больше НИКОГДА не пишет по первому клику. Уже
+            # отправленные старые кнопки понимаются, но ведут только в безопасное
+            # превью пресета безубытка (авторитетное чтение → предпросмотр →
+            # явное подтверждение → одна set_trading_stop → readback).
             _, sym, side = data.split("|")
-            pos_resp = await bybit_call(session.get_positions, category="linear", symbol=sym)
-            pos = pos_resp['result']['list'][0]
-            entry = safe_float(pos.get('avgPrice'), field='avgPrice')
-            if entry <= 0:
-                await context.bot.send_message(
-                    user_id,
-                    format_error_message(
-                        "Нет данных о цене входа.",
-                        context=sym,
-                        action="проверьте позицию вручную на Bybit",
-                    ),
-                    parse_mode='HTML',
-                )
-                return
-            await bybit_call(session.set_trading_stop, category="linear", symbol=sym, stopLoss=str(entry), slTriggerBy="LastPrice")
-            await context.bot.send_message(
-                user_id,
-                f"{format_header('✅', 'POSITION UPDATED')}\n"
-                f"Position: {h(sym)}\n\n"
-                f"🛡 <b>Защита</b>\n"
-                f"{format_value_block([('SL', entry), ('Статус', 'безубыток')])}",
-                parse_mode='HTML',
-            )
+            await start_protection_preset(update, context, PRESET_SL_BE, sym, side)
 
         elif data.startswith("exit_be|"):
+            # S3: «🏁 TP в БУ» тоже ведёт только в безопасное превью пресета
+            # (вход + буфер 0.1%). Прямой записи в этой ветке больше нет.
             _, sym, side = data.split("|")
-            try:
-                pos_resp = await bybit_call(session.get_positions, category="linear", symbol=sym)
-                pos = pos_resp['result']['list'][0]
-                entry_price = safe_float(pos.get('avgPrice'), field='avgPrice')
-
-                info_resp = await bybit_call(session.get_instruments_info, category="linear", symbol=sym)
-                info = info_resp['result']['list'][0]
-                tick_size = safe_float(info['priceFilter'].get('tickSize'), field='tickSize')
-
-                if entry_price <= 0 or tick_size <= 0:
-                    await query.answer(f"❌ Нет данных цены/тика для {sym}", show_alert=True)
-                    return
-
-                fee_buffer = 0.001  # 0.1%
-
-                if side == "Buy":
-                    target_price = entry_price * (1 + fee_buffer)
-                    target_price = round(target_price / tick_size) * tick_size
-                else:
-                    target_price = entry_price * (1 - fee_buffer)
-                    target_price = round(target_price / tick_size) * tick_size
-
-                target_str = str(target_price)
-
-                await bybit_call(
-                    session.set_trading_stop,
-                    category="linear",
-                    symbol=sym,
-                    takeProfit=target_str,
-                    tpTriggerBy="LastPrice"
-                )
-
-                await query.answer(f"🏁 TP установлен на {target_str}", show_alert=True)
-                await context.bot.send_message(user_id,
-                                               f"{format_header('✅', 'POSITION UPDATED')}\n"
-                                               f"Position: {h(sym)}\n\n"
-                                               f"🛡 <b>Защита</b>\n"
-                                               f"{format_value_block([('TP', target_str), ('Режим', 'уровень выше цены входа')])}",
-                                               parse_mode='HTML')
-
-            except Exception as e:
-                await query.answer("❌ Не удалось установить TP. Проверьте позицию.", show_alert=True)
+            await start_protection_preset(update, context, PRESET_TP_BE, sym, side)
 
         elif data.startswith("show_orders|"):
             _, sym = data.split("|")

@@ -109,6 +109,34 @@ TRIGGER_MISMATCH = "mismatch"
 # Имя пути записи в доказательствах проверки (HIGH-6).
 _PROTECTION_VERIFY_PATH = "protection_edit"
 
+# --- Быстрые пресеты защиты (S3) ---
+# Кнопки карточки позиции «🛡 SL в БУ» и «🏁 TP в БУ» больше не пишут на биржу с
+# первого клика. Они строят обычный снимок подтверждения HIGH-4 и переиспользуют
+# существующий pconf/pcancel → confirm_protection → readback → доказательство.
+# Пресет — это лишь предвычисленная целевая цена и особый контракт валидации;
+# отдельной модели записи или проверки он не создаёт.
+PRESET_SL_BE = "sl_be"   # Stop Loss ровно в цену входа (безубыток).
+PRESET_TP_BE = "tp_be"   # Take Profit = вход + буфер 0.1% (прежняя семантика).
+
+# Буфер комиссии TP-безубытка. Прежний продуктовый смысл (0.1%) сохранён, но
+# вычисление ведётся в Decimal, а не во float, чтобы округление по tickSize не
+# сдвинуло уровень на неверную сторону от цены входа.
+TP_BREAK_EVEN_BUFFER = Decimal("0.001")
+
+_PRESET_KIND = {PRESET_SL_BE: SL, PRESET_TP_BE: TP}
+_PRESET_TITLE = {PRESET_SL_BE: "SL В БЕЗУБЫТОК", PRESET_TP_BE: "TP В БЕЗУБЫТОК"}
+# Правдивое описание смысла пресета для превью.
+_PRESET_MEANING = {
+    PRESET_SL_BE: "Безубыток (SL = цена входа)",
+    PRESET_TP_BE: "Безубыток + буфер 0.1%",
+}
+# Путь доказательства пресета: тот же формат write_verify, но отличает быстрые
+# кнопки от общего ручного редактора через поле path (без нового события).
+_PRESET_VERIFY_PATH = {
+    PRESET_SL_BE: "protection_preset_sl_be",
+    PRESET_TP_BE: "protection_preset_tp_be",
+}
+
 
 async def _journal_protection_write(kind: str, evidence: dict) -> None:
     """Пишет доказательство записи защиты в журнал.
@@ -351,6 +379,57 @@ def validate_direction(kind: str, side, entry: Decimal, price: Decimal) -> None:
             f"{label} для {direction} должен быть {need} цены входа "
             f"({fmt_decimal(entry)}). Получено: {fmt_decimal(price)}."
         )
+
+
+def compute_preset_target(preset: str, entry: Decimal, side, tick: Decimal) -> Decimal:
+    """Целевая цена быстрого пресета, нормализованная по tickSize (S3).
+
+    SL-безубыток: ровно авторитетная цена входа. Если нормализованная по тику
+    цена не совпала с ценой входа (вход не ложится на шаг инструмента),
+    приблизительный безубыток не ставится — пресет fail-closed отклоняется.
+
+    TP-безубыток: цена входа, сдвинутая на буфер 0.1% в прибыльную сторону, и
+    затем нормализованная. Все вычисления в Decimal: float дал бы ошибку
+    представления и мог бы сдвинуть уровень на неверную сторону. Направление
+    проверяется отдельно (:func:`validate_preset_direction`).
+    """
+    if preset == PRESET_SL_BE:
+        price = normalize_to_tick(entry, tick)
+        if price != entry:
+            raise ProtectionInputError(
+                "Безубыток недоступен: цена входа не ложится на шаг цены "
+                "инструмента. Используйте ручную установку SL."
+            )
+        return price
+    if preset == PRESET_TP_BE:
+        is_long = _is_long(side)
+        target = (entry * (Decimal(1) + TP_BREAK_EVEN_BUFFER) if is_long
+                  else entry * (Decimal(1) - TP_BREAK_EVEN_BUFFER))
+        return normalize_to_tick(target, tick)
+    raise ProtectionInputError("Неизвестный пресет защиты.")
+
+
+def validate_preset_direction(preset: str, side, entry: Decimal, price: Decimal) -> None:
+    """Проверяет сторону уровня для пресета.
+
+    SL-безубыток допускает цену РОВНО в цене входа — это его особый контракт.
+    Общий :func:`validate_direction` при этом не ослабляется: ручной SL ровно в
+    входе остаётся отклонённым. TP-безубыток использует обычную прибыльную
+    сторону через :func:`validate_direction`.
+    """
+    if price <= 0:
+        raise ProtectionInputError("Рассчитанная цена должна быть больше нуля.")
+    if preset == PRESET_SL_BE:
+        if price != entry:
+            raise ProtectionInputError(
+                f"Безубыток SL должен равняться цене входа ({fmt_decimal(entry)}). "
+                f"Получено: {fmt_decimal(price)}."
+            )
+        return
+    if preset == PRESET_TP_BE:
+        validate_direction(TP, side, entry, price)
+        return
+    raise ProtectionInputError("Неизвестный пресет защиты.")
 
 
 def build_edit_callback(kind: str, symbol: str, side: str) -> str:
@@ -661,6 +740,36 @@ def format_protection_preview(snapshot: dict) -> str:
     ])
 
 
+def format_preset_preview(snapshot: dict) -> str:
+    """Превью быстрого пресета защиты до записи в Bybit (S3).
+
+    Показывает достаточный контекст для осознанного подтверждения: инструмент,
+    сторону, positionIdx, цену входа, текущие SL и TP, предлагаемый новый
+    уровень, тип триггера и правдивый смысл пресета. Запись не выполняется.
+    """
+    kind = snapshot["kind"]
+    short = _KIND_SHORT[kind]
+    preset = snapshot["preset"]
+    rows = [
+        ("Инструмент", snapshot["symbol"]),
+        ("Позиция", _direction_label(snapshot["side"])),
+        ("positionIdx", snapshot["position_idx"]),
+        ("Размер", fmt_decimal(snapshot["size"])),
+        ("Entry", fmt_decimal(snapshot["entry"])),
+        ("Текущий SL", fmt_decimal(snapshot["current_sl"])),
+        ("Текущий TP", fmt_decimal(snapshot["current_tp"])),
+        (f"Новый {short}", fmt_decimal(snapshot["price"])),
+        ("Триггер", TRIGGER_LABEL),
+        ("Пресет", _PRESET_MEANING[preset]),
+    ]
+    return "\n\n".join([
+        format_header(_KIND_EMOJI[kind], _PRESET_TITLE[preset]),
+        f"📊 <b>Изменение</b>\n{format_value_block(rows)}",
+        f"⏳ Подтверждение действительно {h(MARKET_PREVIEW_TTL_SEC)} сек.",
+        format_action("подтвердите или отмените изменение"),
+    ])
+
+
 def _format_readback_result(kind: str, symbol: str, side,
                             requested: Decimal, result: dict) -> str:
     """Правдивый результат: факт биржи отделён от намерения запроса."""
@@ -947,6 +1056,114 @@ async def handle_protection_input(update: Update,
 
 
 # ---------------------------------------------------------------------------
+# Шаг 2b — быстрые пресеты защиты (S3): первый клик → превью, ноль записей
+# ---------------------------------------------------------------------------
+
+async def start_protection_preset(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                  preset: str, symbol: str, side: str) -> None:
+    """Быстрая кнопка защиты (🛡 SL в БУ / 🏁 TP в БУ): первый клик → превью.
+
+    Первый клик НЕ пишет на биржу. Он авторитетно читает позицию и инструмент,
+    вычисляет целевую цену пресета, строит обычный снимок подтверждения HIGH-4 и
+    показывает превью с кнопками ✅/❌. Запись выполняет только существующий
+    :func:`confirm_protection` после явного подтверждения — тем же путём recheck
+    → одна set_trading_stop → readback → доказательство, что и ручной редактор.
+
+    Fail-closed: недоказанная идентичность позиции, недоступные метаданные
+    инструмента, невалидная целевая цена и (для TP) конкурирующая лимитная
+    TP-лестница не создают токен и не допускают записи.
+    """
+    if preset not in _PRESET_KIND:
+        return
+    kind = _PRESET_KIND[preset]
+
+    user_id = _callback_user_id(update)
+    if user_id is None or user_id != ALLOWED_ID:
+        return
+
+    try:
+        _, identity = await _fetch_identity(symbol, side)
+    except Exception as exc:
+        logging.warning("preset[%s] %s %s: чтение позиции не удалось: %s",
+                        preset, symbol, side, exc)
+        await _reply(update, context, format_error_message(
+            "Не удалось прочитать позицию на Bybit.",
+            context=f"{symbol} · {_direction_label(side)}",
+            action="повторите попытку позже",
+        ))
+        return
+
+    if identity is None:
+        # Сюда попадает и отсутствующий/неразобранный positionIdx, и неверная
+        # сторона, и неоднозначная позиция: идентичность не доказана.
+        await _reply(update, context, format_error_message(
+            "Позиция не найдена или её идентичность не доказана "
+            "(symbol, side, positionIdx, размер, цена входа).",
+            context=f"{symbol} · {_direction_label(side)}",
+            action="откройте /pos заново",
+        ))
+        return
+
+    try:
+        tick, min_price, max_price = await _fetch_price_filter(symbol)
+        price = compute_preset_target(preset, identity["entry"], side, tick)
+        validate_bounds(price, min_price, max_price)
+        validate_preset_direction(preset, side, identity["entry"], price)
+
+        # Ручной Full TP не создаётся рядом с лимитной TP-лестницей. Для SL
+        # проверка не нужна: SL не конкурирует с моделью фиксации прибыли.
+        ladder = ()
+        if kind == TP:
+            ladder = await _fetch_tp_ladder(symbol, side)
+            if ladder:
+                raise ProtectionInputError(_LADDER_CONFLICT_TEXT)
+    except ProtectionInputError as exc:
+        logging.info("preset[%s] %s %s: пресет отклонён: %s",
+                     preset, symbol, side, exc)
+        await _reply(update, context, format_error_message(
+            str(exc),
+            context=f"{symbol} · {_KIND_SHORT[kind]}",
+            action="откройте /pos заново",
+        ))
+        return
+    except Exception as exc:
+        logging.warning("preset[%s] %s %s: подготовка превью не удалась: %s",
+                        preset, symbol, side, exc)
+        await _reply(update, context, format_error_message(
+            "Не удалось подготовить безопасное изменение защиты.",
+            context=f"{symbol} · {_KIND_SHORT[kind]}",
+            action="повторите попытку позже",
+        ))
+        return
+
+    _prune_confirmations()
+    token = secrets.token_urlsafe(6)
+    snapshot = dict(identity)
+    snapshot.update({
+        "kind": kind,
+        "preset": preset,
+        "user_id": user_id,
+        "price": price,
+        "min_price": min_price,
+        "max_price": max_price,
+        "mode": "preset",
+        "raw_input": _PRESET_MEANING[preset],
+        # Отпечаток TP-лестницы храним только в снимке, не в callback_data.
+        "ladder": ladder,
+        "created_at": _now(),
+    })
+    _PENDING_CONFIRM[token] = snapshot
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Подтвердить", callback_data=f"pconf|{token}"),
+        InlineKeyboardButton("❌ Отмена", callback_data=f"pcancel|{token}"),
+    ]])
+    logging.info("preset[%s] %s %s idx=%s: превью пресета %s (первый клик — ноль записей)",
+                 preset, symbol, side, snapshot["position_idx"], fmt_decimal(price))
+    await _reply(update, context, format_preset_preview(snapshot), reply_markup=keyboard)
+
+
+# ---------------------------------------------------------------------------
 # Шаг 3 — подтверждение, запись и readback
 # ---------------------------------------------------------------------------
 
@@ -1127,6 +1344,9 @@ async def confirm_protection(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     kind = snapshot["kind"]
+    # Быстрый пресет (S3) отличается только предвычисленной целью и особым
+    # контрактом стороны; ниже он идёт тем же путём записи/readback.
+    preset = snapshot.get("preset")
     symbol = snapshot["symbol"]
     side = snapshot["side"]
     price = snapshot["price"]
@@ -1167,10 +1387,15 @@ async def confirm_protection(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return
 
     # Цена уже проверена по ограничениям инструмента при построении превью;
-    # повторная проверка чистая, без обращения к сети.
+    # повторная проверка чистая, без обращения к сети. Пресет безубытка (S3)
+    # допускает SL ровно в цену входа через отдельный контракт, не ослабляя
+    # общий validate_direction ручного редактора.
     try:
         validate_bounds(price, snapshot["min_price"], snapshot["max_price"])
-        validate_direction(kind, side, fresh["entry"], price)
+        if preset is not None:
+            validate_preset_direction(preset, side, fresh["entry"], price)
+        else:
+            validate_direction(kind, side, fresh["entry"], price)
     except ProtectionInputError as exc:
         await _stale_preview(query, str(exc))
         return
@@ -1249,7 +1474,8 @@ async def confirm_protection(update: Update, context: ContextTypes.DEFAULT_TYPE,
         }
     evidence = make_result(
         status=resolved_status,
-        path=_PROTECTION_VERIFY_PATH, symbol=symbol, side=side,
+        path=_PRESET_VERIFY_PATH.get(preset, _PROTECTION_VERIFY_PATH),
+        symbol=symbol, side=side,
         position_idx=position_idx, field=_KIND_FIELD[kind],
         expected=price, actual=result["level"],
         attempts=result.get("attempts", 0), source=SOURCE_POSITION,
