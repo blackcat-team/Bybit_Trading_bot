@@ -4,7 +4,7 @@ certifi==2026.1.4
 cffi==2.0.0
 charset-normalizer==3.4.4
 colorama==0.4.6
-cryptography==46.0.3
+cryptography==50.0.0
 et-xmlfile==2.0.0
 h11==0.16.0
 httpcore==1.0.9
