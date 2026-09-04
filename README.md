@@ -208,18 +208,40 @@ This can be based on a loss streak or PnL thresholds.
 
 ## Bot commands
 
-| Command          | Purpose                                                         |
-| ---------------- | --------------------------------------------------------------- |
-| `/start`         | Enable new trade processing                                     |
-| `/stop`          | Pause new trades                                                |
-| `/status`        | Show trading state, PnL, positions, heat, alerts and quarantine |
-| `/risk 50`       | Set risk per trade to $50                                       |
-| `/pos`           | Show open positions and PnL                                     |
-| `/orders`        | Show active orders                                              |
-| `/report`        | Generate a trading report                                       |
-| `/note BTC Text` | Add a note to the trading journal                               |
+| Command             | Purpose                                                                                  |
+| ------------------- | ---------------------------------------------------------------------------------------- |
+| `/start`            | Enable processing of new trade signals                                                   |
+| `/stop`             | Pause new entries; open positions and orders are kept                                    |
+| `/status`           | Show trading state, daily PnL, positions, heat, sources and the last alert               |
+| `/risk 50`          | Show or set the global per-trade price risk (ENTRY→SL); no argument shows the current one |
+| `/pos`              | Show open positions with Stop Loss / Take Profit management buttons                      |
+| `/orders`           | Show entry orders with their cancel buttons                                              |
+| `/report`           | Current month's closed trades; `/report 01.2026` exports that month as Excel (`.xlsx`)   |
+| `/note BTC Text`    | Add a note for an instrument to the trading journal                                      |
+| `/timeline BTCUSDT` | Show recent journal events for an instrument (read-only, local journal, no Bybit calls)  |
+| `/health`           | Show command-processing counters and the OK / DEGRADED status                            |
+| `/info`             | Show usage help for the commands and the signal syntax                                   |
+| `/price BTC`        | Show the current Bybit Linear price for one instrument (read-only)                       |
 
-The Telegram responses themselves are currently in Russian.
+All commands are restricted to `ALLOWED_TELEGRAM_ID`. The Telegram responses themselves are currently in Russian.
+
+---
+
+## Reporting
+
+- `/report` is manual, interactive and owner-only. With no argument it replies with a text summary of the current month's closed trades (the last 15 are listed). With a month argument such as `/report 01.2026` it builds a native Excel workbook (`.xlsx`) for that month.
+- Automatic scheduled reports run in the background: a daily balance report and a weekly signal-source report.
+- By default automatic reports are delivered to the owner (`ALLOWED_TELEGRAM_ID`). They can instead be routed to a single custom chat or forum topic:
+
+```env
+# owner (default) = private chat of ALLOWED_TELEGRAM_ID
+# custom          = deliver automatic DAILY/WEEKLY reports to one custom destination
+TELEGRAM_REPORT_DESTINATION=owner
+TELEGRAM_REPORT_CHAT_ID=          # required when TELEGRAM_REPORT_DESTINATION=custom
+TELEGRAM_REPORT_THREAD_ID=        # optional forum topic id
+```
+
+The custom destination is outbound only: it only changes where automatic DAILY/WEEKLY reports are delivered and grants no command, callback, signal or trading authority to anyone in that chat — it creates no separate control plane. Command authorization stays the existing owner identity check (`ALLOWED_TELEGRAM_ID`) and does not depend on chat type: an allowed owner can invoke commands from any chat the bot receives them in. Manual `/report` is unaffected and continues to use that normal owner authorization. Custom mode uses a single destination — there is no duplicate copy to the owner.
 
 ---
 
@@ -231,7 +253,7 @@ Python 3.10+
 ├── python-telegram-bot
 ├── Async application flow
 ├── JSON / JSONL runtime storage
-├── CSV reporting
+├── Excel (.xlsx) monthly reporting
 └── systemd deployment
 ```
 
