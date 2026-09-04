@@ -90,7 +90,7 @@ async def check_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ),
             ]
             row3 = [
-                InlineKeyboardButton("🎯 Настроить TP", callback_data=f"set_tps|{sym}"),
+                InlineKeyboardButton("🎯 Настроить Auto TP", callback_data=f"set_tps|{sym}"),
                 InlineKeyboardButton(f"📋 Ордера ({cnt})", callback_data=f"show_orders|{sym}")
             ]
 

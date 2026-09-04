@@ -685,7 +685,7 @@ async def parse_and_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb = [[InlineKeyboardButton(btn_label, callback_data=cb_data)]]
             await msg_obj.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
         else:
-            kb = [[InlineKeyboardButton("🎯 Настроить TP", callback_data=f"set_tps|{sym}")]]
+            kb = [[InlineKeyboardButton("🎯 Настроить Auto TP", callback_data=f"set_tps|{sym}")]]
             # Для процентного SL в ордер уходит нормализованный Decimal, а не процент.
             sl_for_order = sl_decimal if sl_decimal is not None else stop_val
             # §4: создаём orderLinkId ДО размещения тем же безопасным методом,

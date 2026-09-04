@@ -100,7 +100,7 @@ async def on_startup_check(context: ContextTypes.DEFAULT_TYPE):
                     keyboard.append(InlineKeyboardButton("⛔ Закрыть", callback_data=f"emergency_close|{sym}"))
                 if not has_tp:
                     problem_desc.append("отсутствует TP")
-                    keyboard.append(InlineKeyboardButton("🎯 Настроить TP", callback_data=f"set_tps|{sym}"))
+                    keyboard.append(InlineKeyboardButton("🎯 Настроить Auto TP", callback_data=f"set_tps|{sym}"))
                 issues.append({"sym": sym, "desc": ", ".join(problem_desc), "kb": keyboard})
 
         if not issues:
