@@ -59,11 +59,16 @@ import pytest  # noqa: E402
 import app.jobs as jobs  # noqa: E402
 import handlers.reporting as reporting  # noqa: E402
 from core.journal import UNKNOWN  # noqa: E402
+from core.report_destination import ScheduledReportDestination  # noqa: E402
 from handlers.reporting import (  # noqa: E402
     _MAX_PAGES,
     _BybitReportError,
     fetch_closed_pnl_rows,
 )
+
+# Адрес доставки плановых отчётов фиксирован на владельце: эти тесты проверяют
+# пагинацию, а не маршрутизацию (маршрутизация — в test_pre_mid_s6_report_destination).
+_OWNER_DESTINATION = ScheduledReportDestination(chat_id=int(_UID))
 
 # Окно одного интервала биржи: конкретные миллисекунды роли не играют, важно
 # лишь то, что интервал один и не превышает 7 суток.
@@ -514,6 +519,8 @@ async def _run_weekly(*responses, tail=None):
     context.bot.send_message = AsyncMock(side_effect=_send)
 
     with patch.object(reporting, "bybit_call", new=pages), \
+            patch.object(jobs, "resolve_scheduled_report_destination",
+                         return_value=_OWNER_DESTINATION), \
             patch.object(jobs, "get_source_at_time", return_value="TG"), \
             patch.object(jobs, "get_disabled_sources", return_value=[]), \
             patch("core.database.get_global_risk", return_value=1.0), \
@@ -594,6 +601,8 @@ class TestWeeklyJobPagination:
         pages = _Pages(_page([], next_cursor="C2"))
 
         with patch.object(reporting, "bybit_call", new=pages), \
+                patch.object(jobs, "resolve_scheduled_report_destination",
+                             return_value=_OWNER_DESTINATION), \
                 patch("asyncio.sleep", new=AsyncMock()):
             await jobs.weekly_source_report_job(context)      # исключения нет
 

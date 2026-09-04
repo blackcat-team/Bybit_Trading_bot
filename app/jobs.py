@@ -159,6 +159,10 @@ from core.r2_evidence import (
     read_page_cursor,
 )
 from core.utils import safe_float
+# Адрес доставки автоматических DAILY/WEEKLY отчётов (owner/custom). Чистый
+# резолвер: None = отчёты недоступны (fail-closed только для отчётов, без
+# отката на владельца и без остановки торгового бота).
+from core.report_destination import resolve_scheduled_report_destination
 # Полная выборка closed-PnL одного интервала с единственным контрактом
 # пагинации: токен продолжения читается из result["nextPageCursor"] и уходит
 # следующим запросом параметром cursor. Реализация общая с /report намеренно —
@@ -1229,7 +1233,18 @@ async def auto_cleanup_orders_job(context: ContextTypes.DEFAULT_TYPE):
 
 # --- 4. Утренний отчет ---
 async def daily_balance_job(context: ContextTypes.DEFAULT_TYPE):
-    """Каждое утро (в 9:00 UTC) присылает баланс."""
+    """Каждое утро (в 9:00 UTC) присылает баланс.
+
+    Адрес доставки — resolve_scheduled_report_destination(): владелец или
+    настроенный custom-чат/топик. Недоступный адрес пропускает отчёт без
+    дублирования во владельца.
+    """
+    destination = resolve_scheduled_report_destination()
+    if destination is None:
+        logging.error(
+            "Daily report: адрес доставки не настроен — отчёт не отправлен"
+        )
+        return
     try:
         wallet = await bybit_call(session.get_wallet_balance, accountType="UNIFIED", coin="USDT")
         acct = wallet['result']['list'][0]
@@ -1242,7 +1257,9 @@ async def daily_balance_job(context: ContextTypes.DEFAULT_TYPE):
             f"💰 <b>Счёт</b>\n"
             f"{format_value_block([('Баланс', f'{equity:.2f} USDT'), ('PnL', f'{pnl:+.2f} USDT')])}"
         )
-        await context.bot.send_message(chat_id=ALLOWED_ID, text=msg, parse_mode='HTML')
+        await context.bot.send_message(
+            **destination.send_kwargs, text=msg, parse_mode='HTML'
+        )
         logging.info("Morning report sent")
     except Exception as e:
         logging.error(f"Daily Balance Job Error: {e}")
@@ -1907,8 +1924,19 @@ async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
     Неполная или аномальная пагинация отчётом не становится: сборщик
     поднимает ошибку, задача её логирует и молча выходит. Заниженная недельная
     статистика выглядит как правдивая, поэтому отправлять её нельзя.
+
+    Адрес доставки — resolve_scheduled_report_destination(): владелец или
+    настроенный custom-чат/топик. Недоступный адрес пропускает отчёт без
+    дублирования во владельца.
     """
     try:
+        destination = resolve_scheduled_report_destination()
+        if destination is None:
+            logging.error(
+                "Weekly report: адрес доставки не настроен — отчёт не отправлен"
+            )
+            return
+
         now = datetime.now(timezone.utc)
         end_ts = int(now.timestamp() * 1000)
         start_ts = int((now - timedelta(days=7)).timestamp() * 1000)
@@ -1918,7 +1946,7 @@ async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
 
         if not all_trades:
             await context.bot.send_message(
-                chat_id=ALLOWED_ID,
+                **destination.send_kwargs,
                 text=(
                     f"{format_header('📊', 'WEEKLY REPORT')}\n\n"
                     f"ℹ️ За неделю нет закрытых сделок."
@@ -1963,7 +1991,8 @@ async def weekly_source_report_job(context: ContextTypes.DEFAULT_TYPE):
             )
 
         await context.bot.send_message(
-            chat_id=ALLOWED_ID, text="\n".join(lines), parse_mode='HTML'
+            **destination.send_kwargs,
+            text="\n".join(lines), parse_mode='HTML'
         )
     except Exception as e:
         logging.error("Weekly report job error: %s", e)

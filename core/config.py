@@ -93,6 +93,19 @@ REQUIRE_MARKET_CONFIRM = int(os.getenv('REQUIRE_MARKET_CONFIRM', 0))
 # MARKET_PREVIEW_TTL_SEC: секунды, в течение которых кнопка подтверждения действительна.
 MARKET_PREVIEW_TTL_SEC = int(os.getenv('MARKET_PREVIEW_TTL_SEC', 300))
 
+# --- АДРЕС АВТОМАТИЧЕСКИХ DAILY/WEEKLY ОТЧЁТОВ ---
+# TELEGRAM_REPORT_DESTINATION: куда идут ТОЛЬКО автоматические отчёты
+# (утренний баланс и недельный отчёт по источникам). Ручной /report не
+# затрагивается. Валидация — в core/report_destination.py: неверное значение
+# отключает только автоматические отчёты и не останавливает торгового бота.
+#   owner  = личный чат владельца ALLOWED_TELEGRAM_ID (по умолчанию)
+#   custom = TELEGRAM_REPORT_CHAT_ID и необязательный TELEGRAM_REPORT_THREAD_ID
+TELEGRAM_REPORT_DESTINATION = os.getenv('TELEGRAM_REPORT_DESTINATION', 'owner')
+# Обязателен только при TELEGRAM_REPORT_DESTINATION=custom (ненулевое целое).
+TELEGRAM_REPORT_CHAT_ID = os.getenv('TELEGRAM_REPORT_CHAT_ID', '')
+# Необязательный ID топика форума для custom-адреса (положительное целое).
+TELEGRAM_REPORT_THREAD_ID = os.getenv('TELEGRAM_REPORT_THREAD_ID', '')
+
 # --- WATCHDOG ЗАЩИТЫ ОТКРЫТЫХ ПОЗИЦИЙ ---
 # WATCHDOG_ENABLED: периодическая alert-only проверка Stop Loss по открытым позициям.
 #   Включён по умолчанию; выключается только явным значением 0/false/no/off,
