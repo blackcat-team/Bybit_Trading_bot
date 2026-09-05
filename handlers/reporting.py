@@ -41,7 +41,7 @@ from datetime import datetime, timedelta, timezone
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from core.config import ALLOWED_ID
@@ -437,6 +437,23 @@ def _build_report_workbook(rows: list) -> io.BytesIO:
     return buffer
 
 
+# Инлайн-действие «другой месяц» на текстовом отчёте текущего месяца (без
+# аргумента). Нажатие ведёт в разговорный ввод MM.YYYY (ForceReply), а ответ
+# исполняет тот же путь месячного XLSX, что и прямая /report MM.YYYY. Контракт
+# данных отчёта, историю R, пагинацию, генерацию XLSX и адрес плановых отчётов
+# это не меняет.
+REPORT_OTHER_MONTH_CALLBACK = "report_other_month"
+
+
+def _other_month_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура с единственной кнопкой «📅 Другой месяц»."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "📅 Другой месяц", callback_data=REPORT_OTHER_MONTH_CALLBACK
+        ),
+    ]])
+
+
 async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Команда /report [мм.гггг] — отчёт о закрытых сделках за месяц.
@@ -501,6 +518,7 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{format_header('📊', 'REPORT')}\n\n"
                 f"ℹ️ За {h(month_name)} закрытых сделок нет.",
                 parse_mode='HTML',
+                reply_markup=_other_month_keyboard() if not context.args else None,
             )
             return
 
@@ -626,6 +644,7 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"{header}\n\n📋 <b>Последние 15</b>\n{short_list}",
                 parse_mode='HTML',
+                reply_markup=_other_month_keyboard(),
             )
 
     except Exception as e:

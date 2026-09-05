@@ -252,6 +252,7 @@ def runtime():
             "alert_command_degradation",
             "info_command",
             "price_command",
+            "handle_command_reply",
         )
     }
     jobs = {
@@ -589,9 +590,13 @@ def test_runtime_preserves_handlers_and_background_job_schedules(runtime):
     assert sum(h.kind == "CallbackQueryHandler" for h in runtime.app.handlers) == 1
 
     message_handlers = [h for h in runtime.app.handlers if h.kind == "MessageHandler"]
-    assert len(message_handlers) == 2
-    # Ввод уровня SL/TP перехватывается строго раньше парсера сигналов.
-    protection, signals = message_handlers
+    assert len(message_handlers) == 3
+    # Разговорный ввод команды (reply на ForceReply) перехватывается строго
+    # раньше ввода защиты SL/TP и парсера сигналов; ввод защиты — строго раньше
+    # парсера.
+    command_reply, protection, signals = message_handlers
+    assert command_reply.args[1].__name__ == "handle_command_reply"
+    assert command_reply.group == -2
     assert protection.args[1].__name__ == "handle_protection_input"
     assert protection.group == -1
     assert signals.args[1].__name__ == "parse_and_trade"

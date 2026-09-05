@@ -39,6 +39,8 @@ from handlers.pos_protection import (
     cancel_protection_input, confirm_protection, start_protection_edit,
     start_protection_preset,
 )
+from handlers.command_input import REPORT_MONTH, request_input
+from handlers.reporting import REPORT_OTHER_MONTH_CALLBACK
 from handlers.ui import (
     format_action,
     format_error_message,
@@ -263,6 +265,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sym = data.split("|")[1]
             res = await place_tp_ladder(sym)
             await context.bot.send_message(user_id, res, parse_mode='HTML')
+
+        # --- /report → «другой месяц»: разговорный ввод MM.YYYY (ForceReply) ---
+        # Кнопка ведёт ТОЛЬКО в подсказку ввода. Сам месячный отчёт исполняет
+        # существующий send_report по ответу оператора — новой report-логики и
+        # новой записи здесь нет.
+        elif data == REPORT_OTHER_MONTH_CALLBACK:
+            await request_input(
+                update, context, REPORT_MONTH,
+                f"{format_header('📅', 'REPORT')}\n\n"
+                "Введите месяц отчёта в формате MM.YYYY\n\n"
+                f"{format_action('ответьте, например, 08.2026 (или /report 08.2026)')}",
+                "08.2026",
+            )
 
         # --- Ручное изменение защиты позиции (HIGH-4) ---
         elif data.startswith("pedit|"):

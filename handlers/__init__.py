@@ -30,6 +30,8 @@ from .info import info_command
 
 from .price import price_command
 
+from .command_input import handle_command_reply
+
 from .preflight import (
     _safe_float, get_available_usd, floor_qty,
     validate_qty, clip_qty,

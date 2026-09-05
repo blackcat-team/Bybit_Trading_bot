@@ -19,6 +19,7 @@ from core.database import (
 
 from core.bybit_call import bybit_call
 from core.notifier import sanitize_operator_text
+from handlers.command_input import NOTE, RISK, request_input
 from handlers.ui import (
     format_action,
     format_error_message,
@@ -68,14 +69,19 @@ async def set_risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not context.args:
             current = get_global_risk()
-            await msg.reply_text(
+            # Меню Telegram отправляет /risk без аргумента. Показываем текущий
+            # риск и просим новое значение прямо ответом (ForceReply). Прямая
+            # форма /risk 25 остаётся полностью поддержанной и обязательной не
+            # становится.
+            await request_input(
+                update, context, RISK,
                 f"{format_header('📊', 'STATUS')}\n\n"
                 f"🛡 <b>Риск</b>\n"
                 f"{format_value_block([('ENTRY→SL', f'{current:.2f} USDT')])}\n"
                 "Это ценовой риск от входа до SL; комиссии и проскальзывание "
                 "не входят, поэтому фактический PnL может отличаться.\n\n"
-                f"{format_action('для изменения используйте /risk 50')}",
-                parse_mode='HTML'
+                f"{format_action('ответьте новым риском (например 25) или используйте /risk 25')}",
+                "Новый риск, например 25",
             )
             return
 
@@ -118,12 +124,15 @@ async def add_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ALLOWED_ID: return
     try:
         if len(context.args) < 2:
-            await update.message.reply_text(
-                f"{format_header('⚠️', 'WARNING')}\n\n"
-                f"⚠️ <b>Предупреждения</b>\n"
-                f"• Не указан символ или текст заметки.\n\n"
-                f"{format_action('используйте /note BTC Текст заметки')}",
-                parse_mode='HTML',
+            # Недостаточно аргументов (в т.ч. вызов из меню без текста): просим
+            # инструмент и текст заметки ответом (ForceReply). Прямая форма
+            # /note BTC текст сохраняется без изменений.
+            await request_input(
+                update, context, NOTE,
+                f"{format_header('📝', 'NOTE')}\n\n"
+                "Инструмент и текст заметки\n\n"
+                f"{format_action('ответьте в формате «BTC Тестовая заметка» или используйте /note BTC текст')}",
+                "BTC Тестовая заметка",
             )
             return
 

@@ -30,6 +30,7 @@ from core.bybit_call import bybit_call
 from core.config import ALLOWED_ID
 from core.trading_core import session
 from core.write_verify import envelope_ok
+from handlers.command_input import PRICE, request_input
 from handlers.ui import (
     format_action,
     format_header,
@@ -190,6 +191,17 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = context.args or []
+    if not args:
+        # Меню Telegram отправляет /price без аргумента. Просим инструмент
+        # ответом (ForceReply); прямая форма /price BTC остаётся без изменений.
+        await request_input(
+            update, context, PRICE,
+            f"{format_header('💲', 'PRICE')}\n\n"
+            "Введите инструмент\n\n"
+            f"{format_action('ответьте тикером, например BTC (или /price BTC)')}",
+            "BTC",
+        )
+        return
     symbol = normalize_symbol(args[0]) if len(args) == 1 else None
     if symbol is None:
         # Некорректный ввод до биржи не доходит: запроса нет вовсе.

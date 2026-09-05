@@ -20,6 +20,7 @@ from core.journal import (
     get_trade_timeline,
     normalize_symbol,
 )
+from handlers.command_input import TIMELINE, request_input
 from handlers.ui import (
     TELEGRAM_TEXT_LIMIT,
     format_action,
@@ -189,6 +190,17 @@ async def timeline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = context.args or []
+    if not args:
+        # Меню Telegram отправляет /timeline без аргумента. Просим инструмент
+        # ответом (ForceReply); прямая форма /timeline BTCUSDT не меняется.
+        await request_input(
+            update, context, TIMELINE,
+            f"{format_header('🧾', 'TIMELINE')}\n\n"
+            "Введите инструмент\n\n"
+            f"{format_action('ответьте тикером, например BTCUSDT (или /timeline BTCUSDT)')}",
+            "BTCUSDT",
+        )
+        return
     symbol = normalize_symbol(args[0]) if args else ""
     if not symbol:
         await update.message.reply_text(

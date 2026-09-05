@@ -22,7 +22,7 @@ from handlers import (
     parse_and_trade, set_risk_command, view_orders, on_startup_check,
     status_command, handle_protection_input, timeline_command,
     health_command, alert_command_degradation,
-    info_command, price_command,
+    info_command, price_command, handle_command_reply,
 )
 from app.jobs import (
     daily_balance_job, auto_breakeven_job, auto_cleanup_orders_job,
@@ -185,6 +185,16 @@ if __name__ == '__main__':
     _command("price", price_command)
 
     app.add_handler(CallbackQueryHandler(button_handler))
+    # Группа -2: раньше и обработчика защиты, и парсера сигналов. Перехватывает
+    # ТОЛЬКО прямой reply оператора на активную подсказку разговорного ввода
+    # команды и потребляет его ровно один раз. Любое иное сообщение (обычный
+    # текст, торговый сигнал, ввод защиты позиции) проходит дальше в
+    # существующие обработчики без изменений.
+    app.add_handler(
+        MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND),
+                       handle_command_reply),
+        group=-2,
+    )
     # Группа -1: перехватывает текст только когда ожидается значение SL/TP из /pos.
     # Прочие сообщения пропускаются дальше, в обычный парсер сигналов.
     app.add_handler(
