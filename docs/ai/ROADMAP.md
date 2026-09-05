@@ -4,10 +4,10 @@ This roadmap prioritizes future work; it is not authorization to combine items i
 
 This document carries two independent layers that must never be conflated:
 
-- the **canonical product roadmap**: HIGH → MID → LOW → NICE TO HAVE;
+- the **canonical product roadmap**: HIGH → MID → NEXT → LOW → FUTURE;
 - the **LIVE-FIX8 safety remediation track**: a bounded temporary track that had to be completed, deployed and verified before the project returned to MID. It is now **CLOSED** — see the [authoritative current state](#authoritative-current-state).
 
-LIVE-FIX8 is not a replacement product roadmap. It never renumbers, replaces or absorbs MID, LOW or NICE TO HAVE.
+LIVE-FIX8 is not a replacement product roadmap. It never renumbers, replaces or absorbs MID, NEXT, LOW or FUTURE. The former **NICE TO HAVE** section has been reconciled into the authoritative MID / NEXT / LOW / FUTURE structure — see [old NICE TO HAVE reconciliation](#old-nice-to-have-reconciliation).
 
 ## Authoritative current state
 
@@ -19,14 +19,16 @@ This block is the authoritative current planning state. It outranks every histor
 - The whole LIVE-FIX8 safety remediation — units A, B, C1, C2 (at `9f71b57`), D (at `7dfef42`) and E (at `1a82d63`) — was ACCEPTED / COMMITTED / PUSHED, then DEPLOYED at `0d1adb0`, RUNTIME VERIFIED and LIVE ACCEPTED. **LIVE-FIX8 is CLOSED.** LIVE-FIX8-E keeps its own repository commit identity `1a82d63`; the deployed release `0d1adb0` carries the whole accepted remediation.
 - LIVE Risk Cut acceptance was **GREEN, proven on real Bybit** — the observed production chain was confirmed BTC entry → owned TP1 fill → durable 1R milestone → Risk Cut (-0.3R) → authoritative write verification → a real exchange-side stop at the requested level. The Auto-BE live observation is DEFERRED and **non-blocking**, and Auto-BE is **not** claimed as observed live (see the [deferred Auto-BE live observation](#deferred-auto-be-live-observation)).
 - `0d1adb0` is the historical LIVE-FIX8 production baseline; it carries the accepted LIVE-FIX8 remediation only and is not fresh verification of any later work.
+- The bounded **PRE-MID safety batch** — stop semantics (S0, `5337faa`), portfolio-heat fail-closed (S1, `79575e6`), individual order-cancellation fail-closed (S2, `868b733`), break-even shortcut confirmation (S3, `41d6098`), duplicate-`positionIdx` fail-closed (S4, `e9e99c2`), monthly XLSX report (S5, `2d20136`), optional scheduled-report destination (S6, `88af83d`) and the dependency refresh (`4ab37b4`; `cryptography 50.0.0`, `python-dotenv 1.2.2`) — was implemented as separate [units of work](../../AGENTS.md#unit-of-work-and-remediation). Its repository-complete identity is `4ab37b4`. The whole batch was ACCEPTED / COMMITTED / PUSHED, then DEPLOYED together as one consolidated release, RUNTIME VERIFIED and LIVE ACCEPTED; its historical [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate) is now closed, all required statuses complete (`CLOSED_GREEN` as the compact historical label) — see the [PRE-MID safety batch](#pre-mid-safety-batch). The optional scheduled-report destination introduced in S6 has been operationally configured and verified: a custom Telegram destination resolves correctly, the bot can access the target chat, and a real safe test message reached the intended forum topic.
+- The **PRE-MID ROADMAP / DOCS SYNC** unit (`4b2e37f`) is a distinct subsequent docs-only follow-up. It is **not** part of the S0–S6 safety batch and does not change the batch's repository-complete identity `4ab37b4`; later production releases carry both in ancestry without merging their unit identities.
+- Two later product/UX units were ACCEPTED / COMMITTED / PUSHED, then DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED: the **Auto TP button label UX** (`6bf56e8`) and the **Telegram Command Input UX** (`6143efa`).
 
 **WHERE WE ARE**
 
-- Canonical repository release: `main` and `origin/main` @ `4ab37b4`.
-- Since the LIVE-FIX8 closeout, a bounded **PRE-MID safety batch** was implemented as eight separate [units of work](../../AGENTS.md#unit-of-work-and-remediation): stop semantics (S0, `5337faa`), portfolio-heat fail-closed (S1, `79575e6`), individual order-cancellation fail-closed (S2, `868b733`), break-even shortcut confirmation (S3, `41d6098`), duplicate-`positionIdx` fail-closed (S4, `e9e99c2`), monthly XLSX report (S5, `2d20136`), optional scheduled-report destination (S6, `88af83d`), followed by a dependency refresh (`4ab37b4`; `cryptography 50.0.0`, `python-dotenv 1.2.2`). The whole batch is ACCEPTED / COMMITTED / PUSHED — see the [PRE-MID safety batch](#pre-mid-safety-batch).
-- The PRE-MID batch is **not yet DEPLOYED, not RUNTIME VERIFIED and not LIVE ACCEPTED**: its accumulated changes are intentionally deferred to one [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate) rather than deployed per stage. The historical `0d1adb0` baseline must not be presented as fresh verification of this batch.
-- The current unit is **PRE-MID ROADMAP / DOCS SYNC** — this documentation synchronization only. It changes no product behavior and reopens no accepted stage.
-- MID has not started.
+- Current production / product-code release: `6143efa` is **DEPLOYED, RUNTIME VERIFIED and LIVE ACCEPTED**. This is the current production truth.
+- This planning reconciliation was based on canonical `main` and `origin/main` @ `6143efa` before its own docs-only promotion. Promoting this docs unit advances canonical `main`/`origin/main` to a new docs-only commit while the production product-code release legitimately stays at `6143efa`, because this unit changes no runtime/product behavior; canonical head is therefore not permanently asserted here.
+- All historical safety and product work above — LIVE-FIX8, the PRE-MID safety batch and its consolidated deployment gate, the Auto TP button label UX and the Telegram Command Input UX — is CLOSED. No completed gate remains open.
+- MID has not started. The current future product block is **[MID](#mid)** and the next product implementation unit is **[MID-1 — Planned vs Actual Risk](#mid)**.
 
 Status chain of the LIVE-FIX8 remediation (units A–E), deployed and live accepted at `0d1adb0`:
 
@@ -41,7 +43,7 @@ Status chain of the LIVE-FIX8 remediation (units A–E), deployed and live accep
 | RUNTIME VERIFIED | YES |
 | LIVE ACCEPTED | YES |
 
-Status chain of the PRE-MID safety batch (S0–S6 and the dependency refresh), at `4ab37b4`:
+Status chain of the PRE-MID safety batch (S0–S6 and the dependency refresh), repository-complete at `4ab37b4`, later deployed together as one consolidated release and now part of production `6143efa` (the separate PRE-MID ROADMAP / DOCS SYNC unit `4b2e37f` is tracked distinctly below and is not part of this batch identity):
 
 | Status | Value |
 | --- | --- |
@@ -50,37 +52,50 @@ Status chain of the PRE-MID safety batch (S0–S6 and the dependency refresh), a
 | ACCEPTED | YES |
 | COMMITTED | YES |
 | PUSHED | YES |
-| DEPLOYED | NO |
-| RUNTIME VERIFIED | NO |
-| LIVE ACCEPTED | NO |
+| DEPLOYED | YES |
+| RUNTIME VERIFIED | YES |
+| LIVE ACCEPTED | YES |
 
-Each status is defined normatively in [WORKFLOW.md](WORKFLOW.md#status-semantics) and each needs its own evidence; **no status implies the next**. The LIVE-FIX8 acceptance does not retroactively assert that Auto-BE was observed live; the PRE-MID DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED states stay `NO` until the [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate) proves each one.
+Status chain of the later product/UX units — Auto TP button label UX (`6bf56e8`) and Telegram Command Input UX (`6143efa`), the current production release:
+
+| Status | Value |
+| --- | --- |
+| CODE READY | YES |
+| QA GREEN | YES |
+| ACCEPTED | YES |
+| COMMITTED | YES |
+| PUSHED | YES |
+| DEPLOYED | YES |
+| RUNTIME VERIFIED | YES |
+| LIVE ACCEPTED | YES |
+
+Each status is defined normatively in [WORKFLOW.md](WORKFLOW.md#status-semantics) and each needs its own evidence; **no status implies the next**. The LIVE-FIX8 acceptance does not retroactively assert that Auto-BE was observed live; the deferred [Auto-BE live observation](#deferred-auto-be-live-observation) remains a non-blocking operational observation only.
 
 **WHERE WE GO NEXT**
 
-The next roadmap gate is **not** MID-1. The accepted PRE-MID batch must first pass one [consolidated PRE-MID deployment + runtime verification gate](#consolidated-pre-mid-deployment-gate):
+The historical PRE-MID deployment gate is closed (all required statuses complete) and no longer blocks the product roadmap. The next roadmap gate is now the first product unit:
 
-- **[Consolidated PRE-MID deployment + runtime verification](#consolidated-pre-mid-deployment-gate) — NEXT GATE.** Deploy the accumulated PRE-MID state together, prove the intended commit is running, perform the authorized runtime verification, and obtain the required live acceptance. No forced real-money / live trade is required for acceptance.
-- **[MID-1](#mid) — Planned vs actual risk — NOT STARTED.** It is shown only after the consolidated PRE-MID gate is GREEN, is not opened by this docs-sync unit, and remains its own [unit of work](../../AGENTS.md#unit-of-work-and-remediation).
+- **[MID-1](#mid) — Planned vs Actual Risk — NOT STARTED, NEXT PRODUCT UNIT.** It is the next product implementation unit, is not opened by this docs reconciliation unit, and remains its own [unit of work](../../AGENTS.md#unit-of-work-and-remediation).
 
-Compact sequence: **LIVE-FIX8 CLOSED (DEPLOYED @ `0d1adb0`) → PRE-MID S0–S6 + dependency refresh (ACCEPTED / COMMITTED / PUSHED @ `4ab37b4`, NOT deployed) → PRE-MID ROADMAP / DOCS SYNC (current) → consolidated PRE-MID deployment + runtime verification (next gate) → MID-1 (NOT STARTED)**. The deferred, non-blocking [Auto-BE live observation](#deferred-auto-be-live-observation) remains an operational observation only.
+Compact sequence: **LIVE-FIX8 CLOSED (DEPLOYED @ `0d1adb0`) → PRE-MID safety batch S0–S6 + dependency refresh (repository-complete @ `4ab37b4`, later deployed / runtime verified / live accepted) → PRE-MID ROADMAP / DOCS SYNC (distinct docs-only unit @ `4b2e37f`) → Auto TP button label UX (deployed / runtime verified / live accepted @ `6bf56e8`) → Telegram Command Input UX (deployed / runtime verified / live accepted @ `6143efa`, current production) → MID-1 (NOT STARTED, next product unit)**. The deferred, non-blocking [Auto-BE live observation](#deferred-auto-be-live-observation) remains an operational observation only.
 
 ## Canonical product roadmap
 
 Architect-authoritative order of the product blocks; it does not change:
 
-**[HIGH](#high) → [MID](#mid) → [LOW](#low) → [NICE TO HAVE](#nice-to-have)**
+**[HIGH](#high) → [MID](#mid) → [NEXT](#next) → [LOW](#low) → [FUTURE](#future)**
 
 - [HIGH](#high) — safety-critical core. HIGH-1 … HIGH-11 are DONE.
-- [MID](#mid) — operator usability / observability / protection. NOT STARTED. LIVE-FIX8 is CLOSED and the [PRE-MID safety batch](#pre-mid-safety-batch) is ACCEPTED / COMMITTED / PUSHED but not yet deployed; MID becomes the current product block and MID-1 the next unit only after the [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate) is GREEN.
+- [MID](#mid) — operator usability / observability / protection. **Current future product block; MID-1 is the next product implementation unit.** All prior safety and product gates (LIVE-FIX8, the [PRE-MID safety batch](#pre-mid-safety-batch) with its consolidated deployment gate, the Auto TP button label UX and the Telegram Command Input UX) are CLOSED, so MID is now open.
+- [NEXT](#next) — trade-intent, lifecycle UX and structured TP/trailing productization. NOT STARTED.
 - [LOW](#low) — analytics / later development. NOT STARTED.
-- [NICE TO HAVE](#nice-to-have) — future concepts only, never current implementation scope.
+- [FUTURE](#future) — future architecture only, never current implementation scope.
 
-The [LIVE-FIX8 track](#current-live-fix8-safety-remediation-track) is a temporary safety remediation track that ran *before* the return to MID and is now CLOSED. It is not a product block and does not substitute for MID, LOW or NICE TO HAVE.
+The [LIVE-FIX8 track](#current-live-fix8-safety-remediation-track) is a temporary safety remediation track that ran *before* the return to MID and is now CLOSED. It is not a product block and does not substitute for MID, NEXT, LOW or FUTURE.
 
 ## Current LIVE-FIX8 safety remediation track
 
-This track was the safety remediation focus that preceded the return to MID. It is temporary, bounded and safety-critical: it existed to finish the sticky-R protection remediation, not to extend the product. It is now **CLOSED** — repository-complete, deployed at `0d1adb0`, runtime verified and live accepted; the [release gate](#mandatory-post-fix-release-gate) is GREEN. After it closed, the accepted [PRE-MID safety batch](#pre-mid-safety-batch) followed and now stands between this track and MID-1 through its own [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate).
+This track was the safety remediation focus that preceded the return to MID. It is temporary, bounded and safety-critical: it existed to finish the sticky-R protection remediation, not to extend the product. It is now **CLOSED** — repository-complete, deployed at `0d1adb0`, runtime verified and live accepted; the [release gate](#mandatory-post-fix-release-gate) is GREEN. After it closed, the accepted [PRE-MID safety batch](#pre-mid-safety-batch) (repository-complete at `4ab37b4`) followed and has itself since been deployed, runtime verified and live accepted; its [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate) is now closed with every required status complete, and the current production release is `6143efa`.
 
 ### Accepted and frozen units
 
@@ -125,9 +140,9 @@ LIVE-FIX8-D has no separate per-unit deployment: DEPLOYED, RUNTIME VERIFIED and 
 
 **LIVE-FIX8-E** — STATUS: ACCEPTED / COMMITTED / PUSHED at `1a82d63`.
 
-Roadmap-level purpose: the integration / regression / final remediation acceptance checkpoint. Its exact implementation contract was issued separately by the architect, and detailed E implementation requirements are deliberately not restated here. Its scope was not expanded from [NICE TO HAVE](#nice-to-have) items; in particular, the NICE-TO-HAVE milestone-based trailing concept (item C) was **not** the contract of LIVE-FIX8-E: a LIVE-FIX8 unit may consume already frozen sticky milestones for this specific safety remediation, while productized trailing profiles remain future scope until separately architected.
+Roadmap-level purpose: the integration / regression / final remediation acceptance checkpoint. Its exact implementation contract was issued separately by the architect, and detailed E implementation requirements are deliberately not restated here. Its scope was not expanded from future-concept items; in particular, the milestone-based trailing concept now mapped to [NEXT-4](#next) was **not** the contract of LIVE-FIX8-E: a LIVE-FIX8 unit may consume already frozen sticky milestones for this specific safety remediation, while productized trailing profiles remain future scope until separately architected.
 
-With LIVE-FIX8-E accepted, committed and pushed, the LIVE-FIX8 remediation (units A–E) reached REPOSITORY-COMPLETE and there is no further LIVE-FIX8 remediation unit. It has since been deployed at `0d1adb0`, runtime verified and live accepted: the [mandatory post-fix release gate](#mandatory-post-fix-release-gate) is GREEN and **LIVE-FIX8 is CLOSED**. What followed was the accepted [PRE-MID safety batch](#pre-mid-safety-batch), which must pass the [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate) before [MID-1](#mid) (NOT STARTED) is opened.
+With LIVE-FIX8-E accepted, committed and pushed, the LIVE-FIX8 remediation (units A–E) reached REPOSITORY-COMPLETE and there is no further LIVE-FIX8 remediation unit. It has since been deployed at `0d1adb0`, runtime verified and live accepted: the [mandatory post-fix release gate](#mandatory-post-fix-release-gate) is GREEN and **LIVE-FIX8 is CLOSED**. What followed was the accepted [PRE-MID safety batch](#pre-mid-safety-batch), which has itself been deployed, runtime verified and live accepted (its [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate) is CLOSED_GREEN). With all those gates closed and the current production release at `6143efa`, [MID-1](#mid) (NOT STARTED) is the next product implementation unit.
 
 ### Deferred Auto-BE live observation
 
@@ -151,26 +166,28 @@ The complete LIVE-FIX8 remediation (units A–E) reached REPOSITORY-COMPLETE (CO
 4. Perform the required live acceptance for this safety-critical fix. — DONE (LIVE ACCEPTED; LIVE Risk Cut proven GREEN on real Bybit).
 5. Obtain architect / control-plane acceptance of that production evidence. — DONE (production accepted).
 
-This gate is now **GREEN** for LIVE-FIX8. It closed the LIVE-FIX8 track only; the accepted [PRE-MID safety batch](#pre-mid-safety-batch) that followed has its own still-pending [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate) before MID-1. Compact form:
+This gate is now **GREEN** for LIVE-FIX8. It closed the LIVE-FIX8 track only; the accepted [PRE-MID safety batch](#pre-mid-safety-batch) that followed has since passed its own [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate), now CLOSED_GREEN. Compact form:
 
-**LIVE-FIX8 A–E (repository-complete, COMMITTED / PUSHED, E @ `1a82d63`) → DEPLOYED @ `0d1adb0` → RUNTIME VERIFIED → REQUIRED LIVE ACCEPTANCE → GREEN (LIVE-FIX8 CLOSED) → [PRE-MID batch](#pre-mid-safety-batch) → [consolidated PRE-MID gate](#consolidated-pre-mid-deployment-gate) → MID-1 (NOT STARTED)**
+**LIVE-FIX8 A–E (repository-complete, COMMITTED / PUSHED, E @ `1a82d63`) → DEPLOYED @ `0d1adb0` → RUNTIME VERIFIED → REQUIRED LIVE ACCEPTANCE → GREEN (LIVE-FIX8 CLOSED) → [PRE-MID batch](#pre-mid-safety-batch) → [consolidated PRE-MID gate](#consolidated-pre-mid-deployment-gate) CLOSED_GREEN → later product/UX units CLOSED_GREEN → production `6143efa` → MID-1 (NOT STARTED, next product unit)**
 
-There was no direct LIVE-FIX8-E → MID-1 transition and no direct repository-complete → MID-1 transition: deployment and server verification were a mandatory gate between the completed fix and MID, and that gate has been satisfied for LIVE-FIX8. The one still-open item from this remediation is the deferred, non-blocking [Auto-BE live observation](#deferred-auto-be-live-observation); it does not reopen this gate and does not block the later PRE-MID work.
+There was no direct LIVE-FIX8-E → MID-1 transition and no direct repository-complete → MID-1 transition: deployment and server verification were a mandatory gate between the completed fix and MID, and that gate has been satisfied for LIVE-FIX8. The one still-open item from this remediation is the deferred, non-blocking [Auto-BE live observation](#deferred-auto-be-live-observation); it does not reopen this gate and did not block the later PRE-MID work, which is now itself deployed and live accepted.
 
 ## PRE-MID safety batch
 
-A bounded safety batch was implemented after the LIVE-FIX8 closeout and before the return to MID. Each stage was its own [unit of work](../../AGENTS.md#unit-of-work-and-remediation) and is ACCEPTED / COMMITTED / PUSHED; the whole batch is **not yet DEPLOYED, RUNTIME VERIFIED or LIVE ACCEPTED** and is intentionally deferred to the single [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate). These stages are frozen accepted source truth and are not reopened, redesigned or bundled with MID work.
+A bounded safety batch was implemented after the LIVE-FIX8 closeout and before the return to MID. Each stage was its own [unit of work](../../AGENTS.md#unit-of-work-and-remediation) and is ACCEPTED / COMMITTED / PUSHED. **The PRE-MID safety batch is S0–S6 plus the dependency refresh, and its repository-complete identity is `4ab37b4`.** The whole batch was subsequently DEPLOYED together as one consolidated release, RUNTIME VERIFIED and LIVE ACCEPTED through the [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate) — now closed with every required status complete — and is part of the current production release `6143efa`. The separate [PRE-MID ROADMAP / DOCS SYNC](#pre-mid-roadmap--docs-sync) unit (`4b2e37f`) is a distinct subsequent docs-only follow-up and is **not** part of this batch identity. These stages are frozen accepted source truth and are not reopened, redesigned or bundled with MID work.
 
 | Stage | Scope | Commit | Status |
 | --- | --- | --- | --- |
-| PRE-MID S0 | Stop semantics: `/stop` blocks new entries while preserving protection | `5337faa` | ACCEPTED / COMMITTED / PUSHED — not deployed |
-| PRE-MID S1 | Portfolio-heat fail-closed on unavailable heat | `79575e6` | ACCEPTED / COMMITTED / PUSHED — not deployed |
-| PRE-MID S2 | Individual order-cancellation fail-closed | `868b733` | ACCEPTED / COMMITTED / PUSHED — not deployed |
-| PRE-MID S3 | Break-even shortcut requires confirmation | `41d6098` | ACCEPTED / COMMITTED / PUSHED — not deployed |
-| PRE-MID S4 | Duplicate-`positionIdx` fail-closed | `e9e99c2` | ACCEPTED / COMMITTED / PUSHED — not deployed |
-| PRE-MID S5 | Monthly XLSX report with strict raw-PnL validation | `2d20136` | ACCEPTED / COMMITTED / PUSHED — not deployed |
-| PRE-MID S6 | Optional scheduled-report destination | `88af83d` | ACCEPTED / COMMITTED / PUSHED — not deployed |
-| Dependency refresh | `cryptography 50.0.0`, `python-dotenv 1.2.2` | `4ab37b4` | ACCEPTED / COMMITTED / PUSHED — not deployed |
+| PRE-MID S0 | Stop semantics: `/stop` blocks new entries while preserving protection | `5337faa` | ACCEPTED / COMMITTED / PUSHED / DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED |
+| PRE-MID S1 | Portfolio-heat fail-closed on unavailable heat | `79575e6` | ACCEPTED / COMMITTED / PUSHED / DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED |
+| PRE-MID S2 | Individual order-cancellation fail-closed | `868b733` | ACCEPTED / COMMITTED / PUSHED / DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED |
+| PRE-MID S3 | Break-even shortcut requires confirmation | `41d6098` | ACCEPTED / COMMITTED / PUSHED / DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED |
+| PRE-MID S4 | Duplicate-`positionIdx` fail-closed | `e9e99c2` | ACCEPTED / COMMITTED / PUSHED / DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED |
+| PRE-MID S5 | Monthly XLSX report with strict raw-PnL validation | `2d20136` | ACCEPTED / COMMITTED / PUSHED / DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED |
+| PRE-MID S6 | Optional scheduled-report destination | `88af83d` | ACCEPTED / COMMITTED / PUSHED / DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED |
+| Dependency refresh | `cryptography 50.0.0`, `python-dotenv 1.2.2` | `4ab37b4` | ACCEPTED / COMMITTED / PUSHED / DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED |
+
+The batch is repository-complete at `4ab37b4`; its later deployment / runtime verification / live acceptance is the separate release/gate fact recorded in the [consolidated PRE-MID deployment gate](#consolidated-pre-mid-deployment-gate).
 
 Accepted product decisions preserved by this batch and relevant to authoritative docs:
 
@@ -178,22 +195,31 @@ Accepted product decisions preserved by this batch and relevant to authoritative
 - Automatic DAILY / WEEKLY reports may route to the owner or to one custom chat / topic. Custom mode has **one destination only**; there is no duplicate owner copy.
 - Manual `/report` and `/report MM.YYYY` remain interactive and governed by the normal owner authorization (`ALLOWED_TELEGRAM_ID`), unchanged.
 - Configuring the custom destination adds no authorization: it grants no commands, callbacks, signals or exchange authority to anyone and creates no separate ingress or control plane. An allowed owner remains authorized by owner identity and may invoke commands from any chat the bot receives them in.
+- The optional scheduled-report destination (S6) has since been **operationally configured and verified**: the custom Telegram destination resolves correctly, the bot can access the target chat, and a real safe test message reached the intended forum topic. No secret or token material is recorded here.
+
+## PRE-MID ROADMAP / DOCS SYNC
+
+This is a **distinct subsequent docs-only follow-up unit**, separate from the [PRE-MID safety batch](#pre-mid-safety-batch). It changed no product behavior and reopened no accepted stage.
+
+- Unit identity: commit `4b2e37f`.
+- It is **not** part of the S0–S6 safety batch, and it does **not** change the batch's repository-complete identity `4ab37b4`.
+- Later production releases carry both `4ab37b4` and `4b2e37f` in ancestry; that shared ancestry does not merge their distinct unit identities.
 
 ## Consolidated PRE-MID deployment gate
 
-The accepted [PRE-MID safety batch](#pre-mid-safety-batch) is COMMITTED / PUSHED at `4ab37b4` but repository-complete is not deployed. Production deployment of the accumulated PRE-MID work is **intentionally deferred to one consolidated deployment + runtime-verification gate** rather than a per-stage deployment. The project does not go directly to MID; it must first pass this gate:
+The [PRE-MID safety batch](#pre-mid-safety-batch) is repository-complete at `4ab37b4` (ACCEPTED / COMMITTED / PUSHED). Production deployment of the accumulated PRE-MID work was **intentionally deferred to one consolidated deployment + runtime-verification gate** rather than a per-stage deployment. That gate has since been satisfied and every step is now DONE:
 
-1. Deploy the accumulated PRE-MID repository state (`4ab37b4`) to the production server as one consolidated release. — PENDING.
-2. Prove the intended commit / version is the one actually running. — PENDING.
-3. Perform the separately authorized runtime verification / smoke checks. — PENDING (RUNTIME VERIFIED = NO).
-4. Perform the required live acceptance. No forced real-money / live trade test is required for acceptance. — PENDING (LIVE ACCEPTED = NO).
-5. Obtain architect / control-plane acceptance of that production evidence. — PENDING.
+1. Deploy the accumulated PRE-MID repository state (`4ab37b4`) to the production server as one consolidated release. — DONE (DEPLOYED).
+2. Prove the intended commit / version is the one actually running. — DONE.
+3. Perform the separately authorized runtime verification / smoke checks. — DONE (RUNTIME VERIFIED).
+4. Perform the required live acceptance. No forced real-money / live trade test was required for acceptance. — DONE (LIVE ACCEPTED).
+5. Obtain architect / control-plane acceptance of that production evidence. — DONE.
 
-This gate is **NOT GREEN**. Compact form:
+This gate is closed with every required status complete (`CLOSED_GREEN` as the compact historical label). Compact form:
 
-**PRE-MID S0–S6 + dependency refresh (ACCEPTED / COMMITTED / PUSHED @ `4ab37b4`, NOT deployed) → consolidated deployment @ one release → prove running commit → RUNTIME VERIFICATION → REQUIRED LIVE ACCEPTANCE → GREEN → MID-1 (NOT STARTED)**
+**PRE-MID safety batch S0–S6 + dependency refresh (repository-complete @ `4ab37b4`, ACCEPTED / COMMITTED / PUSHED) → consolidated deployment @ one release → prove running commit → RUNTIME VERIFIED → LIVE ACCEPTED → gate closed → later product/UX units DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED → production `6143efa` → MID-1 (NOT STARTED, next product unit)**
 
-Until this gate is GREEN, MID-1 is not opened and the historical `0d1adb0` production baseline is not fresh verification of the PRE-MID batch.
+This gate is closed; the current production release is `6143efa`, and MID-1 is the next product implementation unit. The historical `0d1adb0` baseline was the LIVE-FIX8 production baseline and is not the current production truth. The separate [PRE-MID ROADMAP / DOCS SYNC](#pre-mid-roadmap--docs-sync) unit (`4b2e37f`) is not part of this batch's repository-complete identity `4ab37b4`.
 
 ## HIGH
 
@@ -834,7 +860,7 @@ fail-closed but resolved nothing. Its runtime — the monthly Order History swee
 `close_parents`, and `get_entry_link_risk_evidence()` — was removed by LIVE-FIX4.
 Only the ancestry path was removed; the LIVE-FIX2 direct path is untouched.
 
-### LIVE-FIX4 — durable protective exit-order → historical risk binding (deployed at `bb9866b`, remediation active)
+### LIVE-FIX4 — durable protective exit-order → historical risk binding (historical, superseded as current planning context; deployed at `bb9866b`)
 
 **Production evidence:** the LIVE-FIX3 chain `closed-PnL orderId` → Order History
 `parentOrderLinkId` → `ENTRY_PLACED order_link_id` → `planned_risk_usdt` gave zero
@@ -855,7 +881,7 @@ proximity. The denominator of the historical R must therefore be persisted
 *before* the exit fires, while the protective order is still visible in open
 orders.
 
-**Solution implemented (awaiting independent review):**
+**Solution implemented (historical evidence, superseded as current planning context):**
 
 - A new lifecycle-neutral journal event `EXIT_ORDER_BOUND` durably stores the
   exact protective `exit_order_id` together with the `planned_risk_usdt` proven
@@ -953,8 +979,12 @@ current global risk; it is out of this scope, so it stays reported, not touched.
 - `tests/test_report_historical_r.py`, `tests/test_main_prod_sync.py` — extended;
   the LIVE-FIX2 tests remain passing.
 
-**Status:** merged and deployed at `bb9866b`. In production the binding still did
-not appear, for the reason recorded in the remediation subsection below.
+**Status (historical, superseded as current planning context):** merged and
+deployed at `bb9866b`. In production the binding still did not appear, for the
+reason recorded in the remediation subsection below. This is preserved evidence,
+not an active remediation, a current stage, a next stage or an unresolved review
+gate; the current planning state is the [authoritative current
+state](#authoritative-current-state) (MID-1 is the next product unit).
 
 #### LIVE-FIX4 production remediation — entry side domain boundary (historical, superseded as current planning context)
 
@@ -1010,10 +1040,13 @@ case-shifted, exchange-side and non-string journal sides).
 `core/exit_binding.py`, `app/jobs.py`, `main.py`, `handlers/reporting.py` and
 both entry writers are unchanged.
 
-**Status (historical):** recorded at the time as awaiting independent review. This
-is preserved evidence, not a current planning pointer, and no later status is
+**Status (historical, superseded as current planning context):** at the time this
+remediation was recorded as pending independent review. That review pointer is
+historical only: this subsection is preserved evidence, not an active remediation,
+a current stage, a next stage or an unresolved review gate, and no later status is
 claimed for it here. The current planning state is the [authoritative current
-state](#authoritative-current-state).
+state](#authoritative-current-state), where the only current future product
+direction is MID → MID-1 next.
 
 ### LIVE-FIX5 — Closed-PnL pagination continuation token (historical, superseded as current planning context)
 
@@ -1144,9 +1177,13 @@ later status is claimed for it here.
 ### LIVE acceptance state (historical, superseded as current planning context)
 
 The two bullets below are the LIVE acceptance state as it was recorded during the
-LIVE-FIX4 period. They are preserved evidence and do **not** describe the current
-plan: the current LIVE acceptance requirement for the active safety remediation is
-defined by the [authoritative current state](#authoritative-current-state) and the
+LIVE-FIX4 period. They are preserved historical evidence and do **not** describe the
+current plan: the then-current LIVE acceptance requirement that applied to that
+remediation at that historical time has since been superseded. The LIVE-FIX
+remediation and its release gates are now closed, LIVE-FIX4 is neither active nor
+awaiting any current acceptance gate, and the current planning truth is defined by
+the [authoritative current state](#authoritative-current-state) — where the forward
+direction is MID and MID-1 is the next product implementation unit — and the
 [mandatory post-fix release gate](#mandatory-post-fix-release-gate), which outrank
 this subsection.
 
@@ -1162,98 +1199,175 @@ this subsection.
 - Historical batching context, superseded as current planning context: HIGH-4 through HIGH-11 were batched into one production release to be reviewed together before deployment, with the joint release review of the whole batch named as the next step while HIGH-11 was still awaiting independent review. HIGH-11 is now DONE, so that pointer is no longer the current next step and does not compete with the gate above.
 - After a release review passes, an authorized operator performs one deployment, then a runtime smoke check, then a period of observation.
 
+## Later accepted product/UX units
+
+After the PRE-MID batch closed, two product/UX units were implemented, each as its
+own [unit of work](../../AGENTS.md#unit-of-work-and-remediation). Both completed all
+required statuses — ACCEPTED / COMMITTED / PUSHED / DEPLOYED / RUNTIME VERIFIED /
+LIVE ACCEPTED. They are historical evidence, not current scope.
+
+| Unit | Scope | Commit | Status |
+| --- | --- | --- | --- |
+| Auto TP button label UX | Clarify Auto TP button labels | `6bf56e8` | ACCEPTED / COMMITTED / PUSHED / DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED |
+| Telegram Command Input UX | Scoped conversational command input | `6143efa` | ACCEPTED / COMMITTED / PUSHED / DEPLOYED / RUNTIME VERIFIED / LIVE ACCEPTED (current production release) |
+
 ## MID
 
-Operator usability / observability / protection. **NOT STARTED.** LIVE-FIX8 is
-CLOSED, but the later [PRE-MID safety batch](#pre-mid-safety-batch) is ACCEPTED /
-COMMITTED / PUSHED and not yet deployed, so MID is not yet the current product
-block: **MID-1 starts only after the [consolidated PRE-MID deployment
-gate](#consolidated-pre-mid-deployment-gate) is GREEN, and is NOT STARTED**. Each
-MID item remains its own [unit of work](../../AGENTS.md#unit-of-work-and-remediation); MID-1 is not
-opened by this docs-sync unit.
+Operator usability / observability / protection. **Current future product block.**
+All prior safety and product gates are CLOSED — LIVE-FIX8, the
+[PRE-MID safety batch](#pre-mid-safety-batch) with its consolidated deployment gate,
+the Auto TP button label UX and the Telegram Command Input UX — and the current
+production release is `6143efa`. **MID-1 is the next product implementation unit and
+is NOT STARTED.** Each MID item remains its own
+[unit of work](../../AGENTS.md#unit-of-work-and-remediation); MID-1 is not opened by
+this docs reconciliation unit.
 
-**MID-1 — Planned vs actual risk.** Show after execution: planned entry, actual
-entry, planned risk, actual risk, and the difference; also notional, required
-margin, slippage, qty-rounding effect and estimated commissions. The first step is
-transparency only; risk formulas are not rewritten without factual evidence.
+**MID-1 — Planned vs Actual Risk.** Show planned entry/risk versus actual
+execution/fill/risk and explain the deviations — slippage, qty rounding, and
+fees/notional where the evidence supports it. This stage is **observability first**:
+it does not redefine the risk-sizing formula.
 
-**MID-2 — Protection against repeated confirmation.** A practical bounded guard:
-the first button activation consumes the confirmation; callback TTL; a repeated
-press reports the action as already processed; one execution attempt per card; a
-timeout must not trigger a second order before the Bybit state has been checked.
+**MID-2 — One-shot Confirmation Guard.** A practical bounded guard: the first button
+activation consumes the confirmation; callback TTL; a repeated press reports the
+action as already processed; one execution attempt per card; a timeout must not
+trigger a second order before the Bybit state has been checked.
 
-**MID-3 — Extended `/status` health block.** SYSTEM HEALTH including Telegram
-status, Bybit API status, polling errors per 24 h, process restarts, last
-heartbeat, commit and uptime. Warnings may include: a position without confirmed
-SL, an exchange/local state mismatch, an old pending operation, an unknown manual
-position, an orphan active order.
+**MID-3 — Operator Health.** An operator-facing health product stage: Telegram
+status, Bybit API status, polling errors per window, process restarts, last
+heartbeat, commit and uptime, plus warnings such as a position without confirmed SL,
+an exchange/local state mismatch, an old pending operation, an unknown manual
+position, or an orphan active order. **Existing `/health` primitives do NOT
+automatically mean MID-3 is complete**; an existing primitive is not the roadmap
+product stage, and MID-3 stays a future acceptance item until explicitly reviewed
+and accepted.
 
-**MID-4 — Telegram polling-log normalization.** Desired behaviour: an isolated
+**MID-4 — Telegram Polling Log Normalization.** Desired behaviour: an isolated
 transient `ReadError` → `DEBUG`; a short transient series → one aggregated
 `WARNING`; recovery → one `INFO`. Never suppressed: handler exceptions, job
 exceptions, an unknown `NetworkError`, a long connection loss.
 
-**MID-5 — Position lifecycle in journal.** A durable lifecycle view including:
-signal received, preview created, confirmed, order submitted, fill confirmed, SL
-confirmed, TP confirmed, SL modified, partial close, external close, position
-closed, realized PnL, remaining orders. Existing HIGH / LIVE-FIX infrastructure may
-already provide some primitives; MID-5 must **not** be marked DONE merely because
-prerequisites exist, and it remains a future product-roadmap acceptance item until
-explicitly reviewed and accepted as such.
+**MID-5 — Full Position Lifecycle Journal.** A durable, authoritative lifecycle /
+close-evidence view including: signal received, preview created, confirmed, order
+submitted, fill confirmed, SL confirmed, TP confirmed, SL modified, partial close,
+external close, position closed, realized PnL and remaining orders. It must include
+the intent for authoritative lifecycle/close evidence — **TP execution evidence** and
+**truthful close-cause attribution** where provable. Existing HIGH / LIVE-FIX
+infrastructure may already provide some primitives, and the existing `/timeline`
+command does **NOT** mean MID-5 is already complete; MID-5 must not be marked DONE
+merely because prerequisites exist and remains a future acceptance item until
+explicitly reviewed and accepted.
 
-**MID-6 — Position ownership.** Distinguish a position opened by the bot, opened
-manually, and of unknown source. Default for a manually opened position: show it,
-do not automatically apply Auto-BE / Auto-TP, and provide one explicit operator
-action — adopt under bot management.
+**MID-6 — Position Ownership.** Distinguish a position opened by the bot, opened
+manually, and of unknown source. Default for a manually opened position: show it, do
+not automatically apply Auto-BE / Auto-TP, and provide one explicit operator action —
+adopt under bot management.
+
+**MID-7 — SL Worsening Guard.** A guard against SL changes that worsen the operator's
+protection: an SL edit must not silently move the stop to a worse level than the
+current protection without explicit operator intent.
+
+**MID-8 — Telegram Notification Profiles.** Configurable operator notification
+profiles that select which lifecycle and health events are delivered, without
+changing trading behaviour.
+
+**MID-9 — Portfolio Risk Heat v2 + Account Risk Circuit Breaker.** Before a new
+entry, show the new trade's risk, existing open risk, the total after the new entry,
+and the configured limit, based on potential loss to SL rather than merely occupied
+margin; plus an account-level risk circuit breaker. **Existing portfolio Heat
+primitives do NOT mean MID-9 is complete**; it remains a future acceptance item until
+explicitly reviewed and accepted.
+
+## NEXT
+
+Trade-intent, lifecycle UX and structured TP/trailing productization. **NOT
+STARTED.** Each item is its own future
+[unit of work](../../AGENTS.md#unit-of-work-and-remediation).
+
+**NEXT-1 — Immutable TradeIntent + config versioning.** A versioned trade-settings
+concept (for example `risk_usd`, `tp_profile`, `trailing_profile`,
+`config_version`): changing global settings later must not silently change an
+already-open trade. This is the authoritative destination of the former
+NICE-TO-HAVE "Versioned trade settings / TradeIntent" concept.
+
+**NEXT-2 — Lifecycle UX v1.** Clearer operator-visible lifecycle statuses such as:
+entry 1/3 filled; all entries filled; TP1 filled; SL moved to breakeven; SL moved to
+TP1; position closed by trailing stop; original Stop Loss hit; closed manually;
+closed externally; protection missing. The distinctions among closure and protection
+outcomes must be preserved. This is the authoritative destination of the former
+NICE-TO-HAVE "Telegram lifecycle/status UX" concept.
+
+**NEXT-3 — Structured TP execution tracking.** Durable, structured tracking of TP
+execution across the position lifecycle, beyond ad-hoc primitives.
+
+**NEXT-4 — Structured trailing by achieved TP milestones.** A productized trailing
+concept, for example: TP1 reached → SL to breakeven; TP2 reached → SL to TP1; TP3
+reached → SL to TP2; or a more conservative configured variant. This is the
+authoritative destination of the former NICE-TO-HAVE "Milestone-based trailing"
+concept. **Existing Risk Cut / Auto-BE milestone machinery does NOT mean this
+productized trailing stage is complete**: a LIVE-FIX8 unit may consume already frozen
+sticky milestones for its specific safety remediation, but broader productized
+trailing profiles remain future scope until separately architected and accepted.
+
+**NEXT-5 — Lifecycle UX v2 / close attribution.** A later lifecycle UX iteration
+focused on truthful close-cause attribution surfaced to the operator.
 
 ## LOW
 
 Analytics / later development. **NOT STARTED.**
 
-**LOW-1 — Signal-source statistics.** After enough trades: PnL, win rate, average
-realized R, max drawdown, loss streaks, MAE/MFE, Market vs Limit, Long vs Short,
-average slippage, rejected-preflight rate and results by source. The primary metric
-is average realized R, not win rate alone.
+**LOW-1 — Source statistics.** After enough trades: PnL, win rate, average realized
+R, max drawdown, loss streaks, MAE/MFE, Market vs Limit, Long vs Short, average
+slippage, rejected-preflight rate and results by source. The primary metric is
+average realized R, not win rate alone.
 
-**LOW-2 — Position history in Telegram.** A compact timeline for one
-position/symbol including entry, protection changes, closure, PnL and R.
+**LOW-2 — Position history in Telegram.** A compact timeline for one position/symbol
+including entry, protection changes, closure, PnL and R. **Existing `/timeline` does
+NOT mean LOW-2 is complete**; it remains a future acceptance item until explicitly
+reviewed and accepted.
 
 **LOW-3 — SL/TP presets.** Quick buttons such as SL 3 / 5 / 10 percent and TP
 5 / 10 / 20 percent, only after stable base manual SL/TP editing.
 
-**LOW-4 — Improved partial TP.** Future unification of volume percentages,
+**LOW-4 — Partial TP UX / normalization.** Future unification of volume percentages,
 price/percent targets, parts summing to exactly 100 %, a full plan preview,
 reduce-only verification and qty-rounding remainder correction.
 
-**LOW-5 — Internal structural refactoring.** Only after feature stabilization: a
-shared price/percentage parser, shared `tickSize`/`qtyStep` normalization, a shared
-Bybit operation-result object, a shared position/order card formatter, and fewer
-duplicate callback flows.
+**LOW-5 — Internal refactor.** Only after feature stabilization: a shared
+price/percentage parser, shared `tickSize`/`qtyStep` normalization, a shared Bybit
+operation-result object, a shared position/order card formatter, and fewer duplicate
+callback flows.
 
-## NICE TO HAVE
+**LOW-6 — Paper / Dry execution.** A paper / dry-run execution mode for validating
+flows without live exchange writes.
 
-Future concepts only. Nothing here is current implementation scope, and nothing
-here may be pulled into the [LIVE-FIX8 track](#current-live-fix8-safety-remediation-track).
+**LOW-7 — Maker / Limit chaser.** A maker/limit-chaser execution style for entries,
+kept future until separately architected.
 
-**A. Versioned trade settings / TradeIntent.** Example concept: `risk_usd`,
-`tp_profile`, `trailing_profile`, `config_version`. Changing global settings later
-must not silently change an already-open trade.
+## FUTURE
 
-**B. Aggregate risk / Risk Heat Guard.** Before a new entry, eventually show: the
-new trade's risk, existing open risk, the total after the new entry, and the
-configured limit. Risk is based on potential loss to SL, not merely on occupied
-margin.
+Future architecture only. Nothing here is current implementation scope.
 
-**C. Milestone-based trailing.** Future product concept, for example: TP1 reached →
-SL to breakeven; TP2 reached → SL to TP1; TP3 reached → SL to TP2; or a more
-conservative configured variant. **This NICE-TO-HAVE trailing concept was not the
-contract of [LIVE-FIX8-D](#accepted-and-frozen-units) and is not the contract of
-[LIVE-FIX8-E](#next-remediation-unit).** A LIVE-FIX8 unit may consume already
-frozen sticky milestones for the specific current safety remediation, but broader
-productized trailing profiles remain future scope until separately architected.
+**Web operator dashboard / control-plane separation.** A future web operator
+dashboard and control-plane separation. This is future architecture only and must
+not become current implementation scope.
 
-**D. Telegram lifecycle/status UX.** Future clearer operator-visible statuses such
-as: entry 1/3 filled; all entries filled; TP1 filled; SL moved to breakeven; SL
-moved to TP1; position closed by trailing stop; original Stop Loss hit; closed
-manually; closed externally; protection missing. The distinctions among closure and
-protection outcomes must be preserved.
+## Old NICE TO HAVE reconciliation
+
+The previous **NICE TO HAVE** section is superseded. Its accepted concepts were not
+deleted; they were mapped to their authoritative destinations in the structure
+above so no idea is lost and no competing duplicate roadmap entry remains:
+
+- **Versioned trade settings / TradeIntent** → [NEXT-1](#next) (Immutable TradeIntent
+  + config versioning).
+- **Aggregate risk / Risk Heat Guard** (total open risk) → [MID-9](#mid) (Portfolio
+  Risk Heat v2 + Account Risk Circuit Breaker).
+- **Milestone-based trailing** → [NEXT-4](#next) (Structured trailing by achieved TP
+  milestones). It was **not** the contract of
+  [LIVE-FIX8-D](#accepted-and-frozen-units) or [LIVE-FIX8-E](#next-remediation-unit),
+  and existing sticky-milestone machinery does not make it complete.
+- **Telegram lifecycle/status UX** → [NEXT-2](#next) (Lifecycle UX v1), with truthful
+  close attribution continued in [NEXT-5](#next) (Lifecycle UX v2 / close
+  attribution).
+
+No old NICE-TO-HAVE concept remains without an authoritative destination, and none
+was promoted into a new current implementation stage.
